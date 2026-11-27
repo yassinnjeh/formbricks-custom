@@ -41,7 +41,7 @@ RUN set -eu; \
   rm /tmp/native.tar.gz; \
   find node_modules -type f -name '*.map' -delete
 
-FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:088a01637f22908632ba09018be2e0b516f2fa6f7869c191d29491139db43c78
+FROM gcr.io/distroless/nodejs24-debian13:nonroot@sha256:675c532423b908f9e56f9d60a4e62309b63cd2a3175acb90a46b96f7ee68e121
 
 LABEL org.opencontainers.image.source="https://github.com/formbricks/formbricks" \
   org.opencontainers.image.description="Cube API server for Formbricks analytics, on a distroless Node runtime"
