@@ -5,7 +5,7 @@
 # The build stage runs on the builder's own platform and only downloads files: npm is told the target
 # platform and the native module is fetched for the target architecture, so a multi-arch build needs
 # no emulation.
-FROM --platform=$BUILDPLATFORM node:24-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 AS build
+FROM --platform=$BUILDPLATFORM node:24-trixie-slim@sha256:4d00acb4bcc42c454c4eb801526f7ad7f772ea3bd4fd168c5cc2e384abcbb9d4 AS build
 
 ARG TARGETARCH
 
