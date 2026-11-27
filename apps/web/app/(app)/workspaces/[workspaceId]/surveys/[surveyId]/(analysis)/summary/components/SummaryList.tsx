@@ -1,0 +1,279 @@
+"use client";
+
+import { toast } from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { TI18nString } from "@formbricks/types/i18n";
+import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
+import { TSurvey, TSurveySummary } from "@formbricks/types/surveys/types";
+import { getTextContent } from "@formbricks/types/surveys/validation";
+import { TUserLocale } from "@formbricks/types/user";
+import { useWorkspaceContext } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
+import { EmptyAppSurveys } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/components/EmptyInAppSurveys";
+import { useResponseTableFilters } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/hooks/use-response-table-filters";
+import { isQuestionFilter } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/lib/response-table-filters";
+import { CESSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/CESSummary";
+import { CSATSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/CSATSummary";
+import { CTASummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/CTASummary";
+import { CalSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/CalSummary";
+import { ConsentSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/ConsentSummary";
+import { ContactInfoSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/ContactInfoSummary";
+import { DateElementSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/DateElementSummary";
+import { FileUploadSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/FileUploadSummary";
+import { HiddenFieldsSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/HiddenFieldsSummary";
+import { MatrixElementSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/MatrixElementSummary";
+import { MultipleChoiceSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/MultipleChoiceSummary";
+import { NPSSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/NPSSummary";
+import { OpenTextSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/OpenTextSummary";
+import { PictureChoiceSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/PictureChoiceSummary";
+import { RankingSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/RankingSummary";
+import { RatingSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/RatingSummary";
+import { SignatureSummary } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/SignatureSummary";
+import { constructToastMessage } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/lib/utils";
+import { OptionsType } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/components/response-filter-options";
+import { getLocalizedValue } from "@/lib/i18n/utils";
+import { EmptyState } from "@/modules/ui/components/empty-state";
+import { SkeletonLoader } from "@/modules/ui/components/skeleton-loader";
+import { NotShownCountsProvider, getNotShownCounts } from "../lib/not-shown-counts";
+import { AddressSummary } from "./AddressSummary";
+
+interface SummaryListProps {
+  summary: TSurveySummary["summary"];
+  /** Read for each element's "Not shown to N" (ENG-6936). */
+  dropOff: TSurveySummary["dropOff"];
+  responseCount: number | null;
+  survey: TSurvey;
+  locale: TUserLocale;
+  isReadOnly: boolean;
+}
+
+export const SummaryList = ({
+  summary,
+  dropOff,
+  responseCount,
+  survey,
+  locale,
+  isReadOnly,
+}: Readonly<SummaryListProps>) => {
+  const { workspace } = useWorkspaceContext();
+  const { filters, applyQuestionFilter } = useResponseTableFilters(survey);
+  const { t } = useTranslation();
+  // "Filter by this answer" writes a rule to the shared toolbar filter, replacing the question's own.
+  const setFilter = (
+    elementId: string,
+    label: TI18nString,
+    elementType: TSurveyElementTypeEnum,
+    filterValue: string,
+    filterComboBoxValue?: string | string[]
+  ) => {
+    const hasFilter = filters.some((filter) => isQuestionFilter(filter, elementId));
+    const isApplied = applyQuestionFilter({
+      elementType: {
+        id: elementId,
+        label: getTextContent(getLocalizedValue(label, "default")),
+        elementType,
+        type: OptionsType.ELEMENTS,
+      },
+      filterType: { filterComboBoxValue, filterValue },
+    });
+    if (!isApplied) return;
+    toast.success(
+      hasFilter
+        ? t("workspace.surveys.summary.filter_updated_successfully")
+        : (constructToastMessage(elementType, filterValue, survey, elementId, t, filterComboBoxValue) ??
+            t("workspace.surveys.summary.filter_added_successfully")),
+      { duration: 5000 }
+    );
+  };
+
+  // The element summary cards, or what the page shows before there is anything to summarize.
+  const renderSummary = () => {
+    if (survey.type === "app" && responseCount === 0 && !workspace.appSetupCompleted) {
+      return <EmptyAppSurveys />;
+    }
+    if (summary.length === 0) return <SkeletonLoader type="summary" />;
+    if (responseCount === 0) {
+      return <EmptyState text={t("workspace.surveys.summary.no_responses_found")} />;
+    }
+    return summary.map((elementSummary) => {
+      switch (elementSummary.type) {
+        case TSurveyElementTypeEnum.OpenText: {
+          return (
+            <OpenTextSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              locale={locale}
+              isReadOnly={isReadOnly}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.MultipleChoiceSingle:
+        case TSurveyElementTypeEnum.MultipleChoiceMulti: {
+          return (
+            <MultipleChoiceSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              surveyType={survey.type}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.NPS: {
+          return (
+            <NPSSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.CTA: {
+          return (
+            <CTASummary key={elementSummary.element.id} elementSummary={elementSummary} survey={survey} />
+          );
+        }
+        case TSurveyElementTypeEnum.Rating: {
+          return (
+            <RatingSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.CSAT: {
+          return (
+            <CSATSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.CES: {
+          return (
+            <CESSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.Consent: {
+          return (
+            <ConsentSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.PictureSelection: {
+          return (
+            <PictureChoiceSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.Date: {
+          return (
+            <DateElementSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              locale={locale}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.FileUpload: {
+          return (
+            <FileUploadSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              locale={locale}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.Signature: {
+          return (
+            <SignatureSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              locale={locale}
+              isReadOnly={isReadOnly}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.Cal: {
+          return (
+            <CalSummary key={elementSummary.element.id} elementSummary={elementSummary} survey={survey} />
+          );
+        }
+        case TSurveyElementTypeEnum.Matrix: {
+          return (
+            <MatrixElementSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              setFilter={setFilter}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.Address: {
+          return (
+            <AddressSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              locale={locale}
+            />
+          );
+        }
+        case TSurveyElementTypeEnum.Ranking: {
+          return (
+            <RankingSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              surveyType={survey.type}
+              survey={survey}
+            />
+          );
+        }
+        case "hiddenField": {
+          return (
+            <HiddenFieldsSummary key={elementSummary.id} elementSummary={elementSummary} locale={locale} />
+          );
+        }
+        case TSurveyElementTypeEnum.ContactInfo: {
+          return (
+            <ContactInfoSummary
+              key={elementSummary.element.id}
+              elementSummary={elementSummary}
+              survey={survey}
+              locale={locale}
+            />
+          );
+        }
+        default:
+          return null;
+      }
+    });
+  };
+
+  return (
+    <NotShownCountsProvider value={getNotShownCounts(dropOff)}>
+      <div className="mt-4 space-y-8">{renderSummary()}</div>
+    </NotShownCountsProvider>
+  );
+};

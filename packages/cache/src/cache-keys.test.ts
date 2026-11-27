@@ -1,0 +1,338 @@
+import { describe, expect, test } from "vitest";
+import type { CacheKey } from "@/types/keys";
+import { createCacheKey } from "./cache-keys";
+
+describe("@formbricks/cache cacheKeys", () => {
+  describe("createCacheKey", () => {
+    describe("environment namespace", () => {
+      test("should create environment state key", () => {
+        const key = createCacheKey.workspace.state("env-123");
+        expect(key).toBe("fb:env:env-123:state");
+        // Verify it returns branded CacheKey type
+        expect(typeof key).toBe("string");
+      });
+
+      test("should create environment config key", () => {
+        const key = createCacheKey.workspace.config("env-abc");
+        expect(key).toBe("fb:env:env-abc:config");
+      });
+
+      test("should create environment segments key", () => {
+        const key = createCacheKey.workspace.segments("env-def");
+        expect(key).toBe("fb:env:env-def:segments");
+      });
+
+      test("should handle special characters in environment IDs", () => {
+        const key = createCacheKey.workspace.state("env-test_123-special");
+        expect(key).toBe("fb:env:env-test_123-special:state");
+      });
+
+      test("should throw error for empty environment ID", () => {
+        expect(() => createCacheKey.workspace.state("")).toThrow("Invalid Cache key: Parts cannot be empty");
+      });
+    });
+
+    describe("custom css namespace", () => {
+      test("should version reprocessed output by processor version and source hash", () => {
+        expect(createCacheKey.customCss.reprocessed("survey", 3, "abc123")).toBe(
+          "fb:custom-css:survey:v3:abc123"
+        );
+        expect(createCacheKey.customCss.reprocessed("survey", 4, "abc123")).not.toBe(
+          createCacheKey.customCss.reprocessed("survey", 3, "abc123")
+        );
+      });
+    });
+
+    describe("organization namespace", () => {
+      test("should create organization billing key", () => {
+        const key = createCacheKey.organization.billing("org-123");
+        expect(key).toBe("fb:org:org-123:billing");
+      });
+
+      test("should create organization billing-sync-lock key scoped to the org", () => {
+        const key = createCacheKey.organization.billingSyncLock("org-123");
+        expect(key).toBe("fb:org:org-123:billing-sync-lock");
+      });
+
+      test("should create monthly-response-count key scoped to the org and usage cycle", () => {
+        const key = createCacheKey.organization.monthlyResponseCount("org-123", "1793491200000");
+        expect(key).toBe("fb:org:org-123:monthly-response-count:1793491200000");
+      });
+
+      test("should handle complex organization IDs", () => {
+        const key = createCacheKey.organization.billing("org-enterprise-team_123");
+        expect(key).toBe("fb:org:org-enterprise-team_123:billing");
+      });
+
+      test("should throw error for empty organization ID", () => {
+        expect(() => createCacheKey.organization.billing("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+
+    describe("integration namespace", () => {
+      test("should create a Google Sheets write-lock key scoped to the spreadsheet", () => {
+        const key = createCacheKey.integration.googleSheetWriteLock("1AbC-dEf_123");
+        expect(key).toBe("fb:integration:google-sheets:1AbC-dEf_123:write-lock");
+      });
+    });
+
+    describe("license namespace", () => {
+      test("should create license status key", () => {
+        const key = createCacheKey.license.status("org-123");
+        expect(key).toBe("fb:license:org-123:status");
+      });
+
+      test("should create license previous_result key", () => {
+        const key = createCacheKey.license.previous_result("org-def");
+        expect(key).toBe("fb:license:org-def:previous_result");
+      });
+
+      test("should handle UUID-style organization IDs", () => {
+        const key = createCacheKey.license.status("550e8400-e29b-41d4-a716-446655440000");
+        expect(key).toBe("fb:license:550e8400-e29b-41d4-a716-446655440000:status");
+      });
+
+      test("should throw error for empty organization ID in license keys", () => {
+        expect(() => createCacheKey.license.status("")).toThrow("Invalid Cache key: Parts cannot be empty");
+        expect(() => createCacheKey.license.previous_result("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+
+    describe("rateLimit namespace", () => {
+      test("should create rate limit core key", () => {
+        const key = createCacheKey.rateLimit.core("api", "user-123", 1640995200);
+        expect(key).toBe("fb:rate_limit:api:user-123:1640995200");
+      });
+
+      test("should handle different rate limit namespaces", () => {
+        const apiKey = createCacheKey.rateLimit.core("api", "key-abc", 1640995200);
+        expect(apiKey).toBe("fb:rate_limit:api:key-abc:1640995200");
+
+        const loginKey = createCacheKey.rateLimit.core("auth:login", "user-456", 1640995300);
+        expect(loginKey).toBe("fb:rate_limit:auth:login:user-456:1640995300");
+      });
+
+      test("should create an in-flight key apart from every window's key", () => {
+        expect(createCacheKey.rateLimit.inFlight("api:v3:charts:in-flight", "key-abc")).toBe(
+          "fb:rate_limit:api:v3:charts:in-flight:key-abc:in_flight"
+        );
+      });
+
+      test("should convert window start number to string", () => {
+        const key = createCacheKey.rateLimit.core("webhook", "endpoint-789", 0);
+        expect(key).toBe("fb:rate_limit:webhook:endpoint-789:0");
+      });
+
+      test("should throw error for empty parameters", () => {
+        expect(() => createCacheKey.rateLimit.core("", "user-123", 1640995200)).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.rateLimit.core("api", "", 1640995200)).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+
+    describe("creative stats namespace", () => {
+      test("keys one UTC day's counters of a creative, and the day's flush sets", () => {
+        expect(createCacheKey.creativeStats.devices("2026-10-16", "clcr1")).toBe(
+          "fb:creative-stats:{2026-10-16}:clcr1:devices"
+        );
+        expect(createCacheKey.creativeStats.pages("2026-10-16", "clcr1")).toBe(
+          "fb:creative-stats:{2026-10-16}:clcr1:pages"
+        );
+        expect(createCacheKey.creativeStats.pending("2026-10-16")).toBe(
+          "fb:creative-stats:{2026-10-16}:pending"
+        );
+        expect(createCacheKey.creativeStats.flushing("2026-10-16")).toBe(
+          "fb:creative-stats:{2026-10-16}:flushing"
+        );
+      });
+
+      test("puts every key used by a day's Redis scripts in the same cluster slot", () => {
+        const day = "2026-10-16";
+        const keys = [
+          createCacheKey.creativeStats.pending(day),
+          createCacheKey.creativeStats.flushing(day),
+          createCacheKey.creativeStats.devices(day, "clcr1"),
+          createCacheKey.creativeStats.pages(day, "clcr1"),
+          createCacheKey.creativeStats.devices(day, "clcr2"),
+          createCacheKey.creativeStats.pages(day, "clcr2"),
+        ];
+        expect(keys.map((key) => /\{([^}]+)\}/.exec(key)?.[1])).toEqual(Array(keys.length).fill(day));
+      });
+
+      test("keeps the old untagged keys readable during a rolling upgrade", () => {
+        const day = "2026-10-16";
+        expect(createCacheKey.creativeStats.legacyDevices(day, "clcr1")).toBe(
+          "fb:creative-stats:2026-10-16:clcr1:devices"
+        );
+        expect(createCacheKey.creativeStats.legacyPages(day, "clcr1")).toBe(
+          "fb:creative-stats:2026-10-16:clcr1:pages"
+        );
+        expect(createCacheKey.creativeStats.legacyPending(day)).toBe("fb:creative-stats:2026-10-16:pending");
+        expect(createCacheKey.creativeStats.legacyFlushing(day)).toBe(
+          "fb:creative-stats:2026-10-16:flushing"
+        );
+      });
+
+      test("rejects an empty tagged day", () => {
+        expect(() => createCacheKey.creativeStats.devices("", "clcr1")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.creativeStats.pages("", "clcr1")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.creativeStats.pending("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+        expect(() => createCacheKey.creativeStats.flushing("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+
+      test("keys the countable creative ids by workspace, next to its state, and by the ids' hash", () => {
+        expect(createCacheKey.workspace.creativeIds("clws1", "ab12")).toBe("fb:env:clws1:creative-ids:ab12");
+      });
+    });
+
+    describe("hub namespace", () => {
+      test("should create feedback record tenant key", () => {
+        const key = createCacheKey.hub.feedbackRecordTenant("0194d8a0-3d55-7ff4-9f62-8d02c3fbcfe8");
+        expect(key).toBe("fb:hub:0194d8a0-3d55-7ff4-9f62-8d02c3fbcfe8:feedback_record_tenant");
+      });
+
+      test("should throw error for empty feedback record id", () => {
+        expect(() => createCacheKey.hub.feedbackRecordTenant("")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+
+    describe("survey import namespace", () => {
+      test("scopes an idempotency key to the user who sent it", () => {
+        expect(createCacheKey.surveyImport.idempotency("user-1", "abc123")).toBe(
+          "fb:survey_import:user-1:idempotency:abc123"
+        );
+      });
+    });
+
+    describe("custom namespace", () => {
+      test("should create custom key with subResource", () => {
+        const key = createCacheKey.custom("analytics", "user-456", "daily-stats");
+        expect(key).toBe("fb:analytics:user-456:daily-stats");
+      });
+
+      test("should create custom key without subResource", () => {
+        const key = createCacheKey.custom("analytics", "user-789");
+        expect(key).toBe("fb:analytics:user-789");
+      });
+
+      test("should handle complex subResources", () => {
+        const key = createCacheKey.custom("analytics", "user-123", "dashboard:metrics:daily");
+        expect(key).toBe("fb:analytics:user-123:dashboard:metrics:daily");
+      });
+
+      test("should restrict to valid namespaces only", () => {
+        // TypeScript should prevent invalid namespaces at compile time
+        // Test with currently valid namespace
+        const key = createCacheKey.custom("analytics", "test-id");
+        expect(key).toBe("fb:analytics:test-id");
+      });
+
+      test("should throw error for empty identifier", () => {
+        expect(() => createCacheKey.custom("analytics", "")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+
+      test("should throw error for empty subResource when provided", () => {
+        expect(() => createCacheKey.custom("analytics", "user-123", "")).toThrow(
+          "Invalid Cache key: Parts cannot be empty"
+        );
+      });
+    });
+  });
+
+  describe("CacheKey type safety", () => {
+    test("should return CacheKey branded type", () => {
+      const key = createCacheKey.workspace.state("test-env");
+
+      // This function would only accept CacheKey, not raw string
+      const acceptsCacheKey = (cacheKey: CacheKey): string => cacheKey;
+
+      // This should work without TypeScript errors
+      expect(acceptsCacheKey(key)).toBe("fb:env:test-env:state");
+
+      // Raw string would not be accepted (TypeScript compile-time check)
+      // acceptsCacheKey("fb:env:test:state"); // This would cause TS error
+    });
+
+    test("should work with all namespace keys", () => {
+      const keys = [
+        createCacheKey.workspace.state("env-1"),
+        createCacheKey.workspace.config("env-1"),
+        createCacheKey.workspace.segments("env-1"),
+        createCacheKey.organization.billing("org-1"),
+        createCacheKey.license.status("org-1"),
+        createCacheKey.license.previous_result("org-1"),
+        createCacheKey.hub.feedbackRecordTenant("record-1"),
+        createCacheKey.rateLimit.core("api", "user-1", 123456),
+        createCacheKey.custom("analytics", "temp-1"),
+        createCacheKey.custom("analytics", "temp-1", "sub"),
+      ];
+
+      keys.forEach((key) => {
+        expect(typeof key).toBe("string");
+        expect(key.startsWith("fb:")).toBe(true);
+      });
+    });
+  });
+
+  describe("validation and error handling", () => {
+    test("should validate all cache key structures", () => {
+      // All generated keys should follow the fb:resource:identifier[:subresource] pattern
+      const keys = [
+        createCacheKey.workspace.state("env-123"),
+        createCacheKey.organization.billing("org-456"),
+        createCacheKey.license.status("license-789"),
+        createCacheKey.hub.feedbackRecordTenant("record-321"),
+        createCacheKey.rateLimit.core("api", "user-101", 1640995200),
+        createCacheKey.custom("analytics", "analytics-102", "daily"),
+      ];
+
+      keys.forEach((key) => {
+        // Should match the expected pattern: fb:resource:identifier[:subresource]*
+        expect(key).toMatch(/^fb:(?:[^:]+)(?::[^:]+)+$/);
+        expect(key.split(":").length).toBeGreaterThanOrEqual(3);
+      });
+    });
+
+    test("should throw consistent error messages for empty parts", () => {
+      const errorMessage = "Invalid Cache key: Parts cannot be empty";
+
+      expect(() => createCacheKey.workspace.state("")).toThrow(errorMessage);
+      expect(() => createCacheKey.organization.billing("")).toThrow(errorMessage);
+      expect(() => createCacheKey.license.status("")).toThrow(errorMessage);
+      expect(() => createCacheKey.hub.feedbackRecordTenant("")).toThrow(errorMessage);
+      expect(() => createCacheKey.rateLimit.core("", "user", 123)).toThrow(errorMessage);
+      expect(() => createCacheKey.custom("analytics", "")).toThrow(errorMessage);
+    });
+
+    test("should handle edge case values safely", () => {
+      // Test with realistic edge case values
+      const specialChars = createCacheKey.workspace.state("env_test-123.special");
+      expect(specialChars).toBe("fb:env:env_test-123.special:state");
+
+      const numeric = createCacheKey.organization.billing("12345");
+      expect(numeric).toBe("fb:org:12345:billing");
+
+      const longId = createCacheKey.license.status("very-long-organization-identifier-that-might-exist");
+      expect(longId).toBe("fb:license:very-long-organization-identifier-that-might-exist:status");
+    });
+  });
+});

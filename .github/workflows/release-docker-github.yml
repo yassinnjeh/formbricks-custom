@@ -1,0 +1,211 @@
+name: Release Community Docker Images
+
+# This workflow uses actions that are not certified by GitHub.
+# They are provided by a third-party and are governed by
+# separate terms of service, privacy policy, and support
+# documentation.
+
+on:
+  workflow_call:
+    inputs:
+      IS_PRERELEASE:
+        description: "Whether this is a prerelease (affects latest tag)"
+        required: false
+        type: boolean
+        default: false
+      MAKE_LATEST:
+        description: "Whether to tag as latest (from GitHub release 'Set as the latest release' option)"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      VERSION:
+        description: release version
+        value: ${{ jobs.build.outputs.IMAGE_TAG }}
+      IMAGE_DIGEST:
+        description: digest of the pushed community image
+        value: ${{ jobs.build.outputs.IMAGE_DIGEST }}
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      VERSION: ${{ steps.extract_release_tag.outputs.VERSION }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract release version from tag
+        id: extract_release_tag
+        run: |
+          set -euo pipefail
+
+          # Extract tag name with fallback logic for different trigger contexts
+          if [[ -n "${RELEASE_TAG:-}" ]]; then
+            TAG="$RELEASE_TAG"
+            echo "Using RELEASE_TAG override: $TAG"
+          elif [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]] || [[ "$GITHUB_REF_NAME" =~ ^v[0-9] ]]; then
+            TAG="$GITHUB_REF_NAME"
+            echo "Using GITHUB_REF_NAME (looks like tag): $TAG"
+          else
+            # Fallback: extract from GITHUB_REF for direct tag triggers
+            TAG="${GITHUB_REF#refs/tags/}"
+            if [[ -z "$TAG" || "$TAG" == "$GITHUB_REF" ]]; then
+              TAG="$GITHUB_REF_NAME"
+              echo "Using GITHUB_REF_NAME as final fallback: $TAG"
+            else
+              echo "Extracted from GITHUB_REF: $TAG"
+            fi
+          fi
+
+          # Strip v-prefix if present (normalize to clean SemVer)
+          TAG=${TAG#[vV]}
+
+          # Validate SemVer format (supports prereleases like 4.0.0-rc.1)
+          if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "ERROR: Invalid tag format '$TAG'. Expected SemVer (e.g., 1.2.3, 4.0.0-rc.1)"
+            exit 1
+          fi
+
+          echo "VERSION=$TAG" >> $GITHUB_OUTPUT
+          echo "Using version: $TAG"
+
+  build:
+    needs: resolve-version
+    uses: ./.github/workflows/build-docker-candidate.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      registry_type: ghcr
+      ghcr_image_name: ${{ github.repository }}
+      version: ${{ needs.resolve-version.outputs.VERSION }}
+      is_prerelease: ${{ inputs.IS_PRERELEASE }}
+      make_latest: ${{ inputs.MAKE_LATEST }}
+    secrets: inherit
+
+  # Self-hosters verify an install with this image (docs/self-hosting/setup/deployment-check.mdx). It is
+  # versioned with the app because it speaks the app's HTTP API, and tagged :latest only when the release
+  # itself is, so `:latest` never runs ahead of the version people have deployed.
+  deployment-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build, promote]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Self-hosters run on arm64 too, so the image ships the same architectures as the app image.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.IMAGE_TAG }}
+          PROMOTE_LATEST: ${{ inputs.MAKE_LATEST && !inputs.IS_PRERELEASE }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          # GHCR requires lower-case repository names.
+          image="${REGISTRY}/${OWNER,,}/deployment-check"
+          {
+            echo "tags<<EOF"
+            echo "${image}:${VERSION}"
+            if [[ "${PROMOTE_LATEST}" == "true" ]]; then echo "${image}:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the deployment check image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./apps/deployment-check/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+
+  validate:
+    name: Image smoke (${{ matrix.platform }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/test-release-image
+        with:
+          image_ref: ${{ needs.build.outputs.IMAGE_REF }}
+          build_identity: ${{ needs.build.outputs.BUILD_IDENTITY }}
+          registry_type: "ghcr"
+          platform: ${{ matrix.platform }}
+
+  promote:
+    name: Promote verified image
+    needs: [build, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/promote-verified-image
+        with:
+          image_ref: ${{ needs.build.outputs.IMAGE_REF }}
+          registry_type: "ghcr"
+          release_tags: ${{ needs.build.outputs.TAGS }}

@@ -1,0 +1,128 @@
+import "server-only";
+import { createClient } from "redis";
+import { logger } from "@formbricks/logger";
+import { getRedisTlsOptions } from "@formbricks/redis-config";
+import { env } from "@/lib/env";
+import { getAuthRedisReconnectDelay } from "./redis-reconnect";
+
+/**
+ * Better Auth `secondaryStorage` backed by Redis (ENG-1054).
+ *
+ * Stores sessions (alongside the DB — see `session.storeSessionInDatabase` in auth.ts),
+ * verification records, and rate-limit counters. A dedicated connection keeps Better Auth's
+ * storage independent of the @formbricks/cache CacheService (which wraps its own client with
+ * serialization/namespacing we don't want for raw BA values).
+ *
+ * Connects lazily on first use; a failed connect is not memoized so the next call can retry.
+ */
+type RedisClient = ReturnType<typeof createClient>;
+
+let clientPromise: Promise<RedisClient> | undefined;
+let activeClient: RedisClient | undefined;
+let supportsGetDel = true;
+
+const GET_AND_DELETE_SCRIPT = `local value = redis.call('GET', KEYS[1])
+if value then redis.call('DEL', KEYS[1]) end
+return value`;
+
+const isGetDelUnsupportedError = (error: unknown): boolean => {
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes("unknown command") && message.includes("getdel");
+};
+
+const getClient = (): Promise<RedisClient> => {
+  // A connection that exhausts its retries closes after the initial connect promise has resolved.
+  if (activeClient && !activeClient.isOpen) clientPromise = undefined;
+  if (!clientPromise) {
+    const redisUrl = env.REDIS_URL;
+    if (!redisUrl) throw new Error("REDIS_URL is required for authentication storage");
+    const tls = getRedisTlsOptions(redisUrl, env.REDIS_TLS_CA);
+    const client = createClient({
+      url: redisUrl,
+      socket: {
+        ...(tls && { tls: true as const, ...tls }),
+        connectTimeout: 3000,
+        reconnectStrategy: getAuthRedisReconnectDelay,
+      },
+      // Managed Redis services and their network paths can reap idle connections (for example,
+      // Azure Cache for Redis documents a 10-minute idle timeout). Ping well inside that limit.
+      pingInterval: 300_000,
+    });
+    activeClient = client;
+    client.on("error", (error) => logger.error(error, "Better Auth Redis secondary storage error"));
+    clientPromise = client
+      .connect()
+      .then(() => client)
+      .catch((error) => {
+        clientPromise = undefined; // allow a retry on the next call
+        throw error;
+      });
+  }
+  return clientPromise;
+};
+
+export const redisSecondaryStorage = {
+  get: async (key: string): Promise<string | null> => {
+    const client = await getClient();
+    return client.get(key);
+  },
+  set: async (key: string, value: string, ttl?: number): Promise<void> => {
+    const client = await getClient();
+    if (ttl === undefined) {
+      await client.set(key, value);
+    } else {
+      await client.set(key, value, { EX: ttl });
+    }
+  },
+  delete: async (key: string): Promise<void> => {
+    const client = await getClient();
+    await client.del(key);
+  },
+  // Atomic single-use consumption (verification / password-reset tokens) across instances. Without
+  // this, Better Auth falls back to a per-process lock that can't span pods, so a token could be
+  // consumed twice under concurrent requests on different instances.
+  getAndDelete: async (key: string): Promise<string | null> => {
+    const client = await getClient();
+    if (supportsGetDel) {
+      try {
+        return await client.getDel(key);
+      } catch (error) {
+        if (!isGetDelUnsupportedError(error)) throw error;
+        supportsGetDel = false;
+      }
+    }
+
+    const value = await client.eval(GET_AND_DELETE_SCRIPT, { keys: [key], arguments: [] });
+    return typeof value === "string" ? value : null;
+  },
+  /**
+   * Writes `value` only when it is above the stored number, and refreshes the key's TTL either way: the
+   * stored number never goes down, so a write that lost a race cannot undo a later one (the revocation
+   * mark, `oauth-revocation-marker.ts`). A stored value that isn't a number is overwritten.
+   */
+  setMax: async (key: string, value: number, ttl: number): Promise<void> => {
+    const client = await getClient();
+    await client.eval(
+      `local stored = tonumber(redis.call('GET', KEYS[1]))
+if not stored or stored < tonumber(ARGV[1]) then redis.call('SET', KEYS[1], ARGV[1]) end
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1`,
+      { keys: [key], arguments: [String(value), String(ttl)] }
+    );
+  },
+  // Atomic rate-limit counter across instances. INCR + EXPIRE-on-first-write run in a single Lua eval
+  // so a crash between the two can't leave a TTL-less (never-expiring) counter that would wedge the
+  // limit at max forever. Mirrors the atomic INCR/EXPIRE pattern in
+  // modules/core/rate-limit/rate-limit.ts. TTL (seconds) is applied only on creation.
+  increment: async (key: string, ttl: number): Promise<number> => {
+    const client = await getClient();
+    const count = await client.eval(
+      `local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return count`,
+      { keys: [key], arguments: [String(ttl)] }
+    );
+    return Number(count);
+  },
+};

@@ -1,0 +1,382 @@
+"use client";
+
+import { useQueryClient } from "@tanstack/react-query";
+import Image from "next/image";
+import { useMemo, useState } from "react";
+import { useForm } from "react-hook-form";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import {
+  TIntegrationGoogleSheets,
+  TIntegrationGoogleSheetsConfigData,
+} from "@formbricks/types/integration/google-sheet";
+import { TSurvey, TSurveyQuestionId } from "@formbricks/types/surveys/types";
+import { getTextContent } from "@formbricks/types/surveys/validation";
+import {
+  constructGoogleSheetsUrl,
+  extractSpreadsheetIdFromUrl,
+  isValidGoogleSheetsUrl,
+} from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/google-sheets/lib/util";
+import {
+  getSpreadsheet,
+  saveIntegrationMappings,
+} from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/api-client";
+import { integrationKeys } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/query";
+import GoogleSheetLogo from "@/images/googleSheetsLogo.png";
+import {
+  GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_PERMISSION,
+  GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_SCOPES,
+  GOOGLE_SHEET_INTEGRATION_INVALID_GRANT,
+} from "@/lib/googleSheet/constants";
+import { recallToHeadline } from "@/lib/utils/recall";
+import { V3ApiError, getV3ApiErrorMessage, getV3ApiErrorReason } from "@/modules/api/lib/v3-client";
+import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import {
+  RestrictedSurveyHint,
+  RestrictedSurveysNote,
+} from "@/modules/survey/visibility/components/restricted-survey-hint";
+import { isRestrictedSurveyPick } from "@/modules/survey/visibility/lib/outbound";
+import { AdditionalIntegrationSettings } from "@/modules/ui/components/additional-integration-settings";
+import { Button } from "@/modules/ui/components/button";
+import { Checkbox } from "@/modules/ui/components/checkbox";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
+import { DropdownSelector } from "@/modules/ui/components/dropdown-selector";
+import { Input } from "@/modules/ui/components/input";
+import { Label } from "@/modules/ui/components/label";
+
+interface AddIntegrationModalProps {
+  workspaceId: string;
+  open: boolean;
+  surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
+  setOpen: (v: boolean) => void;
+  googleSheetIntegration: TIntegrationGoogleSheets;
+  selectedIntegration?: (TIntegrationGoogleSheetsConfigData & { index: number }) | null;
+}
+
+export const AddIntegrationModal = ({
+  workspaceId,
+  surveys,
+  surveyVisibilityEnabled,
+  open,
+  setOpen,
+  googleSheetIntegration,
+  selectedIntegration,
+}: Readonly<AddIntegrationModalProps>) => {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const refetchIntegration = () =>
+    queryClient.invalidateQueries({ queryKey: integrationKeys.byType(workspaceId, "googleSheets") });
+  const { handleSubmit } = useForm();
+  // The mapping being edited keeps its survey selectable even if it has since been restricted.
+  const attachedSurveyIds = selectedIntegration ? [selectedIntegration.surveyId] : [];
+  const [selectedElements, setSelectedElements] = useState<string[]>([]);
+  const [isLinkingSheet, setIsLinkingSheet] = useState(false);
+  const [selectedSurvey, setSelectedSurvey] = useState<TSurvey | null>(null);
+  const [spreadsheetUrl, setSpreadsheetUrl] = useState("");
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
+  const existingMappings = googleSheetIntegration?.config?.data ?? [];
+  const [includeVariables, setIncludeVariables] = useState(false);
+  const [includeHiddenFields, setIncludeHiddenFields] = useState(false);
+  const [includeMetadata, setIncludeMetadata] = useState(false);
+  const [includeCreatedAt, setIncludeCreatedAt] = useState(true);
+  const [includeContactAttributes, setIncludeContactAttributes] = useState(false);
+
+  const surveyElements = useMemo(
+    () => (selectedSurvey ? getElementsFromBlocks(selectedSurvey.blocks) : []),
+    [selectedSurvey]
+  );
+
+  // A new mapping starts with every question of the picked survey selected.
+  const handleSurveySelect = (survey: TSurvey) => {
+    setSelectedSurvey(survey);
+    if (!selectedIntegration) {
+      setSelectedElements(getElementsFromBlocks(survey.blocks).map((element) => element.id));
+    }
+  };
+
+  const resetForm = () => {
+    setSpreadsheetUrl("");
+    setIsLinkingSheet(false);
+    setSelectedSurvey(null);
+    setIncludeHiddenFields(false);
+    setIncludeMetadata(false);
+  };
+
+  // Load the mapping being edited (or reset for a new one) whenever it, or the survey list, changes.
+  // Adjusted during render.
+  const [loadedFrom, setLoadedFrom] = useState({ selectedIntegration, surveys });
+  if (loadedFrom.selectedIntegration !== selectedIntegration || loadedFrom.surveys !== surveys) {
+    setLoadedFrom({ selectedIntegration, surveys });
+    if (selectedIntegration) {
+      setSpreadsheetUrl(constructGoogleSheetsUrl(selectedIntegration.spreadsheetId));
+      setSelectedSurvey(
+        surveys.find((survey) => {
+          return survey.id === selectedIntegration.surveyId;
+        })!
+      );
+      setSelectedElements(selectedIntegration.elementIds);
+      setIncludeVariables(!!selectedIntegration.includeVariables);
+      setIncludeHiddenFields(!!selectedIntegration.includeHiddenFields);
+      setIncludeMetadata(!!selectedIntegration.includeMetadata);
+      setIncludeCreatedAt(!!selectedIntegration.includeCreatedAt);
+      setIncludeContactAttributes(!!selectedIntegration.includeContactAttributes);
+    } else {
+      resetForm();
+    }
+  }
+
+  const showErrorMessageToast = (error: unknown) => {
+    // Google knows no spreadsheet by the id the pasted URL carries: a typo, or one since deleted.
+    if (error instanceof V3ApiError && error.status === 404) {
+      toast.error(t("workspace.integrations.google_sheets.enter_a_valid_spreadsheet_url_error"));
+      return;
+    }
+    const errorMessage = getV3ApiErrorReason(error, "");
+    // Disconnected in another tab, or the grant expired: either way the way out is to reconnect.
+    if (errorMessage === GOOGLE_SHEET_INTEGRATION_INVALID_GRANT || errorMessage === "not_connected") {
+      toast.error(t("workspace.integrations.google_sheets.token_expired_error"));
+    } else if (errorMessage === GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_PERMISSION) {
+      toast.error(t("workspace.integrations.google_sheets.spreadsheet_permission_error"));
+    } else if (errorMessage === GOOGLE_SHEET_INTEGRATION_INSUFFICIENT_SCOPES) {
+      toast.error(t("workspace.integrations.google_sheets.spreadsheet_scope_error"));
+    } else {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    }
+  };
+
+  const linkSheet = async () => {
+    try {
+      if (!isValidGoogleSheetsUrl(spreadsheetUrl)) {
+        throw new Error(t("workspace.integrations.google_sheets.enter_a_valid_spreadsheet_url_error"));
+      }
+      if (!selectedSurvey) {
+        throw new Error(t("workspace.integrations.please_select_a_survey_error"));
+      }
+      if (selectedElements.length === 0) {
+        throw new Error(t("workspace.integrations.select_at_least_one_question_error"));
+      }
+      setIsLinkingSheet(true);
+      const spreadsheetId = extractSpreadsheetIdFromUrl(spreadsheetUrl);
+      let spreadsheetName: string;
+      try {
+        spreadsheetName = (await getSpreadsheet(workspaceId, spreadsheetId)).name;
+      } catch (error) {
+        showErrorMessageToast(error);
+        return;
+      }
+
+      const integrationData: TIntegrationGoogleSheetsConfigData = {
+        spreadsheetId,
+        spreadsheetName,
+        surveyId: selectedSurvey.id,
+        surveyName: selectedSurvey.name,
+        elementIds: selectedElements,
+        elements:
+          selectedElements.length === surveyElements.length
+            ? t("common.all_questions")
+            : t("common.selected_questions"),
+        // oxlint-disable-next-line react/purity -- runs on submit: handleSubmit(linkSheet) only wraps it during render
+        createdAt: new Date(),
+        includeVariables,
+        includeHiddenFields,
+        includeMetadata,
+        includeCreatedAt,
+        includeContactAttributes,
+      };
+      // Edit a copy: the cached integration stays as stored until the save succeeds and the query refetches.
+      const mappings = [...existingMappings];
+      if (selectedIntegration) {
+        mappings[selectedIntegration.index] = integrationData;
+      } else {
+        mappings.push(integrationData);
+      }
+      await saveIntegrationMappings(workspaceId, "googleSheets", mappings);
+      if (selectedIntegration) {
+        toast.success(t("workspace.integrations.integration_updated_successfully"));
+      } else {
+        toast.success(t("workspace.integrations.integration_added_successfully"));
+      }
+      resetForm();
+      setOpen(false);
+      void refetchIntegration();
+    } catch (e) {
+      toast.error(getV3ApiErrorMessage(e, t("common.something_went_wrong_please_try_again")));
+    } finally {
+      setIsLinkingSheet(false);
+    }
+  };
+
+  const handleCheckboxChange = (questionId: TSurveyQuestionId) => {
+    setSelectedElements((prevValues) =>
+      prevValues.includes(questionId)
+        ? prevValues.filter((value) => value !== questionId)
+        : [...prevValues, questionId]
+    );
+  };
+
+  const setOpenWithStates = (isOpen: boolean) => {
+    resetForm();
+    setOpen(isOpen);
+  };
+
+  const deleteLink = async () => {
+    const mappings = existingMappings.filter((_, index) => index !== selectedIntegration!.index);
+    try {
+      setIsDeleting(true);
+      await saveIntegrationMappings(workspaceId, "googleSheets", mappings);
+      toast.success(t("workspace.integrations.integration_removed_successfully"));
+      setOpen(false);
+      void refetchIntegration();
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpenWithStates}>
+      <DialogContent>
+        <DialogHeader>
+          <div className="flex items-center gap-x-2">
+            <div className="relative size-8">
+              <Image
+                fill
+                className="object-contain object-center"
+                src={GoogleSheetLogo}
+                alt={t("workspace.integrations.google_sheets.google_sheet_logo")}
+              />
+            </div>
+            <div className="space-y-0.5">
+              <DialogTitle>{t("workspace.integrations.google_sheets.link_google_sheet")}</DialogTitle>
+              <DialogDescription>
+                {t("workspace.integrations.google_sheets.google_sheets_integration_description")}
+              </DialogDescription>
+            </div>
+          </div>
+        </DialogHeader>
+        <form className="space-y-4" onSubmit={handleSubmit(linkSheet)}>
+          <DialogBody>
+            <div className="w-full space-y-4">
+              <div>
+                <div className="mb-4">
+                  <Label>{t("workspace.integrations.google_sheets.spreadsheet_url")}</Label>
+                  <Input
+                    value={spreadsheetUrl}
+                    onChange={(e) => setSpreadsheetUrl(e.target.value)}
+                    placeholder="https://docs.google.com/spreadsheets/d/<your-spreadsheet-id>"
+                    className="mt-1"
+                  />
+                </div>
+                <div>
+                  <DropdownSelector
+                    label={t("common.select_survey")}
+                    items={surveys}
+                    selectedItem={selectedSurvey}
+                    setSelectedItem={handleSurveySelect}
+                    disabled={surveys.length === 0}
+                    isItemDisabled={(survey: TSurvey) =>
+                      isRestrictedSurveyPick(surveyVisibilityEnabled, survey, attachedSurveyIds)
+                    }
+                    disabledItemHint={<RestrictedSurveyHint kind="restricted" />}
+                  />
+                  <RestrictedSurveysNote
+                    surveyVisibilityEnabled={surveyVisibilityEnabled}
+                    surveys={surveys}
+                    attachedSurveyIds={attachedSurveyIds}
+                  />
+                  <p className="m-1 text-xs text-slate-500">
+                    {surveys.length === 0 && t("workspace.integrations.create_survey_warning")}
+                  </p>
+                </div>
+              </div>
+              {selectedSurvey && (
+                <div className="space-y-4">
+                  <div>
+                    <Label htmlFor="Surveys">{t("common.questions")}</Label>
+                    <div className="mt-1 max-h-[15vh] overflow-x-hidden overflow-y-auto rounded-lg border border-slate-200">
+                      <div className="grid content-center rounded-lg bg-slate-50 p-3 text-left text-sm text-slate-900">
+                        {surveyElements.map((question) => (
+                          <div key={question.id} className="my-1 flex items-center gap-x-2">
+                            <label htmlFor={question.id} className="flex cursor-pointer items-center">
+                              <Checkbox
+                                type="button"
+                                id={question.id}
+                                value={question.id}
+                                className="bg-white"
+                                checked={selectedElements.includes(question.id)}
+                                onCheckedChange={() => {
+                                  handleCheckboxChange(question.id);
+                                }}
+                              />
+                              <span className="ml-2 w-120 truncate">
+                                {getTextContent(
+                                  recallToHeadline(question.headline, selectedSurvey, false, "default")[
+                                    "default"
+                                  ]
+                                )}
+                              </span>
+                            </label>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  <AdditionalIntegrationSettings
+                    includeVariables={includeVariables}
+                    setIncludeVariables={setIncludeVariables}
+                    includeHiddenFields={includeHiddenFields}
+                    includeMetadata={includeMetadata}
+                    setIncludeHiddenFields={setIncludeHiddenFields}
+                    setIncludeMetadata={setIncludeMetadata}
+                    includeCreatedAt={includeCreatedAt}
+                    setIncludeCreatedAt={setIncludeCreatedAt}
+                    includeContactAttributes={includeContactAttributes}
+                    setIncludeContactAttributes={setIncludeContactAttributes}
+                  />
+                </div>
+              )}
+            </div>
+          </DialogBody>
+          <DialogFooter>
+            {selectedIntegration ? (
+              <Button
+                type="button"
+                variant="destructive"
+                loading={isDeleting}
+                onClick={() => {
+                  void deleteLink();
+                }}>
+                {t("common.delete")}
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  setOpen(false);
+                  resetForm();
+                }}>
+                {t("common.cancel")}
+              </Button>
+            )}
+            <Button type="submit" loading={isLinkingSheet}>
+              {selectedIntegration
+                ? t("common.update")
+                : t("workspace.integrations.google_sheets.link_google_sheet")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+};

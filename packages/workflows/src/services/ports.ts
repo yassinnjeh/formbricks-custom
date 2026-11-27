@@ -1,0 +1,374 @@
+import type { TWorkflowStatus } from "../types/common";
+import type { TWorkflowDefinition, TWorkflowExecutableDefinition } from "../types/document";
+import type {
+  TWorkflowRunData,
+  TWorkflowRunLogInput,
+  TWorkflowRunLogOutput,
+  TWorkflowRunLogStatus,
+  TWorkflowRunStatus,
+  TWorkflowTriggerRunPayload,
+} from "../types/runs";
+import type { TWorkflowSampleData } from "../types/samples";
+
+/**
+ * Runtime ports the workflow server code depends on. They are injected by the adapter
+ * (`apps/web`) so this package stays framework-agnostic and carries no dependency on
+ * `@formbricks/database` — which itself imports `@formbricks/workflows`, so a hard edge back
+ * would create a package build cycle.
+ *
+ * The row and delegate shapes are hand-authored from our own domain types (the row's
+ * `definition`/`status` ARE our types) rather than imported from Prisma's generated client. This
+ * keeps the package a dependency-free leaf; the real Prisma client structurally satisfies these
+ * ports, so the adapter wires it in directly — no cast required.
+ */
+
+/** A `Workflow` row, matching `packages/database/schema/workflows.prisma`. */
+export interface WorkflowRow {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  name: string;
+  description: string | null;
+  status: TWorkflowStatus;
+  workspaceId: string;
+  createdBy: string | null;
+  creator?: { name: string } | null;
+  definition: TWorkflowDefinition;
+  /**
+   * Webhook Secret URL token (ADR 0048): a hash to check calls and an encrypted copy to show the URL
+   * again. Optional on the port because only the webhook operations read them; the Prisma row always
+   * carries both. Never serialized into a resource, an audit snapshot or a log line.
+   */
+  webhookTokenHash?: string | null;
+  webhookTokenEncrypted?: string | null;
+}
+
+/** The subset of `WorkflowRun` fields the list/detail serializers read for `lastRun`. */
+export interface WorkflowRunRow {
+  id: string;
+  createdAt: Date;
+  updatedAt: Date;
+  workflowId: string;
+  workspaceId: string;
+  workflowVersionId: string | null;
+  responseId: string | null;
+  status: TWorkflowRunStatus;
+  // `triggerType` is a free-form `String` column in Prisma (unlike `status`, which is a
+  // `WorkflowRunStatus` enum), so the port mirrors it as `string`. Do NOT narrow this to the
+  // `ZWorkflowTriggerType` union here: the real Prisma row yields `string`, which would then fail
+  // to satisfy this port and break the adapter's structural wiring. The serializer narrows it and
+  // `validateOutput` enforces the union at the response boundary instead.
+  triggerType: string;
+  surveyId: string | null;
+  isDryRun: boolean;
+  attempt: number;
+  error: string | null;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+}
+
+/** A workflow row with its most recent run eagerly loaded (for `lastRun`) and its real (non-Test) run count. */
+export type WorkflowRowWithLastRun = WorkflowRow & {
+  runs: WorkflowRunRow[];
+  _count: { runs: number };
+  /**
+   * The workflow's stored secret header values, id and the origin each was set for (ADR 0051), so a
+   * read can say where each is sent. Never the value. Optional on the port: test rows may omit it.
+   */
+  secrets?: WorkflowSecretOriginRow[];
+};
+
+/** A stored secret header value's id and the origin it was set for (null: before host binding). */
+export interface WorkflowSecretOriginRow {
+  id: string;
+  boundOrigin: string | null;
+}
+
+/** A run-list row: the slim run plus its workflow's name, joined for the runs-list display. */
+export interface WorkflowRunListRow extends WorkflowRunRow {
+  workflow: { name: string };
+}
+
+/**
+ * Eager-load shape for the most recent run plus the creating user's name; matches the Prisma
+ * `include` the adapter satisfies. The `creator` relation (named in `workflows.prisma`) lets the
+ * list/detail serializers emit `creator` without an extra query.
+ */
+export interface LastRunInclude {
+  runs: { take: number; orderBy: { createdAt: "desc" } };
+  creator: { select: { name: true } };
+  _count: { select: { runs: { where: { isDryRun: false } } } };
+  secrets: { select: { id: true; boundOrigin: true } };
+}
+
+/** Narrow `where` filter the service builds — a deliberately small slice of Prisma's WhereInput. */
+export interface WorkflowWhereInput {
+  workspaceId?: string;
+  status?: TWorkflowStatus | { in: TWorkflowStatus[] } | { not: TWorkflowStatus };
+  name?: { contains: string; mode: "insensitive" } | { gt: string } | string;
+  id?: { gt: string } | { lt: string };
+  createdAt?: { lt: Date } | Date;
+  updatedAt?: { lt: Date } | Date;
+  OR?: WorkflowWhereInput[];
+}
+
+export interface WorkflowOrderByInput {
+  id?: "asc" | "desc";
+  name?: "asc" | "desc";
+  createdAt?: "asc" | "desc";
+  updatedAt?: "asc" | "desc";
+}
+
+/**
+ * The slice of `prisma.workflow` the service calls. The real Prisma delegate is structurally
+ * broader; the adapter bridges it to this port.
+ */
+export interface WorkflowDelegate {
+  findMany: (args: {
+    where: WorkflowWhereInput;
+    orderBy: WorkflowOrderByInput[];
+    take: number;
+    include: LastRunInclude;
+  }) => Promise<WorkflowRowWithLastRun[]>;
+  /** Total for `includeTotalCount`: the list's filters without the cursor. */
+  count: (args: { where: WorkflowWhereInput }) => Promise<number>;
+  findUnique: (args: {
+    where: { id: string };
+    include: LastRunInclude;
+  }) => Promise<WorkflowRowWithLastRun | null>;
+  create: (args: {
+    data: {
+      workspaceId: string;
+      name: string;
+      description: string | null;
+      status: TWorkflowStatus;
+      definition: TWorkflowDefinition;
+      createdBy: string | null;
+      webhookTokenHash?: string;
+      webhookTokenEncrypted?: string;
+    };
+    include: LastRunInclude;
+  }) => Promise<WorkflowRowWithLastRun>;
+  update: (args: {
+    where: { id_workspaceId: { id: string; workspaceId: string } };
+    data: {
+      name?: string;
+      description?: string | null;
+      status?: TWorkflowStatus;
+      definition?: TWorkflowDefinition;
+      webhookTokenHash?: string;
+      webhookTokenEncrypted?: string;
+    };
+    include: LastRunInclude;
+  }) => Promise<WorkflowRowWithLastRun>;
+  /**
+   * Conditional status transition. `enable` uses it inside its transaction to flip a draft/disabled
+   * row to enabled and assert exactly one row changed — the row lock serializes concurrent enables,
+   * so the guard can't be bypassed the way a pre-transaction status read could.
+   */
+  updateMany: (args: {
+    where: { id: string; workspaceId: string; status: { in: TWorkflowStatus[] } };
+    data: { status: TWorkflowStatus };
+  }) => Promise<{ count: number }>;
+  delete: (args: {
+    where: { id_workspaceId: { id: string; workspaceId: string } };
+  }) => Promise<{ id: string }>;
+}
+
+/** A `WorkflowVersion` row (immutable executable snapshot), matching the Prisma schema. */
+export interface WorkflowVersionRow {
+  id: string;
+  workflowId: string;
+  workspaceId: string;
+  version: number;
+  definition: TWorkflowExecutableDefinition;
+  publishedAt: Date;
+  publishedBy: string | null;
+}
+
+/** The slice of `prisma.workflowVersion` the enable transaction calls. */
+export interface WorkflowVersionDelegate {
+  findFirst: (args: {
+    where: { workflowId: string };
+    orderBy: { version: "desc" };
+    select: { version: true };
+  }) => Promise<{ version: number } | null>;
+  create: (args: {
+    data: {
+      workflowId: string;
+      workspaceId: string;
+      version: number;
+      definition: TWorkflowExecutableDefinition;
+      publishedBy: string | null;
+    };
+  }) => Promise<WorkflowVersionRow>;
+}
+
+/** Delegates available inside an interactive transaction (the subset enable needs to be atomic). */
+export interface WorkflowsTransaction {
+  workflow: WorkflowDelegate;
+  workflowVersion: WorkflowVersionDelegate;
+}
+
+/** A persisted `WorkflowRunLog` step trace row, matching `packages/database/schema/workflows.prisma`. */
+export interface WorkflowRunLogRow {
+  id: string;
+  runId: string;
+  sequence: number;
+  stepId: string;
+  stepType: string;
+  status: TWorkflowRunLogStatus;
+  input: TWorkflowRunLogInput;
+  output: TWorkflowRunLogOutput;
+  error: string | null;
+  startedAt: Date | null;
+  finishedAt: Date | null;
+}
+
+/**
+ * The full `WorkflowRun` row plus its ordered step logs, returned by the run-detail read. Extends the
+ * slim `WorkflowRunRow` (the list/lastRun shape) with the debug-oriented fields the detail resource
+ * exposes. The JSON columns (`triggerPayload`, `data`) are typed via the schema's
+ * prisma-json-types-generator annotations, so the real Prisma row satisfies this without a cast.
+ */
+export interface WorkflowRunWithLogsRow extends WorkflowRunRow {
+  triggerPayload: TWorkflowTriggerRunPayload;
+  data: TWorkflowRunData;
+  idempotencyKey: string | null;
+  nextAttemptAt: Date | null;
+  lastErrorAt: Date | null;
+  /** The caller's IP for a run a Webhook Secret URL call started; null otherwise. */
+  callerIp: string | null;
+  /** When the retention job deleted the run's content (ADR 0044); null while it is kept. */
+  contentDeletedAt: Date | null;
+  /** The retention period in days that applied when the content was deleted. */
+  contentRetentionDays: number | null;
+  /** The version the run executed, for its number; null for a Test run. */
+  workflowVersion: { version: number } | null;
+  logs: WorkflowRunLogRow[];
+}
+
+/** Narrow `where` filter the run list builds — a deliberately small slice of Prisma's WhereInput. */
+export interface WorkflowRunWhereInput {
+  workspaceId?: string;
+  workflowId?: string;
+  responseId?: string;
+  status?: { in: TWorkflowRunStatus[] };
+  isDryRun?: boolean;
+  createdAt?: { lt: Date } | Date;
+  id?: { lt: string };
+  surveyId?: null | { notIn: string[] };
+  OR?: WorkflowRunWhereInput[];
+  AND?: WorkflowRunWhereInput[];
+}
+
+export interface WorkflowRunOrderByInput {
+  createdAt?: "asc" | "desc";
+  id?: "asc" | "desc";
+}
+
+/** Eager-load shape for a run's step logs, ordered by sequence; matches the Prisma `include`. */
+export interface WorkflowRunLogInclude {
+  logs: { orderBy: { sequence: "asc" } };
+  workflowVersion: { select: { version: true } };
+}
+
+/**
+ * The slice of `prisma.workflowRun` the runs read API calls. `findMany` returns slim summary rows
+ * (newest-first, keyset-paginated); `findUnique` returns the full row with ordered logs for detail.
+ */
+export interface WorkflowRunDelegate {
+  findMany: (args: {
+    where: WorkflowRunWhereInput;
+    orderBy: WorkflowRunOrderByInput[];
+    take: number;
+    // The list emits only the slim `WorkflowRunRow` scalars, so omit the large JSON columns
+    // (`triggerPayload`, `data`) to avoid reading/shipping up to 100 big blobs per page for nothing.
+    // The detail `findUnique` keeps them. Optional so the port stays a faithful subset of Prisma's args.
+    omit?: { triggerPayload?: true; data?: true; testRunDefinition?: true };
+    // Join the workflow's name so the workspace-wide runs table can label each row without an
+    // N+1 client lookup. Required because the return type guarantees `workflow.name` is present;
+    // `omit` + `include` compose in Prisma (unlike `select` + `omit`).
+    include: { workflow: { select: { name: true } } };
+  }) => Promise<WorkflowRunListRow[]>;
+  findUnique: (args: {
+    where: { id: string };
+    include: WorkflowRunLogInclude;
+  }) => Promise<WorkflowRunWithLogsRow | null>;
+  /** Saves a Test run: a queued dry run with no version (ENG-7181). */
+  create: (args: {
+    data: {
+      workflowId: string;
+      workspaceId: string;
+      workflowVersionId: null;
+      status: "queued";
+      triggerType: string;
+      /** A Response completed Test run's survey and response, as a real run records them. */
+      surveyId?: string;
+      responseId?: string;
+      isDryRun: true;
+      attempt: number;
+      triggerPayload: TWorkflowTriggerRunPayload;
+      /** The draft the Test run executes, so its graph can be drawn after the draft changes. */
+      testRunDefinition: TWorkflowExecutableDefinition;
+    };
+    select: { id: true };
+  }) => Promise<{ id: string }>;
+}
+
+/** A `WorkflowSample` row (ADR 0048): one per workflow and source, matching the Prisma schema. */
+export interface WorkflowSampleRow {
+  workflowId: string;
+  workspaceId: string;
+  source: string;
+  sample: TWorkflowSampleData;
+  lastCalledAt: Date | null;
+  lastCallerIp: string | null;
+  updatedAt: Date;
+}
+
+interface WorkflowSampleKey {
+  workflowId_source: { workflowId: string; source: string };
+}
+
+/** The slice of `prisma.workflowSample` the webhook operations call. */
+export interface WorkflowSampleDelegate {
+  findUnique: (args: { where: WorkflowSampleKey }) => Promise<WorkflowSampleRow | null>;
+  upsert: (args: {
+    where: WorkflowSampleKey;
+    create: { workflowId: string; workspaceId: string; source: string; sample: TWorkflowSampleData };
+    update: { sample: TWorkflowSampleData };
+  }) => Promise<WorkflowSampleRow>;
+}
+
+/**
+ * Issues and reveals Webhook Secret URL tokens. Injected by the adapter, which owns the randomness,
+ * the hash and the app's encryption key, so this package never handles key material.
+ */
+export interface WebhookTokenIssuer {
+  /** A new random token, returned only as its hash (to check calls) and encrypted copy (to show it again). */
+  issue: () => { hash: string; encrypted: string };
+  /** The plaintext token from its encrypted copy. */
+  reveal: (encrypted: string) => string;
+}
+
+export interface WorkflowsDb {
+  workflow: WorkflowDelegate;
+  workflowVersion: WorkflowVersionDelegate;
+  workflowRun: WorkflowRunDelegate;
+  workflowSample: WorkflowSampleDelegate;
+  /** Interactive transaction; the real Prisma client's `$transaction` satisfies this structurally. */
+  $transaction: <R>(fn: (tx: WorkflowsTransaction) => Promise<R>) => Promise<R>;
+}
+
+/**
+ * Minimal structural logger port. Satisfied by a request-bound `@formbricks/logger` child
+ * (`logger.withContext({ requestId })`). The package never imports the logger package directly.
+ *
+ * Log a caught error under `error` or `err`: the adapter (`apps/web` `toWorkflowsLogger`) reduces it to
+ * name and frames, since a message can quote a definition, a payload or a stored value.
+ */
+export interface WorkflowsLogger {
+  warn: (obj: object, msg?: string) => void;
+  error: (obj: object, msg?: string) => void;
+}

@@ -1,0 +1,126 @@
+---
+title: "Workflows"
+sidebarTitle: "Overview"
+description: "Automate tasks in Formbricks with triggers, conditions, actions, and observable runs."
+icon: "https://d3gk2c5xim1je2.cloudfront.net/lucide/v1.16.0/workflow.svg"
+---
+
+Workflows automate tasks in response to events in Formbricks or in other systems. You define the event that
+starts the workflow, decide which events qualify, and choose the actions Formbricks should perform.
+
+<Info>
+  Workflows are in **Beta**. They appear under **Act** in the app, badged Beta. Expect the feature set
+  to keep moving; we will note breaking changes here.
+</Info>
+
+<Note>Workflows are part of the Formbricks [Enterprise Edition](/self-hosting/advanced/license).</Note>
+
+## How Workflows work
+
+<CardGroup cols={2}>
+  <Card title="Trigger" icon="bolt">
+    The event that starts a workflow: a completed survey response, or a call to the workflow's Webhook Secret
+    URL from another system.
+  </Card>
+
+  <Card title="Logic" icon="code-branch">
+    Steps that decide what happens inside the run. An **If/else** sends the run down one of two branches, a
+    **Switch** down one of several, and a **Filter** ends the run unless its conditions hold.
+  </Card>
+
+  <Card title="Action" icon="play">
+    Steps with an effect outside the run, such as **Send email** or **HTTP request**.
+  </Card>
+
+  <Card title="Run" icon="list-check">
+    A concrete execution of an enabled workflow. Every run records its overall status and logs for its
+    individual steps.
+  </Card>
+</CardGroup>
+
+For example, a workflow can email a customer a survey when your helpdesk closes their ticket by phone:
+
+`Webhook trigger` → `If/else: payload.channel equals phone` → `Then: Send email to payload.customer.email`
+
+## Available triggers, conditions, and actions
+
+The builder lists the options available in your Formbricks version. The tables below show what you can use
+today.
+
+### Triggers
+
+| Trigger                                         | Description                                                                         |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------- |
+| **Response completed**                          | Starts the workflow when a survey linked to it records a completed response.        |
+| [**Webhook**](/workflows/webhook-trigger)       | Starts the workflow when another system sends JSON to its Webhook Secret URL.       |
+
+### Conditions and logic
+
+| Condition                               | Description                                                                         |
+| --------------------------------------- | ----------------------------------------------------------------------------------- |
+| **Ending card filter**                  | Runs a Response completed workflow for all ending cards or only the selected ones.  |
+| [**If/else**](/workflows/if-else)       | Sends the run down its Then or Else branch depending on conditions.                 |
+| [**Switch**](/workflows/switch)         | Sends the run down the branch of the first case that matches one Variable, or Default. |
+| [**Filter**](/workflows/filter)         | Lets the run go on only when its conditions hold, and ends it otherwise.            |
+
+### Actions
+
+| Action                                        | Description                                                                         |
+| --------------------------------------------- | ----------------------------------------------------------------------------------- |
+| **Send email**                                | Sends an email, to a fixed address, a survey respondent or an [address from the payload](/workflows/send-email#send-to-an-address-from-the-payload). |
+| [**HTTP request**](/workflows/http-request)   | Calls an outside API and passes the response to later steps.                        |
+
+## Current capabilities
+
+You can currently use Workflows to:
+
+- Start when a response is completed for a selected survey, or when another system calls a Webhook Secret URL
+- Branch with If/else and Switch, or stop with a Filter, on payload values, survey answers and earlier step
+  results
+- Send an email, including a survey link that carries Embedded Data from the payload
+- Call an outside API and use its response in later steps
+- Try a workflow with a Test run before you enable it
+- Inspect workspace-wide or workflow-specific execution history
+
+<Note>
+  Schedules, delays, loops over lists, and branches that join again are not available yet.
+</Note>
+
+## Get started
+
+<CardGroup cols={2}>
+  <Card title="Build a workflow" icon="rocket" href="/workflows/build">
+    Choose a trigger and action, configure them, optionally validate the workflow, and enable it.
+  </Card>
+
+  <Card title="Start from another system" icon="webhook" href="/workflows/webhook-trigger">
+    Start runs with a Webhook Secret URL and use the payload in later steps.
+  </Card>
+
+  <Card title="Webhooks vs workflows" icon="scale-balanced" href="/workflows/webhooks-vs-workflows">
+    Choose between the Webhooks integration, a Webhook trigger and an HTTP request.
+  </Card>
+
+  <Card
+    title="Manage and monitor"
+    icon="magnifying-glass-chart"
+    href="/workflows/manage-and-monitor"
+  >
+    Manage the workflow lifecycle and investigate runs and step logs.
+  </Card>
+</CardGroup>
+
+## Self-host Workflows
+
+Self-hosted deployments run Workflows through the shared Redis-backed Job Runner built into the Formbricks web
+process. Before using Workflows in production, configure Redis and any services required by your actions, such
+as SMTP for **Send email**. For the Webhook trigger, check that your reverse proxy forwards the
+[headers it needs](/self-hosting/configuration/environment-variables#workflow-webhook-trigger-behind-a-reverse-proxy).
+
+<Card title="Configure the Job Runner" icon="gears" href="/self-hosting/configuration/job-runner">
+  Set up the runner, scale it across replicas, and troubleshoot queued or failed runs.
+</Card>
+
+## Replace email follow-ups
+
+Use the [migration checklist](/surveys/general-features/email-followups#move-to-workflows) to move existing emails without duplicate delivery. Check plan and release availability before disabling the old automation.

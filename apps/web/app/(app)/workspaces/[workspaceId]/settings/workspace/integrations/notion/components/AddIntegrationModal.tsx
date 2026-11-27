@@ -1,0 +1,437 @@
+"use client";
+
+import { createId } from "@paralleldrive/cuid2";
+import { useQueryClient } from "@tanstack/react-query";
+import Image from "next/image";
+import { useEffect, useMemo, useState } from "react";
+import { useForm } from "react-hook-form";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
+import { labelEmbeddedFields } from "@formbricks/types/embedded-data-label";
+import {
+  getComputedEmbeddedFields,
+  getIngestedEmbeddedFields,
+} from "@formbricks/types/embedded-data-resolver";
+import {
+  TIntegrationNotion,
+  TIntegrationNotionConfigData,
+  TIntegrationNotionDatabase,
+} from "@formbricks/types/integration/notion";
+import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { getTextContent } from "@formbricks/types/surveys/validation";
+import { saveIntegrationMappings } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/api-client";
+import { integrationKeys } from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/lib/query";
+import {
+  MappingRow,
+  TMapping,
+  createEmptyMapping,
+} from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/notion/components/MappingRow";
+import {
+  getDatabaseProperties,
+  getDatabaseTitle,
+} from "@/app/(app)/workspaces/[workspaceId]/settings/workspace/integrations/notion/lib/database";
+import NotionLogo from "@/images/notion.png";
+import { recallToHeadline } from "@/lib/utils/recall";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import {
+  RestrictedSurveyHint,
+  RestrictedSurveysNote,
+} from "@/modules/survey/visibility/components/restricted-survey-hint";
+import { isRestrictedSurveyPick } from "@/modules/survey/visibility/lib/outbound";
+import { Button } from "@/modules/ui/components/button";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
+import { DropdownSelector } from "@/modules/ui/components/dropdown-selector";
+import { Label } from "@/modules/ui/components/label";
+
+interface AddIntegrationModalProps {
+  workspaceId: string;
+  surveys: TSurvey[];
+  surveyVisibilityEnabled: boolean;
+  open: boolean;
+  setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  notionIntegration: TIntegrationNotion;
+  databases: TIntegrationNotionDatabase[];
+  selectedIntegration: (TIntegrationNotionConfigData & { index: number }) | null;
+  contactAttributeKeys: TContactAttributeKey[];
+}
+
+export const AddIntegrationModal = ({
+  workspaceId,
+  surveys,
+  surveyVisibilityEnabled,
+  open,
+  setOpen,
+  notionIntegration,
+  databases,
+  selectedIntegration,
+  contactAttributeKeys,
+}: Readonly<AddIntegrationModalProps>) => {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const refetchIntegration = () =>
+    queryClient.invalidateQueries({ queryKey: integrationKeys.byType(workspaceId, "notion") });
+  const { handleSubmit } = useForm();
+  // The mapping being edited keeps its survey selectable even if it has since been restricted.
+  const attachedSurveyIds = selectedIntegration ? [selectedIntegration.surveyId] : [];
+  const [selectedDatabase, setSelectedDatabase] = useState<TIntegrationNotionDatabase | null>();
+  const [selectedSurvey, setSelectedSurvey] = useState<TSurvey | null>(null);
+  const [mapping, setMapping] = useState<TMapping[]>([createEmptyMapping()]);
+  const [isDeleting, setIsDeleting] = useState<boolean>(false);
+  const [isLinkingDatabase, setIsLinkingDatabase] = useState(false);
+  const integrationData = {
+    databaseId: "",
+    databaseName: "",
+    surveyId: "",
+    surveyName: "",
+    mapping: [
+      {
+        column: { id: "", name: "", type: "" },
+        element: { id: "", name: "", type: "" },
+      },
+    ],
+    createdAt: new Date(),
+  };
+
+  const elements = useMemo(
+    () => (selectedSurvey ? getElementsFromBlocks(selectedSurvey.blocks) : []),
+    [selectedSurvey]
+  );
+
+  const existingMappings = notionIntegration.config?.data ?? [];
+
+  const hasMatchingId = notionIntegration.config.data.some((configData) => {
+    if (!selectedDatabase) {
+      return false;
+    }
+    return configData.databaseId === selectedDatabase.id;
+  });
+
+  const dbItems = useMemo(() => {
+    const dbProperties = getDatabaseProperties(selectedDatabase);
+    return (
+      Object.keys(dbProperties).map((fieldKey: string) => ({
+        id: dbProperties[fieldKey].id,
+        name: dbProperties[fieldKey].name,
+        type: dbProperties[fieldKey].type,
+      })) || []
+    );
+    // The effect below re-seeds `selectedDatabase` with a fresh object literal whenever the
+    // `databases`/`surveys` server props change identity, which an RSC refresh does on unchanged
+    // content. Keying on the id keeps identical content from recomputing this list.
+    //
+    // The trade-off, stated so it is a choice rather than an oversight: if a refresh brings back
+    // *different* properties for the same database id — someone edited the Notion database's schema
+    // while this modal was open on it — the list here stays stale until the database is reselected.
+    // Fixing that by keying on the object trades a rare staleness for a recompute on every refresh;
+    // fixing it properly means not re-seeding with a fresh literal when the content is unchanged,
+    // which belongs in the effect rather than in this dep array.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the database's identity, not the object's
+  }, [selectedDatabase?.id]);
+
+  const elementItems = useMemo(() => {
+    const mappedElements = selectedSurvey
+      ? elements.map((el) => ({
+          id: el.id,
+          name: getTextContent(recallToHeadline(el.headline, selectedSurvey, false, "default")["default"]),
+          type: el.type,
+        }))
+      : [];
+
+    // ENG-1837: the mapping list must name the same things the pipeline exports, so both come from
+    // the survey's Embedded Data definitions, not the legacy columns.
+    const variables = selectedSurvey
+      ? getComputedEmbeddedFields(selectedSurvey).map(({ field, link }) => ({
+          id: link.storageKey,
+          name: field.name,
+          type: TSurveyElementTypeEnum.OpenText,
+        }))
+      : [];
+
+    // ENG-3233: shown by name, still MAPPED by storage key — `id` is the address
+    // `buildNotionPayloadProperties` reads the value from, so it is what the saved mapping stores.
+    const hiddenFields = selectedSurvey
+      ? labelEmbeddedFields(getIngestedEmbeddedFields(selectedSurvey)).map(({ link, label }) => ({
+          id: link.storageKey,
+          name: `${t("common.hidden_field")} : ${label}`,
+          type: TSurveyElementTypeEnum.OpenText,
+        }))
+      : [];
+    const Metadata = [
+      {
+        id: "metadata",
+        name: t("common.metadata"),
+        type: TSurveyElementTypeEnum.OpenText,
+      },
+    ];
+    const createdAt = [
+      {
+        id: "createdAt",
+        name: t("common.created_at"),
+        type: TSurveyElementTypeEnum.Date,
+      },
+    ];
+    const personAttributes = contactAttributeKeys.map((attributeKey) => ({
+      id: `person.${attributeKey.key}`,
+      name: `${t("common.person")}: ${attributeKey.name ?? attributeKey.key}`,
+      type: TSurveyElementTypeEnum.OpenText,
+    }));
+
+    return [...mappedElements, ...variables, ...hiddenFields, ...Metadata, ...createdAt, ...personAttributes];
+    // Same as `dbItems` above: `selectedSurvey` is re-seeded from the `surveys` server prop, so its
+    // identity changes on a refresh that changed nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the survey's identity, not the object's
+  }, [contactAttributeKeys, elements, selectedSurvey?.id, t]);
+
+  useEffect(() => {
+    if (selectedIntegration) {
+      const selectedDB = databases.find((db) => db.id === selectedIntegration.databaseId)!;
+      if (selectedDB) {
+        setSelectedDatabase({
+          id: selectedDB.id,
+          name: getDatabaseTitle(selectedDB),
+          properties: selectedDB.properties,
+        });
+      }
+      setSelectedSurvey(
+        surveys.find((survey) => {
+          return survey.id === selectedIntegration.surveyId;
+        })!
+      );
+      setMapping(selectedIntegration.mapping.map((m) => ({ ...m, id: createId() })));
+      return;
+    }
+    resetForm();
+  }, [selectedIntegration, surveys, databases]);
+
+  const linkDatabase = async () => {
+    try {
+      if (!selectedDatabase) {
+        throw new Error(t("workspace.integrations.notion.please_select_a_database"));
+      }
+      if (!selectedSurvey) {
+        throw new Error(t("workspace.integrations.please_select_a_survey_error"));
+      }
+
+      if (mapping.length === 1 && (!mapping[0].element.id || !mapping[0].column.id)) {
+        throw new Error(t("workspace.integrations.notion.please_select_at_least_one_mapping"));
+      }
+
+      if (mapping.filter((m) => m.error).length > 0) {
+        throw new Error(t("workspace.integrations.notion.please_resolve_mapping_errors"));
+      }
+
+      if (
+        mapping.filter((m) => m.column.id && !m.element.id).length >= 1 ||
+        mapping.filter((m) => m.element.id && !m.column.id).length >= 1
+      ) {
+        throw new Error(
+          t("workspace.integrations.notion.please_complete_mapping_fields_with_notion_property")
+        );
+      }
+
+      setIsLinkingDatabase(true);
+
+      integrationData.databaseId = selectedDatabase.id;
+      integrationData.databaseName = selectedDatabase.name;
+      integrationData.surveyId = selectedSurvey.id;
+      integrationData.surveyName = selectedSurvey.name;
+      integrationData.mapping = mapping.map((m) => {
+        delete m.error;
+        return m;
+      });
+      integrationData.createdAt = new Date();
+
+      // Edit a copy: the page's own data stays as stored until the save succeeds and the query refetches.
+      const mappings = [...existingMappings];
+      if (selectedIntegration) {
+        mappings[selectedIntegration.index] = integrationData;
+      } else {
+        mappings.push(integrationData);
+      }
+      await saveIntegrationMappings(workspaceId, "notion", mappings);
+
+      if (selectedIntegration) {
+        toast.success(t("workspace.integrations.integration_updated_successfully"));
+      } else {
+        toast.success(t("workspace.integrations.integration_added_successfully"));
+      }
+      resetForm();
+      setOpen(false);
+      void refetchIntegration();
+    } catch (e) {
+      toast.error(getV3ApiErrorMessage(e, t("common.something_went_wrong_please_try_again")));
+    } finally {
+      setIsLinkingDatabase(false);
+    }
+  };
+
+  const deleteLink = async () => {
+    const mappings = existingMappings.filter((_, index) => index !== selectedIntegration!.index);
+    try {
+      setIsDeleting(true);
+      await saveIntegrationMappings(workspaceId, "notion", mappings);
+      toast.success(t("workspace.integrations.integration_removed_successfully"));
+      setOpen(false);
+      void refetchIntegration();
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const resetForm = () => {
+    setIsLinkingDatabase(false);
+    setSelectedDatabase(null);
+    setSelectedSurvey(null);
+  };
+  const getFilteredElementItems = (selectedIdx: number) => {
+    const selectedElementIds = new Set(
+      mapping.filter((_, idx) => idx !== selectedIdx).map((m) => m.element.id)
+    );
+    return elementItems.filter((el) => !selectedElementIds.has(el.id));
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent>
+        <DialogHeader>
+          <div className="mb-4 flex items-start gap-x-2">
+            <div className="relative size-8">
+              <Image
+                fill
+                className="object-contain object-center"
+                src={NotionLogo}
+                alt={t("workspace.integrations.notion.notion_logo")}
+              />
+            </div>
+            <div className="space-y-0.5">
+              <DialogTitle>{t("workspace.integrations.notion.link_notion_database")}</DialogTitle>
+              <DialogDescription>
+                {t("workspace.integrations.notion.notion_integration_description")}
+              </DialogDescription>
+            </div>
+          </div>
+        </DialogHeader>
+
+        <form onSubmit={handleSubmit(linkDatabase)} className="contents space-y-4">
+          <DialogBody>
+            <div className="w-full space-y-4">
+              <div>
+                <div className="mb-4">
+                  <DropdownSelector
+                    label={t("workspace.integrations.notion.select_a_database")}
+                    items={databases.map((d) => ({
+                      id: d.id,
+                      name: getDatabaseTitle(d),
+                      properties: d.properties,
+                    }))}
+                    selectedItem={selectedDatabase}
+                    setSelectedItem={setSelectedDatabase}
+                    disabled={databases.length === 0}
+                  />
+                  {selectedDatabase && hasMatchingId && (
+                    <p className="text-xs text-amber-700">
+                      <strong>{t("common.warning")}:</strong>{" "}
+                      {t("workspace.integrations.notion.duplicate_connection_warning")}
+                    </p>
+                  )}
+                  <p className="m-1 text-xs text-slate-500">
+                    {databases.length === 0 &&
+                      t(
+                        "workspace.integrations.notion.create_at_least_one_database_to_setup_this_integration"
+                      )}
+                  </p>
+                </div>
+                <div className="mb-4">
+                  <DropdownSelector
+                    label={t("common.select_survey")}
+                    items={surveys}
+                    selectedItem={selectedSurvey}
+                    setSelectedItem={setSelectedSurvey}
+                    disabled={surveys.length === 0}
+                    isItemDisabled={(survey: TSurvey) =>
+                      isRestrictedSurveyPick(surveyVisibilityEnabled, survey, attachedSurveyIds)
+                    }
+                    disabledItemHint={<RestrictedSurveyHint kind="restricted" />}
+                  />
+                  <RestrictedSurveysNote
+                    surveyVisibilityEnabled={surveyVisibilityEnabled}
+                    surveys={surveys}
+                    attachedSurveyIds={attachedSurveyIds}
+                  />
+                  <p className="m-1 text-xs text-slate-500">
+                    {surveys.length === 0 && t("workspace.integrations.create_survey_warning")}
+                  </p>
+                </div>
+                {selectedDatabase && selectedSurvey && (
+                  <div>
+                    <Label>
+                      {t("workspace.integrations.notion.map_formbricks_fields_to_notion_property")}
+                    </Label>
+                    <div className="mt-1 space-y-2 overflow-y-auto">
+                      {mapping.map((m, idx) => (
+                        <MappingRow
+                          key={m.id}
+                          idx={idx}
+                          mapping={mapping}
+                          setMapping={setMapping}
+                          filteredElementItems={getFilteredElementItems(idx)}
+                          dbItems={dbItems}
+                          elementItems={elementItems}
+                          t={t}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </DialogBody>
+
+          <DialogFooter>
+            {selectedIntegration ? (
+              <Button
+                type="button"
+                variant="destructive"
+                loading={isDeleting}
+                onClick={() => {
+                  void deleteLink();
+                }}>
+                {t("common.delete")}
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => {
+                  setOpen(false);
+                  resetForm();
+                  setMapping([]);
+                }}>
+                {t("common.cancel")}
+              </Button>
+            )}
+            <Button
+              type="submit"
+              loading={isLinkingDatabase}
+              disabled={mapping.filter((m) => m.error).length > 0}>
+              {selectedIntegration ? t("common.update") : t("workspace.integrations.notion.link_database")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+};

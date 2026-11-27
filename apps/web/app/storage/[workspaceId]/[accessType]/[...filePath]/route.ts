@@ -1,0 +1,236 @@
+import { type NextRequest } from "next/server";
+import { logger } from "@formbricks/logger";
+import { ZDeleteFileRequest, ZDownloadFileRequest, getMimeTypeForFileName } from "@formbricks/types/storage";
+import { responses } from "@/app/lib/api/response";
+import { transformErrorToDetails } from "@/app/lib/api/validator";
+import { authorizePrivateDownload } from "@/app/storage/[workspaceId]/[accessType]/[...filePath]/lib/auth";
+import { resolveClientApiIds } from "@/lib/utils/resolve-client-id";
+import { getSession } from "@/modules/auth/lib/session";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
+import { isAttachmentExportFilePath } from "@/modules/storage/attachment-export/storage-key";
+import { deleteFile, getFileStreamForDownload } from "@/modules/storage/service";
+import { getErrorResponseFromStorageError } from "@/modules/storage/utils";
+import { logFileDeletion } from "./lib/audit-logs";
+
+const safeDecode = (value: string): string => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+};
+
+export const GET = async (
+  request: NextRequest,
+  props: { params: Promise<{ workspaceId: string; accessType: string; filePath: string[] }> }
+): Promise<Response> => {
+  const params = await props.params;
+  const fileName = params.filePath.join("/");
+  const paramValidation = ZDownloadFileRequest.safeParse({
+    accessType: params.accessType,
+    fileName,
+  });
+
+  if (!paramValidation.success) {
+    return responses.badRequestResponse(
+      "Fields are missing or incorrectly formatted",
+      transformErrorToDetails(paramValidation.error),
+      true
+    );
+  }
+
+  const { accessType } = paramValidation.data;
+  const idParam = params.workspaceId;
+
+  // Attachment export archives (ENG-6862) are fetched only through their audited, requester-scoped
+  // download route. Checked on one more decode too, so the refusal does not depend on how a proxy or
+  // backend reads an escaped `/`.
+  if (isAttachmentExportFilePath(fileName) || isAttachmentExportFilePath(safeDecode(fileName))) {
+    return responses.notFoundResponse("File", null);
+  }
+
+  // Resolve: the URL param may be an environmentId (old uploads) or workspaceId (new uploads)
+  const resolved = await resolveClientApiIds(idParam);
+  if (!resolved) {
+    return responses.notFoundResponse("Workspace", idParam);
+  }
+
+  // check auth
+  if (accessType === "private") {
+    const authResult = await authorizePrivateDownload(request, resolved.workspaceId, "GET", params.filePath);
+    if (!authResult.ok) {
+      return authResult.error.unauthorized
+        ? responses.unauthorizedResponse()
+        : responses.notAuthenticatedResponse();
+    }
+  }
+
+  // Stream the file — try workspaceId path first (new uploads), fall back to environmentId (legacy)
+  const streamResult = await getFileStreamForDownload(fileName, resolved.workspaceId, accessType, idParam);
+
+  if (!streamResult.ok) {
+    const errorResponse = getErrorResponseFromStorageError(streamResult.error, { fileName });
+    return errorResponse;
+  }
+
+  const { body, contentLength } = streamResult.data;
+  const contentType = getMimeTypeForFileName(fileName) ?? "application/octet-stream";
+
+  return new Response(body, {
+    status: 200,
+    headers: {
+      // The type comes from the extension, never from the stored object: objects uploaded before
+      // ENG-7108 may carry a client-chosen type such as `image/png;,text/html`, which browsers render
+      // as HTML on the app origin.
+      "Content-Type": contentType,
+      // The sandboxing CSP for these paths lives in next.config.mjs, as the config's CSP replaces any
+      // a route handler sets.
+      "X-Content-Type-Options": "nosniff",
+      ...(contentLength > 0 && { "Content-Length": String(contentLength) }),
+      "Cache-Control":
+        accessType === "private"
+          ? "no-store, no-cache, must-revalidate"
+          : "public, max-age=31536000, immutable",
+    },
+  });
+};
+
+/** The rate limit a user's file deletion counts against; the 429 response when it is spent. */
+const applyDeleteRateLimit = async (userId: string): Promise<Response | null> => {
+  try {
+    await applyRateLimit(rateLimitConfigs.storage.delete, userId);
+    return null;
+  } catch (error) {
+    return responses.tooManyRequestsResponse(
+      error instanceof Error ? error.message : "Unknown error occurred"
+    );
+  }
+};
+
+/** Logs a failed deletion and answers it with the storage error's response. */
+const respondToFailedDelete = async (
+  deleteResult: Extract<Awaited<ReturnType<typeof deleteFile>>, { ok: false }>,
+  {
+    accessType,
+    userId,
+    workspaceId,
+    apiUrl,
+    fileName,
+  }: { accessType: string; userId: string | undefined; workspaceId: string; apiUrl: string; fileName: string }
+): Promise<Response> => {
+  if (!("error" in deleteResult)) {
+    logger.error({ deleteResult }, "Unknown delete failure result shape");
+
+    await logFileDeletion({
+      failureReason: "unknown_delete_failure",
+      accessType,
+      userId,
+      workspaceId,
+      apiUrl,
+    });
+
+    return responses.internalServerErrorResponse("Failed to delete file", true);
+  }
+
+  const { error } = deleteResult;
+
+  logger.error({ error }, "Error deleting file");
+
+  await logFileDeletion({
+    failureReason: error.code,
+    accessType,
+    userId,
+    workspaceId,
+    apiUrl,
+  });
+
+  const errorResponse = getErrorResponseFromStorageError(error, { fileName });
+  return errorResponse;
+};
+
+export const DELETE = async (
+  request: NextRequest,
+  props: { params: Promise<{ workspaceId: string; accessType: string; filePath: string[] }> }
+): Promise<Response> => {
+  const params = await props.params;
+  const fileName = params.filePath.join("/");
+  const paramValidation = ZDeleteFileRequest.safeParse({
+    accessType: params.accessType,
+    fileName,
+  });
+  if (!paramValidation.success) {
+    const errorDetails = transformErrorToDetails(paramValidation.error);
+
+    await logFileDeletion({
+      failureReason: "Parameter validation failed",
+      workspaceId: params.workspaceId,
+      apiUrl: request.url,
+    });
+
+    return responses.badRequestResponse("Fields are missing or incorrectly formatted", errorDetails, true);
+  }
+
+  const { accessType } = paramValidation.data;
+  const idParam = params.workspaceId;
+
+  // Resolve: the URL param may be an environmentId (old uploads) or workspaceId (new uploads)
+  const resolved = await resolveClientApiIds(idParam);
+  if (!resolved) {
+    await logFileDeletion({
+      failureReason: "Workspace not found",
+      workspaceId: idParam,
+      apiUrl: request.url,
+    });
+    return responses.notFoundResponse("Workspace", idParam);
+  }
+
+  const session = await getSession();
+
+  const authResult = await authorizePrivateDownload(request, resolved.workspaceId, "DELETE", params.filePath);
+
+  if (!authResult.ok) {
+    await logFileDeletion({
+      failureReason: authResult.error.unauthorized
+        ? "User not authorized to access workspace"
+        : "User not authenticated",
+      accessType,
+      workspaceId: resolved.workspaceId,
+      apiUrl: request.url,
+    });
+
+    return authResult.error.unauthorized
+      ? responses.unauthorizedResponse()
+      : responses.notAuthenticatedResponse();
+  }
+
+  // Rate limiting for apiKey DELETE is enforced by Envoy in v5 — see envoy-rate-limit-coverage.ts
+  if (authResult.ok && authResult.data.authType !== "apiKey") {
+    const rateLimited = await applyDeleteRateLimit(authResult.data.userId);
+    if (rateLimited) return rateLimited;
+  }
+
+  // `fileName` comes from the route param, which Next.js has already decoded once. Objects are stored
+  // under that name, so it goes to storage as is.
+  const deleteResult = await deleteFile(resolved.workspaceId, accessType, fileName, idParam);
+
+  if (!deleteResult.ok) {
+    return respondToFailedDelete(deleteResult, {
+      accessType,
+      userId: session?.user?.id,
+      workspaceId: resolved.workspaceId,
+      apiUrl: request.url,
+      fileName,
+    });
+  }
+
+  await logFileDeletion({
+    status: "success",
+    accessType,
+    userId: session?.user?.id,
+    workspaceId: resolved.workspaceId,
+    apiUrl: request.url,
+  });
+
+  return responses.successResponse("File deleted successfully");
+};

@@ -1,0 +1,153 @@
+"use client";
+
+import { TrashIcon } from "lucide-react";
+import Link from "next/link";
+import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { TResponse } from "@formbricks/types/responses";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { TUser, TUserLocale } from "@formbricks/types/user";
+import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
+import { timeSince } from "@/lib/time";
+import { getContactIdentifier } from "@/lib/utils/contact";
+import { OutcomeBadge } from "@/modules/analysis/response-outcome/components/outcome-badge";
+import { ResponseOutcomeButton } from "@/modules/analysis/response-outcome/components/response-outcome-button";
+import type { TOutcomeActions } from "@/modules/analysis/response-outcome/lib/outcome";
+import { PersonAvatar } from "@/modules/ui/components/avatars";
+import { Button } from "@/modules/ui/components/button";
+import { IdBadge } from "@/modules/ui/components/id-badge";
+import { SurveyStatusIndicator } from "@/modules/ui/components/survey-status-indicator";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/modules/ui/components/tooltip";
+import { isSubmissionTimeMoreThan5Minutes } from "../util";
+
+interface SingleResponseCardHeaderProps {
+  readonly pageType: "people" | "response";
+  readonly response: TResponse;
+  readonly survey: TSurvey;
+  readonly user?: TUser;
+  readonly isReadOnly: boolean;
+  readonly setDeleteDialogOpen: (deleteDialogOpen: boolean) => void;
+  readonly locale: TUserLocale;
+  readonly outcomeActions?: TOutcomeActions;
+}
+
+export const SingleResponseCardHeader = ({
+  pageType,
+  response,
+  survey,
+  user,
+  isReadOnly,
+  setDeleteDialogOpen,
+  locale,
+  outcomeActions,
+}: SingleResponseCardHeaderProps) => {
+  const displayIdentifier = response.contact
+    ? getContactIdentifier(response.contact, response.contactAttributes)
+    : null;
+
+  const { t } = useTranslation();
+  const { workspace } = useWorkspace();
+  const workspaceBasePath = `/workspaces/${workspace?.id}`;
+  const canResponseBeDeleted = response.finished
+    ? true
+    : isSubmissionTimeMoreThan5Minutes(response.updatedAt);
+
+  const deleteSubmissionToolTip = <>{t("workspace.surveys.responses.this_response_is_in_progress")}</>;
+
+  const contactId = response.contact?.id;
+  let contactHeader: ReactNode;
+  if (!contactId) {
+    contactHeader = (
+      <div className="flex items-center">
+        <PersonAvatar personId="anonymous" />
+        <h3 className="ml-4 pb-1 font-semibold text-slate-600">{t("common.anonymous")}</h3>
+      </div>
+    );
+  } else if (user) {
+    contactHeader = (
+      <Link className="flex items-center gap-x-2" href={`${workspaceBasePath}/contacts/${contactId}`}>
+        <PersonAvatar personId={contactId} />
+        <h3 className="ph-no-capture ml-4 pb-1 font-semibold text-slate-600 hover:underline">
+          {displayIdentifier}
+        </h3>
+      </Link>
+    );
+  } else {
+    contactHeader = (
+      <div className="flex items-center gap-x-2">
+        <PersonAvatar personId={contactId} />
+        <h3 className="ph-no-capture ml-4 pb-1 font-semibold text-slate-600">{displayIdentifier}</h3>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2 border-b border-slate-200 px-6 pt-4 pb-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center justify-center gap-x-2">
+          {pageType === "response" && (
+            <>
+              {contactHeader}
+              {response.contact?.userId && <IdBadge id={response.contact.userId} />}
+              <OutcomeBadge outcome={response.outcome} />
+            </>
+          )}
+
+          {pageType === "people" && (
+            <div className="flex items-center justify-center gap-x-2 rounded-full bg-slate-100 p-1 px-2 text-sm text-slate-600">
+              <SurveyStatusIndicator
+                status={survey.status}
+                isScheduled={survey.status === "paused" && survey.publishOn !== null}
+              />
+              <Link className="hover:underline" href={`${workspaceBasePath}/surveys/${survey.id}/summary`}>
+                {survey.name}
+              </Link>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-x-2 text-sm">
+          {pageType !== "response" && <OutcomeBadge outcome={response.outcome} />}
+          <time className="text-slate-500" dateTime={timeSince(response.createdAt.toISOString(), locale)}>
+            {timeSince(response.createdAt.toISOString(), locale)}
+          </time>
+          {user && !isReadOnly && outcomeActions && (
+            <ResponseOutcomeButton
+              responseId={response.id}
+              outcome={response.outcome}
+              workspaceId={survey.workspaceId}
+              actions={outcomeActions}
+            />
+          )}
+          {user &&
+            !isReadOnly &&
+            (canResponseBeDeleted ? (
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => setDeleteDialogOpen(true)}
+                aria-label="Delete response">
+                <TrashIcon className="size-4" />
+              </Button>
+            ) : (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      disabled
+                      className="text-slate-400"
+                      aria-label="Cannot delete response in progress">
+                      <TrashIcon className="size-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="left">{deleteSubmissionToolTip}</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            ))}
+        </div>
+      </div>
+    </div>
+  );
+};

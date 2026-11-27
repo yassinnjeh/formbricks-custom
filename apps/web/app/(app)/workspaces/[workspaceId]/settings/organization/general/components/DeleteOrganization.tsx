@@ -1,0 +1,149 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { Dispatch, SetStateAction, useState } from "react";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { TOrganization } from "@formbricks/types/organizations";
+import { deleteOrganization } from "@/app/(app)/workspaces/[workspaceId]/settings/organization/general/lib/api-client";
+import { FORMBRICKS_ENVIRONMENT_ID_LS, removeLocalStorage } from "@/lib/localStorage";
+import { V3ApiError, getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { Alert, AlertDescription } from "@/modules/ui/components/alert";
+import { Button } from "@/modules/ui/components/button";
+import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
+import { Input } from "@/modules/ui/components/input";
+
+type DeleteOrganizationProps = {
+  readonly organization: TOrganization;
+  readonly isDeleteDisabled?: boolean;
+  readonly isUserOwner?: boolean;
+};
+
+export const DeleteOrganization = ({
+  organization,
+  isDeleteDisabled = false,
+  isUserOwner = false,
+}: DeleteOrganizationProps) => {
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const { t } = useTranslation();
+  const router = useRouter();
+
+  const handleDeleteOrganization = async () => {
+    setIsDeleting(true);
+
+    try {
+      await deleteOrganization(organization.id);
+      toast.success(t("workspace.settings.general.organization_deleted_successfully"));
+      removeLocalStorage(FORMBRICKS_ENVIRONMENT_ID_LS);
+      router.push("/");
+    } catch (error) {
+      toast.error(
+        getV3ApiErrorMessage(
+          error,
+          t("workspace.settings.general.error_deleting_organization_please_try_again")
+        )
+      );
+      // A refusal from the server leaves the dialog open, to retry or cancel; a request that never got an
+      // answer closes it.
+      if (error instanceof V3ApiError && error.status > 0) {
+        setIsDeleting(false);
+        return;
+      }
+    }
+
+    setIsDeleteDialogOpen(false);
+    setIsDeleting(false);
+  };
+
+  const deleteDisabledWarning = isUserOwner
+    ? t("workspace.settings.general.cannot_delete_only_organization")
+    : t("workspace.settings.general.only_org_owner_can_perform_action");
+
+  return (
+    <div>
+      {!isDeleteDisabled && (
+        <div>
+          <p className="text-sm text-slate-900">{t("workspace.settings.general.once_its_gone_its_gone")}</p>
+          <Button
+            size="sm"
+            disabled={isDeleteDisabled}
+            variant="destructive"
+            className={`mt-4 ${isDeleteDisabled ? "ring-grey-500 ring-1 ring-offset-1" : ""}`}
+            onClick={() => setIsDeleteDialogOpen(true)}>
+            {t("common.delete")}
+          </Button>
+        </div>
+      )}
+      {isDeleteDisabled && (
+        <Alert variant="warning" alertRole="status">
+          <AlertDescription>{deleteDisabledWarning}</AlertDescription>
+        </Alert>
+      )}
+      <DeleteOrganizationModal
+        open={isDeleteDialogOpen}
+        setOpen={setIsDeleteDialogOpen}
+        organizationData={organization}
+        deleteOrganization={handleDeleteOrganization}
+        isDeleting={isDeleting}
+      />
+    </div>
+  );
+};
+
+interface DeleteOrganizationModalProps {
+  readonly open: boolean;
+  readonly setOpen: Dispatch<SetStateAction<boolean>>;
+  // organizationData: { name: string; id: string; plan: string };
+  readonly organizationData: TOrganization;
+  readonly deleteOrganization: () => void;
+  readonly isDeleting?: boolean;
+}
+
+const DeleteOrganizationModal = ({
+  setOpen,
+  open,
+  organizationData,
+  deleteOrganization,
+  isDeleting,
+}: DeleteOrganizationModalProps) => {
+  const [inputValue, setInputValue] = useState("");
+  const { t } = useTranslation();
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setInputValue(e.target.value);
+  };
+
+  return (
+    <DeleteDialog
+      open={open}
+      setOpen={setOpen}
+      deleteWhat={t("common.organization")}
+      onDelete={deleteOrganization}
+      text={t("workspace.settings.general.delete_organization_warning")}
+      disabled={inputValue !== organizationData?.name}
+      isDeleting={isDeleting}>
+      <div className="py-5" data-i18n="[html]content.body">
+        <ul className="list-disc pb-6 pl-6">
+          <li>{t("workspace.settings.general.delete_organization_warning_1")}</li>
+          <li>{t("workspace.settings.general.delete_organization_warning_2")}</li>
+        </ul>
+        <form onSubmit={(e) => e.preventDefault()}>
+          <label htmlFor="deleteOrganizationConfirmation">
+            {t("workspace.settings.general.delete_organization_warning_3", {
+              organizationName: organizationData?.name,
+            })}
+          </label>
+          <Input
+            value={inputValue}
+            onChange={handleInputChange}
+            placeholder={organizationData?.name}
+            className="mt-5"
+            type="text"
+            id="deleteOrganizationConfirmation"
+            name="deleteOrganizationConfirmation"
+          />
+        </form>
+      </div>
+    </DeleteDialog>
+  );
+};

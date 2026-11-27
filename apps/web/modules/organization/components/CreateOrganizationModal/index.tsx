@@ -1,0 +1,101 @@
+"use client";
+
+import { PlusCircleIcon } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { useForm } from "react-hook-form";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { createAdditionalOrganization } from "@/modules/organization/lib/api-client";
+import { Button } from "@/modules/ui/components/button";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
+import { Input } from "@/modules/ui/components/input";
+import { Label } from "@/modules/ui/components/label";
+
+interface CreateOrganizationModalProps {
+  readonly open: boolean;
+  readonly setOpen: (v: boolean) => void;
+}
+
+type FormValues = {
+  name: string;
+};
+
+export const CreateOrganizationModal = ({ open, setOpen }: CreateOrganizationModalProps) => {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const { register, handleSubmit, watch, setFocus } = useForm<FormValues>();
+  const organizationName = watch("name", "");
+  const isOrganizationNameValid = organizationName.trim() !== "";
+
+  const submitOrganization = async (data: FormValues) => {
+    data.name = data.name.trim();
+    if (!data.name) return;
+
+    setLoading(true);
+    try {
+      const organization = await createAdditionalOrganization(data.name);
+      toast.success(t("workspace.settings.general.organization_created_successfully"));
+      router.push(`/organizations/${organization.id}`);
+      setOpen(false);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    }
+
+    setLoading(false);
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent
+        disableCloseOnOutsideClick={true}
+        onOpenAutoFocus={(event) => {
+          event.preventDefault();
+          setFocus("name");
+        }}>
+        <DialogHeader>
+          <PlusCircleIcon />
+          <DialogTitle>{t("workspace.settings.general.create_new_organization")}</DialogTitle>
+          <DialogDescription>
+            {t("workspace.settings.general.create_new_organization_description")}
+          </DialogDescription>
+        </DialogHeader>
+
+        <form onSubmit={handleSubmit(submitOrganization)} className="space-y-4">
+          <DialogBody>
+            <div className="grid w-full gap-y-2">
+              <Label>{t("workspace.settings.general.organization_name")}</Label>
+              <Input
+                placeholder={t("workspace.settings.general.organization_name_placeholder")}
+                {...register("name", { required: true })}
+              />
+            </div>
+          </DialogBody>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                setOpen(false);
+              }}>
+              {t("common.cancel")}
+            </Button>
+            <Button type="submit" loading={loading} disabled={!isOrganizationNameValid}>
+              {t("workspace.settings.general.create_new_organization")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+};

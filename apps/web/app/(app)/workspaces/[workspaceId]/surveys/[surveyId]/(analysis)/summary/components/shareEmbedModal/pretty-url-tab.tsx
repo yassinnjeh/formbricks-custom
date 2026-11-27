@@ -1,0 +1,193 @@
+"use client";
+
+import { Copy, Trash2 } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { useForm } from "react-hook-form";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { useSurvey } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/context/survey-context";
+import { copyToClipboard } from "@/lib/utils/clipboard";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { removeSurveySlug, updateSurveySlug } from "@/modules/survey/slug/lib/api-client";
+import { Button } from "@/modules/ui/components/button";
+import { DeleteDialog } from "@/modules/ui/components/delete-dialog";
+import {
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormProvider,
+} from "@/modules/ui/components/form";
+import { PrettyUrlInput } from "./pretty-url-input";
+
+interface PrettyUrlTabProps {
+  readonly publicDomain: string;
+  readonly isReadOnly?: boolean;
+}
+
+interface PrettyUrlFormData {
+  slug: string;
+}
+
+export const PrettyUrlTab = ({ publicDomain, isReadOnly = false }: PrettyUrlTabProps) => {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const { survey, replaceSurvey } = useSurvey();
+  const [isEditing, setIsEditing] = useState(!survey.slug);
+  const [showRemoveDialog, setShowRemoveDialog] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Initialize form with current values - memoize to prevent re-initialization
+  const initialFormData = useMemo(() => {
+    return {
+      slug: survey.slug || "",
+    };
+  }, [survey.slug]);
+
+  const form = useForm<PrettyUrlFormData>({
+    defaultValues: initialFormData,
+  });
+
+  const { handleSubmit, reset } = form;
+
+  // Sync isEditing state with survey.slug changes, during render
+  const [syncedSlug, setSyncedSlug] = useState(survey.slug);
+  if (syncedSlug !== survey.slug) {
+    setSyncedSlug(survey.slug);
+    setIsEditing(!survey.slug);
+  }
+
+  // ...and the form, which lives outside React state
+  useEffect(() => {
+    reset({ slug: survey.slug || "" });
+  }, [survey.slug, reset]);
+
+  const onSubmit = async (data: PrettyUrlFormData) => {
+    if (!data.slug.trim()) {
+      toast.error(t("workspace.surveys.share.pretty_url.slug_required"));
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const { slug, updatedAt } = await updateSurveySlug(survey.id, data.slug);
+      // A survey save from another tab sends the whole survey, slug included, so it must carry this one.
+      replaceSurvey({ ...survey, slug, updatedAt });
+      toast.success(t("workspace.surveys.share.pretty_url.save_success"));
+      router.refresh();
+      setIsEditing(false);
+    } catch (err) {
+      toast.error(getV3ApiErrorMessage(err, t("common.something_went_wrong_please_try_again")));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleEdit = () => {
+    setIsEditing(true);
+  };
+
+  const handleCancel = () => {
+    reset({ slug: survey.slug || "" });
+    setIsEditing(false);
+  };
+
+  const handleRemove = async () => {
+    setIsSubmitting(true);
+    try {
+      const { slug, updatedAt } = await removeSurveySlug(survey.id);
+      replaceSurvey({ ...survey, slug, updatedAt });
+      setShowRemoveDialog(false);
+      reset({ slug: "" });
+      router.refresh();
+      setIsEditing(true);
+      toast.success(t("workspace.surveys.share.pretty_url.remove_success"));
+    } catch (err) {
+      toast.error(getV3ApiErrorMessage(err, t("common.something_went_wrong_please_try_again")));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleCopyUrl = async () => {
+    if (!survey.slug) return;
+    const prettyUrl = `${publicDomain}/p/${survey.slug}`;
+    if (await copyToClipboard(prettyUrl)) {
+      toast.success(t("common.copied_to_clipboard"));
+    } else {
+      toast.error(t("common.failed_to_copy_to_clipboard"));
+    }
+  };
+
+  return (
+    <div className="px-1">
+      <FormProvider {...form}>
+        <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+          <FormField
+            control={form.control}
+            name="slug"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t("workspace.surveys.share.pretty_url.slug_label")}</FormLabel>
+                <FormControl>
+                  <PrettyUrlInput
+                    value={field.value}
+                    onChange={field.onChange}
+                    publicDomain={publicDomain}
+                    disabled={isReadOnly || !isEditing}
+                  />
+                </FormControl>
+                <FormDescription>{t("workspace.surveys.share.pretty_url.slug_help")}</FormDescription>
+              </FormItem>
+            )}
+          />
+
+          <div className="flex gap-2">
+            {isEditing ? (
+              <>
+                <Button type="submit" disabled={isReadOnly || isSubmitting}>
+                  {t("common.save")}
+                </Button>
+                {survey.slug && (
+                  <Button type="button" variant="secondary" onClick={handleCancel} disabled={isSubmitting}>
+                    {t("common.cancel")}
+                  </Button>
+                )}
+              </>
+            ) : (
+              <Button type="button" variant="secondary" onClick={handleEdit} disabled={isReadOnly}>
+                {t("common.edit")}
+              </Button>
+            )}
+
+            {survey.slug && !isEditing && (
+              <>
+                <Button type="button" variant="default" onClick={handleCopyUrl} disabled={isReadOnly}>
+                  <Copy className="mr-2 size-4" />
+                  {t("common.copy")} URL
+                </Button>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  onClick={() => setShowRemoveDialog(true)}
+                  disabled={isReadOnly}>
+                  <Trash2 className="mr-2 size-4" />
+                  {t("common.remove")}
+                </Button>
+              </>
+            )}
+          </div>
+        </form>
+      </FormProvider>
+
+      <DeleteDialog
+        open={showRemoveDialog}
+        setOpen={setShowRemoveDialog}
+        deleteWhat={t("workspace.surveys.share.pretty_url.title")}
+        onDelete={handleRemove}
+        text={t("workspace.surveys.share.pretty_url.remove_description")}></DeleteDialog>
+    </div>
+  );
+};

@@ -1,0 +1,394 @@
+"use client";
+
+import { ChevronDownIcon, SparklesIcon } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { getTextContent } from "@formbricks/types/surveys/validation";
+import { getAIUnavailableMessage } from "@/lib/ai/availability";
+import type { TAIUnavailableReason } from "@/lib/ai/service";
+import { cn } from "@/lib/cn";
+import { translateSurveyFields } from "@/modules/ee/ai-translation/lib/api-client";
+import {
+  getAITranslationErrorCodeMessage,
+  getAITranslationErrorMessage,
+} from "@/modules/ee/ai-translation/lib/error-message";
+import {
+  AI_TRANSLATION_ACTIONS_PER_RUN,
+  createTranslationActionBatches,
+  partitionTranslationFieldsByLength,
+} from "@/modules/ee/ai-translation/lib/translation-batches";
+import { Button } from "@/modules/ui/components/button";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/modules/ui/components/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/modules/ui/components/tooltip";
+import { isTranslationPathLocked } from "../lib/published-translation-lock";
+import { type TranslatableString } from "../lib/types";
+import {
+  extractTranslatableStrings,
+  getProgressColor,
+  getProgressTextColor,
+  setTranslationAtPathMutable,
+} from "../lib/utils";
+import { TranslationRow } from "./translation-row";
+
+interface ManageTranslationsModalProps {
+  readonly open: boolean;
+  readonly setOpen: (open: boolean) => void;
+  readonly localSurvey: TSurvey;
+  /** The survey as stored: an option text it already has in this language is locked once published. */
+  readonly persistedSurvey: TSurvey;
+  readonly setLocalSurvey: (survey: TSurvey) => void;
+  readonly languageCode: string;
+  readonly languageName: string;
+  readonly defaultLanguageName: string;
+  readonly defaultLanguageCode: string;
+  readonly workspaceId: string;
+  readonly isAIAvailable: boolean;
+  readonly aiUnavailableReason?: TAIUnavailableReason;
+}
+
+type TranslationFunction = ReturnType<typeof useTranslation>["t"];
+
+const showTranslationRunResult = (
+  t: TranslationFunction,
+  toastId: string,
+  failedMessage: string | undefined,
+  hasOversizedFields: boolean,
+  hasRemainingBatches: boolean
+) => {
+  if (failedMessage) {
+    toast.error(failedMessage, { id: toastId });
+    return;
+  }
+
+  const messages = [
+    hasOversizedFields ? t("workspace.surveys.edit.ai_translation_field_too_long") : undefined,
+    hasRemainingBatches ? t("workspace.surveys.edit.ai_translation_run_limit_reached") : undefined,
+  ].filter((message): message is string => Boolean(message));
+  if (messages.length > 0) {
+    toast.error(messages.join(" "), { id: toastId });
+    return;
+  }
+
+  toast.success(t("workspace.surveys.edit.ai_translation_complete"), { id: toastId });
+};
+
+export const ManageTranslationsModal = ({
+  open,
+  setOpen,
+  localSurvey,
+  persistedSurvey,
+  setLocalSurvey,
+  languageCode,
+  languageName,
+  defaultLanguageName,
+  defaultLanguageCode,
+  workspaceId,
+  isAIAvailable,
+  aiUnavailableReason,
+}: ManageTranslationsModalProps) => {
+  const { t } = useTranslation();
+
+  const strings = useMemo(() => extractTranslatableStrings(localSurvey, t), [localSurvey, t]);
+
+  const [draftTranslations, setDraftTranslations] = useState<Record<string, string>>({});
+  const [missingFirst, setMissingFirst] = useState(false);
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [translatingPaths, setTranslatingPaths] = useState<Set<string>>(new Set());
+  const translationRunId = useRef(0);
+  const translationToastId = useRef<string | undefined>(undefined);
+
+  // Initialize drafts when modal opens
+  useEffect(() => {
+    if (open) {
+      const drafts: Record<string, string> = {};
+      for (const s of strings) {
+        drafts[s.path] = s.value[languageCode] ?? "";
+      }
+      setDraftTranslations(drafts);
+    }
+  }, [open, strings, languageCode]);
+
+  const isDraftEmpty = useCallback(
+    (s: TranslatableString) => {
+      const val = draftTranslations[s.path];
+      if (val === undefined || val === "") return true;
+      // Rich text editors output HTML like "<p></p>" when empty — strip tags before checking
+      const text = s.isRichText ? getTextContent(val) : val;
+      return !text.trim();
+    },
+    [draftTranslations]
+  );
+
+  const progress = useMemo(() => {
+    const total = strings.length;
+    if (total === 0) return { translated: 0, total: 0, percentage: 100 };
+    const translated = strings.filter((s) => !isDraftEmpty(s)).length;
+    const percentage = Math.round((translated / total) * 100);
+    return { translated, total, percentage };
+  }, [isDraftEmpty, strings]);
+
+  // Snapshot the sort order so rows don't jump while the user is typing.
+  // Re-sort only when the sort mode is toggled or the underlying strings change.
+  const displayStrings = useMemo(() => {
+    if (!missingFirst) return strings;
+    return [...strings].sort((a, b) => {
+      const aEmpty = isDraftEmpty(a);
+      const bEmpty = isDraftEmpty(b);
+      if (aEmpty && !bEmpty) return -1;
+      if (!aEmpty && bEmpty) return 1;
+      return 0;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `isDraftEmpty` is intentionally excluded so rows don't re-sort on every keystroke; the order snapshots on strings/missingFirst changes
+  }, [strings, missingFirst]);
+
+  // Merge draft translations into localSurvey so that the recall dropdown
+  // can see in-progress translations (e.g. translated headlines).
+  const mergedSurvey = useMemo(() => {
+    const clone = structuredClone(localSurvey);
+    for (const s of strings) {
+      const val = draftTranslations[s.path] ?? "";
+      if (val) {
+        setTranslationAtPathMutable(clone, s.path, languageCode, val, s.value.default);
+      }
+    }
+    return clone;
+  }, [localSurvey, strings, draftTranslations, languageCode]);
+
+  const handleDraftChange = useCallback((path: string, value: string) => {
+    setDraftTranslations((prev) => ({ ...prev, [path]: value }));
+  }, []);
+
+  const emptyFields = useMemo(() => {
+    return strings.filter((s) => {
+      const val = draftTranslations[s.path];
+      if (val !== undefined && val !== "") {
+        const text = s.isRichText ? getTextContent(val) : val;
+        if (text.trim()) return false;
+      }
+      return (s.value.default || "").trim() !== "";
+    });
+  }, [strings, draftTranslations]);
+
+  const translateBatches = async (
+    batches: ReturnType<typeof createTranslationActionBatches>,
+    runId: number
+  ): Promise<string | undefined> => {
+    for (const batch of batches) {
+      let result: Awaited<ReturnType<typeof translateSurveyFields>>;
+      try {
+        result = await translateSurveyFields(workspaceId, {
+          fields: batch,
+          sourceLanguage: defaultLanguageCode,
+          targetLanguage: languageCode,
+        });
+      } catch (error) {
+        if (runId !== translationRunId.current) return;
+        return getAITranslationErrorMessage(error, t);
+      }
+      if (runId !== translationRunId.current) return;
+
+      setDraftTranslations((prev) => ({ ...prev, ...result.translations }));
+      // Some of the batch's model calls failed: what did translate is kept, and the reason is shown.
+      if (result.errorCode) {
+        return getAITranslationErrorCodeMessage(result.errorCode, t);
+      }
+    }
+  };
+
+  const handleTranslateWithAI = async () => {
+    if (emptyFields.length === 0) return;
+
+    const { eligible, skipped } = partitionTranslationFieldsByLength(
+      emptyFields.map((field) => ({
+        path: field.path,
+        defaultText: field.value.default || "",
+        isRichText: field.isRichText,
+      }))
+    );
+    const hasOversizedFields = skipped.length > 0;
+    if (eligible.length === 0) {
+      toast.error(t("workspace.surveys.edit.ai_translation_field_too_long"));
+      return;
+    }
+
+    const batches = createTranslationActionBatches(eligible);
+    const selectedBatches = batches.slice(0, AI_TRANSLATION_ACTIONS_PER_RUN);
+    const paths = new Set(selectedBatches.flatMap((batch) => batch.map((field) => field.path)));
+    const runId = ++translationRunId.current;
+    setIsTranslating(true);
+    setTranslatingPaths(paths);
+
+    const toastId = toast.loading(t("workspace.surveys.edit.ai_translating"));
+    translationToastId.current = toastId;
+    try {
+      const failedMessage = await translateBatches(selectedBatches, runId);
+      if (runId !== translationRunId.current) return;
+
+      showTranslationRunResult(
+        t,
+        toastId,
+        failedMessage,
+        hasOversizedFields,
+        batches.length > selectedBatches.length
+      );
+    } catch {
+      if (runId === translationRunId.current) {
+        toast.error(t("workspace.surveys.edit.ai_translation_failed"), { id: toastId });
+      }
+    } finally {
+      if (runId === translationRunId.current) {
+        translationToastId.current = undefined;
+        setIsTranslating(false);
+        setTranslatingPaths(new Set());
+      }
+    }
+  };
+
+  const handleSave = () => {
+    const updatedSurvey = structuredClone(localSurvey);
+    for (const s of strings) {
+      const draft = draftTranslations[s.path] ?? "";
+      // Rich-text editors keep an empty wrapper like "<p><br></p>" in the draft. That's
+      // visually empty but a non-empty string, so without normalization it would survive
+      // save and downstream checks would treat the field as translated.
+      const val = s.isRichText && getTextContent(draft).trim() === "" ? "" : draft;
+      setTranslationAtPathMutable(updatedSurvey, s.path, languageCode, val, s.value.default);
+    }
+    setLocalSurvey(updatedSurvey);
+    setOpen(false);
+  };
+
+  const handleCancel = () => {
+    translationRunId.current++;
+    if (translationToastId.current) toast.dismiss(translationToastId.current);
+    translationToastId.current = undefined;
+    setIsTranslating(false);
+    setTranslatingPaths(new Set());
+    setOpen(false);
+  };
+
+  const progressColor = getProgressColor(progress.percentage);
+  const progressTextColor = getProgressTextColor(progress.percentage);
+
+  return (
+    <Dialog open={open} onOpenChange={(nextOpen) => (nextOpen ? setOpen(true) : handleCancel())}>
+      <DialogContent width="wide" className="max-h-[85dvh]" disableCloseOnOutsideClick>
+        <DialogHeader>
+          <DialogTitle>{t("workspace.surveys.edit.manage_translations")}</DialogTitle>
+          <div className="mt-2 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="h-1.5 w-20 overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className={cn("h-full rounded-full transition-all", progressColor)}
+                  style={{ width: `${progress.percentage}%` }}
+                />
+              </div>
+              <span className={cn("text-sm font-medium", progressTextColor)}>
+                {progress.translated}/{progress.total}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div>
+                      <Button
+                        size="sm"
+                        className="text-xs"
+                        onClick={handleTranslateWithAI}
+                        disabled={!isAIAvailable || isTranslating || emptyFields.length === 0}
+                        loading={isTranslating}>
+                        <SparklesIcon className="mr-1 size-3.5" />
+                        {t("workspace.surveys.edit.ai_translate")}
+                      </Button>
+                    </div>
+                  </TooltipTrigger>
+                  {!isAIAvailable && !isTranslating && (
+                    <TooltipContent>{getAIUnavailableMessage(aiUnavailableReason, t)}</TooltipContent>
+                  )}
+                  {isAIAvailable && emptyFields.length === 0 && !isTranslating && (
+                    <TooltipContent>
+                      {t("workspace.surveys.edit.ai_translation_all_fields_populated")}
+                    </TooltipContent>
+                  )}
+                </Tooltip>
+              </TooltipProvider>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="secondary" size="sm" className="text-xs">
+                    {missingFirst
+                      ? t("workspace.surveys.edit.missing_first")
+                      : t("workspace.surveys.edit.show_in_order")}
+                    <ChevronDownIcon className="ml-1 size-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="text-xs">
+                  <DropdownMenuItem
+                    className={cn(!missingFirst && "font-semibold", "text-xs")}
+                    onSelect={() => setMissingFirst(false)}>
+                    {t("workspace.surveys.edit.show_in_order")}
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    className={cn(missingFirst && "font-semibold", "text-xs")}
+                    onSelect={() => setMissingFirst(true)}>
+                    {t("workspace.surveys.edit.missing_first")}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+          </div>
+        </DialogHeader>
+
+        <DialogBody>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b text-left text-slate-500">
+                <th className="w-16 py-2 pr-2 font-medium">{t("common.id")}</th>
+                <th className="w-1/3 py-2 pr-2 font-medium">{defaultLanguageName}</th>
+                <th className="py-2 font-medium">{languageName}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayStrings.map((s) => (
+                <TranslationRow
+                  key={s.path}
+                  s={s}
+                  value={draftTranslations[s.path] ?? ""}
+                  onChange={handleDraftChange}
+                  localSurvey={mergedSurvey}
+                  languageCode={languageCode}
+                  disabled={translatingPaths.has(s.path)}
+                  locked={isTranslationPathLocked(localSurvey, persistedSurvey, s.path, languageCode)}
+                />
+              ))}
+            </tbody>
+          </table>
+        </DialogBody>
+
+        <DialogFooter>
+          <Button variant="secondary" size="sm" onClick={handleCancel}>
+            {t("common.cancel")}
+          </Button>
+          <Button size="sm" onClick={handleSave} disabled={isTranslating}>
+            {t("common.save")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+};

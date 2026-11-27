@@ -1,0 +1,204 @@
+import { ZodRawShape, z } from "zod";
+import { logger } from "@formbricks/logger";
+import { TAuthenticationApiKey } from "@formbricks/types/auth";
+import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
+import { TApiAuditLog } from "@/app/lib/api/with-api-logging";
+import { withAuthorizationSurface } from "@/lib/authorization/context";
+import { formatZodError, handleApiError } from "@/modules/api/v2/lib/utils";
+import { applyRateLimit } from "@/modules/core/rate-limit/helpers";
+import { rateLimitConfigs } from "@/modules/core/rate-limit/rate-limit-configs";
+import { authenticateRequest } from "./authenticate-request";
+
+export type HandlerFn<TInput = Record<string, unknown>> = ({
+  authentication,
+  parsedInput,
+  request,
+  auditLog,
+}: {
+  authentication: TAuthenticationApiKey;
+  parsedInput: TInput;
+  request: Request;
+  auditLog?: TApiAuditLog;
+}) => Promise<Response>;
+
+export type ExtendedSchemas = {
+  body?: z.ZodObject<ZodRawShape>;
+  query?: z.ZodObject<ZodRawShape>;
+  params?: z.ZodObject<ZodRawShape>;
+};
+
+// Define a type that returns separate keys for each input type.
+// It uses mapped types to create a new type based on the input schemas.
+// It checks if each schema is defined and if it is a ZodObject, then infers the type from it.
+// It also uses conditional types to ensure that the keys are only included if the schema is defined and valid.
+// This allows for more flexibility and type safety when working with the input schemas.
+export type ParsedSchemas<S extends ExtendedSchemas | undefined> = S extends object
+  ? {
+      [K in keyof S as NonNullable<S[K]> extends z.ZodObject<ZodRawShape> ? K : never]: NonNullable<
+        S[K]
+      > extends z.ZodObject<ZodRawShape>
+        ? z.infer<NonNullable<S[K]>>
+        : never;
+    }
+  : Record<never, never>;
+
+type TBodyTransform = (
+  body: Record<string, unknown>,
+  auth: TAuthenticationApiKey
+) => Promise<Record<string, unknown>> | Record<string, unknown>;
+
+/** The request's JSON body, or the error response for one that is too large or malformed. */
+const readJsonBody = async (request: Request): Promise<Record<string, unknown> | Response> => {
+  try {
+    return await parseJsonBodyWithLimit<Record<string, unknown>>(request);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return handleApiError(request, {
+        type: "payload_too_large",
+        details: [
+          {
+            field: "body",
+            issue: error.message,
+          },
+        ],
+      });
+    }
+
+    logger.error({ error, url: request.url }, "Error parsing JSON input");
+    return handleApiError(request, {
+      type: "bad_request",
+      details: [
+        {
+          field: "error",
+          issue: "Malformed JSON input, please check your request body",
+        },
+      ],
+    });
+  }
+};
+
+/** The body, transformed and validated against `schema`, or the error response that rejects it. */
+const parseBody = async (
+  request: Request,
+  schema: z.ZodObject<ZodRawShape>,
+  authentication: TAuthenticationApiKey,
+  bodyTransform: TBodyTransform | undefined
+): Promise<{ data: unknown } | Response> => {
+  const body = await readJsonBody(request);
+  if (body instanceof Response) {
+    return body;
+  }
+  const bodyData = bodyTransform ? await bodyTransform(body, authentication) : body;
+
+  const bodyResult = schema.safeParse(bodyData);
+
+  if (!bodyResult.success) {
+    return handleApiError(request, {
+      type: "unprocessable_entity",
+      details: formatZodError(bodyResult.error),
+    });
+  }
+  return { data: bodyResult.data };
+};
+
+/** The 429 response when the API key is over the v2 rate limit, or null when it may proceed. */
+const checkRateLimit = async (request: Request, apiKeyId: string): Promise<Response | null> => {
+  try {
+    await applyRateLimit(rateLimitConfigs.api.v2, apiKeyId);
+    return null;
+  } catch (error) {
+    return handleApiError(request, {
+      type: "too_many_requests",
+      details: [
+        { field: "rateLimit", issue: error instanceof Error ? error.message : "Unknown error occurred" },
+      ],
+    });
+  }
+};
+
+export const apiWrapper = async <S extends ExtendedSchemas>({
+  request,
+  schemas,
+  externalParams,
+  rateLimit = true,
+  handler,
+  auditLog,
+  bodyTransform,
+  allowOrganizationOnlyApiKey = false,
+}: {
+  request: Request;
+  schemas?: S;
+  externalParams?: Promise<Record<string, unknown>>;
+  rateLimit?: boolean;
+  handler: HandlerFn<ParsedSchemas<S>>;
+  auditLog?: TApiAuditLog;
+  bodyTransform?: TBodyTransform;
+  /**
+   * When true, API keys that only carry organization-level access (i.e. no workspace
+   * permissions) are allowed to authenticate. Organization-scoped endpoints opt in so a
+   * pure organization key can reach them; workspace-scoped routes keep this false so such
+   * keys are rejected at the auth layer. See {@link authenticateApiKeyFromHeaders}.
+   */
+  allowOrganizationOnlyApiKey?: boolean;
+}): Promise<Response> => {
+  const authentication = await authenticateRequest(request, { allowOrganizationOnlyApiKey });
+  if (!authentication.ok) {
+    return handleApiError(request, authentication.error);
+  }
+
+  if (auditLog) {
+    auditLog.userId = authentication.data.apiKeyId;
+    auditLog.organizationId = authentication.data.organizationId;
+  }
+
+  const parsedInput: ParsedSchemas<S> = {} as ParsedSchemas<S>;
+
+  if (schemas?.body) {
+    const bodyResult = await parseBody(request, schemas.body, authentication.data, bodyTransform);
+    if (bodyResult instanceof Response) {
+      return bodyResult;
+    }
+    parsedInput.body = bodyResult.data as ParsedSchemas<S>["body"];
+  }
+
+  if (schemas?.query) {
+    const url = new URL(request.url);
+    const queryObject = Object.fromEntries(url.searchParams.entries());
+    const queryResult = schemas.query.safeParse(queryObject);
+    if (!queryResult.success) {
+      return handleApiError(request, {
+        type: "unprocessable_entity",
+        details: formatZodError(queryResult.error),
+      });
+    }
+    parsedInput.query = queryResult.data as ParsedSchemas<S>["query"];
+  }
+
+  if (schemas?.params) {
+    const paramsObject = (await externalParams) || {};
+    const paramsResult = schemas.params.safeParse(paramsObject);
+    if (!paramsResult.success) {
+      return handleApiError(request, {
+        type: "unprocessable_entity",
+        details: formatZodError(paramsResult.error),
+      });
+    }
+    parsedInput.params = paramsResult.data as ParsedSchemas<S>["params"];
+  }
+
+  if (rateLimit) {
+    const rateLimitResponse = await checkRateLimit(request, authentication.data.apiKeyId);
+    if (rateLimitResponse) {
+      return rateLimitResponse;
+    }
+  }
+
+  return withAuthorizationSurface("api_v2", () =>
+    handler({
+      authentication: authentication.data,
+      parsedInput,
+      request,
+      auditLog,
+    })
+  );
+};

@@ -1,0 +1,644 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@formbricks/database";
+import { SurveyStatus, SurveyType } from "@formbricks/database/prisma";
+import type { TBaseFilters } from "@formbricks/types/segment";
+import type { TSurveyActorContext } from "@/lib/survey/visibility/actor-context";
+import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
+import { segmentFilterToPrismaQuery } from "@/modules/ee/contacts/segments/lib/filter/prisma-query";
+import { getContactsInSegment } from "../contact";
+import { getContactAttributeKeys } from "../contact-attribute-key";
+import { getSegment } from "../segment";
+import { getSurvey } from "../surveys";
+
+vi.mock("react", () => ({
+  cache: vi.fn(<T>(fn: T) => fn),
+}));
+
+vi.mock("@formbricks/logger", () => ({
+  logger: {
+    error: vi.fn(),
+    warn: vi.fn(),
+  },
+}));
+
+// Mock dependencies
+vi.mock("@formbricks/database", () => ({
+  prisma: {
+    contact: {
+      findMany: vi.fn(),
+      count: vi.fn(),
+    },
+    survey: {
+      findFirst: vi.fn(),
+    },
+    $transaction: vi.fn(async (promises: Promise<unknown>[]) => Promise.all(promises)),
+  },
+}));
+
+vi.mock("../segment", () => ({
+  getSegment: vi.fn(),
+}));
+
+vi.mock("../surveys", () => ({
+  getSurvey: vi.fn(),
+}));
+
+vi.mock("../contact-attribute-key", () => ({
+  getContactAttributeKeys: vi.fn().mockResolvedValue({
+    ok: true,
+    data: ["email", "name"],
+  }),
+}));
+
+vi.mock("@/modules/ee/contacts/segments/lib/filter/prisma-query", () => ({
+  segmentFilterToPrismaQuery: vi.fn().mockResolvedValue({
+    ok: true,
+    data: {
+      whereClause: {
+        AND: [
+          { workspaceId: "workspace-789" },
+          {
+            AND: [
+              {
+                attributes: {
+                  some: {
+                    attributeKey: { key: "email" },
+                    value: { equals: "test@example.com", mode: "insensitive" },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  }),
+}));
+
+/** API keys never see a restricted survey (ENG-3282). */
+const apiKeyActor: TSurveyActorContext = { enforced: true, kind: "apiKey" };
+
+describe("getContactsInSegment", () => {
+  const mockSurveyId = "survey-123";
+  const mockSegmentId = "segment-456";
+  const mockLimit = 10;
+  const mockSkip = 0;
+  const mockWorkspaceId = "workspace-789";
+
+  const mockSurvey = {
+    id: mockSurveyId,
+    workspaceId: mockWorkspaceId,
+    type: "link" as SurveyType,
+    status: "inProgress" as SurveyStatus,
+  };
+
+  // Define filters as a TBaseFilters array with correct structure
+  const mockFilters: TBaseFilters = [
+    {
+      id: "filter-1",
+      connector: null,
+      resource: {
+        id: "resource-1",
+        root: {
+          type: "attribute",
+          contactAttributeKey: "email",
+        },
+        value: "test@example.com",
+        qualifier: {
+          operator: "equals",
+        },
+      },
+    },
+  ];
+
+  const mockSegment = {
+    id: mockSegmentId,
+    workspaceId: mockWorkspaceId,
+    filters: mockFilters,
+  };
+
+  const mockContacts = [
+    {
+      id: "contact-1",
+      attributes: [
+        { attributeKey: { key: "email" }, value: "test@example.com" },
+        { attributeKey: { key: "name" }, value: "Test User" },
+      ],
+    },
+    {
+      id: "contact-2",
+      attributes: [
+        { attributeKey: { key: "email" }, value: "another@example.com" },
+        { attributeKey: { key: "name" }, value: "Another User" },
+      ],
+    },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    vi.mocked(getSurvey).mockResolvedValue({
+      ok: true,
+      data: mockSurvey,
+    });
+
+    vi.mocked(getSegment).mockResolvedValue({
+      ok: true,
+      data: mockSegment,
+    });
+
+    vi.mocked(segmentFilterToPrismaQuery).mockResolvedValue({
+      ok: true,
+      data: {
+        whereClause: {
+          AND: [
+            { workspaceId: "workspace-789" },
+            {
+              AND: [
+                {
+                  attributes: {
+                    some: {
+                      attributeKey: { key: "email" },
+                      value: { equals: "test@example.com", mode: "insensitive" },
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    vi.mocked(getContactAttributeKeys).mockResolvedValue({
+      ok: true,
+      data: ["email", "name"],
+    });
+
+    vi.mocked(prisma.contact.count).mockResolvedValue(2);
+    vi.mocked(prisma.contact.findMany).mockResolvedValue(
+      mockContacts as unknown as Awaited<ReturnType<typeof prisma.contact.findMany>>
+    );
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  test("should return contacts when all operations succeed", async () => {
+    vi.mocked(prisma.$transaction).mockResolvedValue([mockContacts.length, mockContacts]);
+    const attributeKeys = "email,name";
+    const result = await getContactsInSegment(
+      mockSurveyId,
+      mockSegmentId,
+      apiKeyActor,
+      mockLimit,
+      mockSkip,
+      attributeKeys
+    );
+
+    const whereClause = {
+      AND: [
+        {
+          workspaceId: mockWorkspaceId,
+        },
+        {
+          AND: [
+            {
+              attributes: {
+                some: {
+                  attributeKey: {
+                    key: "email",
+                  },
+                  value: { equals: "test@example.com", mode: "insensitive" },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).toHaveBeenCalledWith(mockSegmentId);
+
+    expect(prisma.contact.count).toHaveBeenCalledWith({
+      where: whereClause,
+    });
+    expect(prisma.contact.findMany).toHaveBeenCalledWith({
+      where: whereClause,
+      select: {
+        id: true,
+        attributes: {
+          select: {
+            attributeKey: {
+              select: {
+                key: true,
+              },
+            },
+            value: true,
+          },
+          where: {
+            attributeKey: {
+              key: {
+                in: ["email", "name"],
+              },
+            },
+          },
+        },
+      },
+      take: mockLimit,
+      skip: mockSkip,
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data).toEqual({
+        data: [
+          {
+            contactId: "contact-1",
+            attributes: {
+              email: "test@example.com",
+              name: "Test User",
+            },
+          },
+          {
+            contactId: "contact-2",
+            attributes: {
+              email: "another@example.com",
+              name: "Another User",
+            },
+          },
+        ],
+        meta: {
+          total: 2,
+          limit: 10,
+          offset: 0,
+        },
+      });
+    }
+  });
+
+  test("should filter contact attributes when fields parameter is provided", async () => {
+    const filteredMockContacts = [
+      {
+        id: "contact-1",
+        attributes: [{ attributeKey: { key: "email" }, value: "test@example.com" }],
+      },
+      {
+        id: "contact-2",
+        attributes: [{ attributeKey: { key: "email" }, value: "another@example.com" }],
+      },
+    ];
+
+    vi.mocked(prisma.$transaction).mockResolvedValue([filteredMockContacts.length, filteredMockContacts]);
+
+    const result = await getContactsInSegment(
+      mockSurveyId,
+      mockSegmentId,
+      apiKeyActor,
+      mockLimit,
+      mockSkip,
+      "email"
+    );
+
+    const whereClause = {
+      AND: [
+        {
+          workspaceId: mockWorkspaceId,
+        },
+        {
+          AND: [
+            {
+              attributes: {
+                some: {
+                  attributeKey: {
+                    key: "email",
+                  },
+                  value: { equals: "test@example.com", mode: "insensitive" },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).toHaveBeenCalledWith(mockSegmentId);
+
+    expect(prisma.contact.count).toHaveBeenCalledWith({
+      where: whereClause,
+    });
+    expect(prisma.contact.findMany).toHaveBeenCalledWith({
+      where: whereClause,
+      select: {
+        id: true,
+        attributes: {
+          where: {
+            attributeKey: {
+              key: {
+                in: ["email"],
+              },
+            },
+          },
+          select: {
+            attributeKey: {
+              select: {
+                key: true,
+              },
+            },
+            value: true,
+          },
+        },
+      },
+      take: mockLimit,
+      skip: mockSkip,
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data).toEqual({
+        data: [
+          {
+            contactId: "contact-1",
+            attributes: {
+              email: "test@example.com",
+            },
+          },
+          {
+            contactId: "contact-2",
+            attributes: {
+              email: "another@example.com",
+            },
+          },
+        ],
+        meta: {
+          total: 2,
+          limit: 10,
+          offset: 0,
+        },
+      });
+    }
+  });
+
+  test("should handle multiple fields when fields parameter has comma-separated values", async () => {
+    vi.mocked(prisma.$transaction).mockResolvedValue([mockContacts.length, mockContacts]);
+
+    const result = await getContactsInSegment(
+      mockSurveyId,
+      mockSegmentId,
+      apiKeyActor,
+      mockLimit,
+      mockSkip,
+      "email,name"
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data).toEqual({
+        data: [
+          {
+            contactId: "contact-1",
+            attributes: {
+              email: "test@example.com",
+              name: "Test User",
+            },
+          },
+          {
+            contactId: "contact-2",
+            attributes: {
+              email: "another@example.com",
+              name: "Another User",
+            },
+          },
+        ],
+        meta: {
+          total: 2,
+          limit: 10,
+          offset: 0,
+        },
+      });
+    }
+  });
+
+  test("should return no attributes but still return contacts when fields parameter is empty", async () => {
+    const mockContactsWithoutAttributes = mockContacts.map((contact) => ({
+      ...contact,
+      attributes: [],
+    }));
+
+    vi.mocked(prisma.$transaction).mockResolvedValue([
+      mockContactsWithoutAttributes.length,
+      mockContactsWithoutAttributes,
+    ]);
+
+    const result = await getContactsInSegment(
+      mockSurveyId,
+      mockSegmentId,
+      apiKeyActor,
+      mockLimit,
+      mockSkip,
+      ""
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.data).toEqual({
+        data: mockContacts.map((contact) => ({
+          contactId: contact.id,
+        })),
+        meta: {
+          total: 2,
+          limit: 10,
+          offset: 0,
+        },
+      });
+    }
+  });
+
+  test("should return error when survey is not a link survey", async () => {
+    const surveyError: ApiErrorResponseV2 = {
+      type: "forbidden",
+      details: [{ field: "surveyId", issue: "Invalid survey" }],
+    };
+
+    vi.mocked(getSurvey).mockResolvedValue({
+      ok: true,
+      data: {
+        ...mockSurvey,
+        type: "web" as SurveyType,
+      },
+    });
+
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).not.toHaveBeenCalled();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual(surveyError);
+    }
+  });
+
+  test("should return error when survey is not active", async () => {
+    const surveyError: ApiErrorResponseV2 = {
+      type: "forbidden",
+      details: [{ field: "surveyId", issue: "Invalid survey" }],
+    };
+
+    vi.mocked(getSurvey).mockResolvedValue({
+      ok: true,
+      data: {
+        ...mockSurvey,
+        status: "completed",
+      },
+    });
+
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).not.toHaveBeenCalled();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual(surveyError);
+    }
+  });
+
+  test("should return error when survey is not found", async () => {
+    const surveyError: ApiErrorResponseV2 = {
+      type: "not_found",
+      details: [{ field: "survey", issue: "not found" }],
+    };
+
+    vi.mocked(getSurvey).mockResolvedValue({
+      ok: false,
+      error: surveyError,
+    });
+
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).not.toHaveBeenCalled();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual(surveyError);
+    }
+  });
+
+  test("should return error when segment is not found", async () => {
+    const segmentError: ApiErrorResponseV2 = {
+      type: "not_found",
+      details: [{ field: "segment", issue: "not found" }],
+    };
+
+    vi.mocked(getSegment).mockResolvedValue({
+      ok: false,
+      error: segmentError,
+    });
+
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).toHaveBeenCalledWith(mockSegmentId);
+    expect(prisma.contact.count).not.toHaveBeenCalled();
+    expect(prisma.contact.findMany).not.toHaveBeenCalled();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual(segmentError);
+    }
+  });
+
+  test("should return error when survey and segment are in different workspaces", async () => {
+    const mockSegmentWithDifferentWorkspace = {
+      ...mockSegment,
+      workspaceId: "different-workspace",
+    };
+
+    vi.mocked(getSegment).mockResolvedValue({
+      ok: true,
+      data: mockSegmentWithDifferentWorkspace,
+    });
+
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).toHaveBeenCalledWith(mockSegmentId);
+    expect(prisma.contact.count).not.toHaveBeenCalled();
+    expect(prisma.contact.findMany).not.toHaveBeenCalled();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual({
+        type: "bad_request",
+        details: [{ field: "segmentId", issue: "Environment mismatch" }],
+      });
+    }
+  });
+
+  test("should return error when database operation fails", async () => {
+    const dbError = new Error("Database connection failed");
+    vi.mocked(prisma.$transaction).mockRejectedValue(dbError);
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(getSurvey).toHaveBeenCalledWith(mockSurveyId);
+    expect(getSegment).toHaveBeenCalledWith(mockSegmentId);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toEqual({
+        type: "internal_server_error",
+      });
+    }
+  });
+  // ENG-6870: an API key never sees a restricted survey, so it may not evaluate a filter that reads one.
+  test("refuses a segment whose survey-interaction filter names a restricted survey", async () => {
+    const scope = { surveyScope: "specific", surveyIds: ["clrestricted00000000000001"] };
+    const filters = [
+      {
+        id: "f1",
+        connector: null,
+        resource: {
+          id: "i1",
+          root: { type: "surveyInteraction" },
+          qualifier: { operator: "haveCompleted" },
+          value: { ...scope, within: { amount: 30, unit: "days" } },
+        },
+      },
+    ] as unknown as TBaseFilters;
+    vi.mocked(getSegment).mockResolvedValue({
+      ok: true,
+      data: { id: mockSegmentId, workspaceId: mockWorkspaceId, filters },
+    });
+    vi.mocked(prisma.survey.findFirst).mockResolvedValue({ id: "clrestricted00000000000001" } as Awaited<
+      ReturnType<typeof prisma.survey.findFirst>
+    >);
+
+    const result = await getContactsInSegment(mockSurveyId, mockSegmentId, apiKeyActor, mockLimit, mockSkip);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatchObject({ type: "forbidden" });
+    // The restricted-survey clause an API key is held to.
+    expect(prisma.survey.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          id: { in: ["clrestricted00000000000001"] },
+          workspaceId: mockWorkspaceId,
+          AND: [expect.objectContaining({ OR: expect.arrayContaining([{ visibility: "restricted" }]) })],
+        }),
+      })
+    );
+    expect(segmentFilterToPrismaQuery).not.toHaveBeenCalled();
+    expect(prisma.contact.count).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,501 @@
+"use client";
+
+import * as Collapsible from "@radix-ui/react-collapsible";
+import { AlertCircle, CheckIcon, ChevronDownIcon, ChevronUpIcon, PencilIcon } from "lucide-react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import React, { useEffect, useMemo, useState } from "react";
+import toast from "react-hot-toast";
+import { Trans, useTranslation } from "react-i18next";
+import { TContactAttributeKey } from "@formbricks/types/contact-attribute-key";
+import type {
+  TBaseFilter,
+  TSegment,
+  TSegmentCreateInput,
+  TSegmentUpdateInput,
+} from "@formbricks/types/segment";
+import type { TSurvey } from "@formbricks/types/surveys/types";
+import { useWorkspace } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
+import { cn } from "@/lib/cn";
+import { structuredClone } from "@/lib/pollyfills/structuredClone";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import {
+  attachSurveySegment,
+  copySegment,
+  createSegment,
+  resetSurveySegment,
+  updateSegment,
+} from "@/modules/ee/contacts/segments/lib/api-client";
+import {
+  type TSharedSegmentEdit,
+  keepSharedSegmentEditFor,
+  startSharedSegmentEdit,
+} from "@/modules/survey/editor/lib/shared-segment-edit";
+import { Alert, AlertDescription } from "@/modules/ui/components/alert";
+import { AlertDialog } from "@/modules/ui/components/alert-dialog";
+import { Button } from "@/modules/ui/components/button";
+import { LoadSegmentModal } from "@/modules/ui/components/load-segment-modal";
+import { SaveAsNewSegmentModal } from "@/modules/ui/components/save-as-new-segment-modal";
+import { SegmentTitle } from "@/modules/ui/components/segment-title";
+import { TargetingIndicator } from "@/modules/ui/components/targeting-indicator";
+import { AddFilterModal } from "./add-filter-modal";
+import { SegmentEditor } from "./segment-editor";
+
+interface TargetingCardProps {
+  readonly localSurvey: TSurvey;
+  readonly setLocalSurvey: React.Dispatch<React.SetStateAction<TSurvey>>;
+  readonly contactAttributeKeys: TContactAttributeKey[];
+  readonly segments: TSegment[];
+  readonly initialSegment?: TSegment;
+  /**
+   * The shared-segment edit open in this card (ENG-6957). A survey save does not write a shared segment,
+   * so the editor stops Save and Publish while it holds unsaved filters, until "Save changes" or Cancel.
+   */
+  readonly sharedSegmentEdit: TSharedSegmentEdit | null;
+  readonly setSharedSegmentEdit: React.Dispatch<React.SetStateAction<TSharedSegmentEdit | null>>;
+}
+
+/**
+ * The card's open state, adjusted during render from the first one: a segment with filters expands
+ * it, and a link survey, which cannot target, collapses it.
+ */
+const useTargetingCardOpen = (segment: TSegment | null, surveyType: TSurvey["type"]) => {
+  const [open, setOpen] = useState(false);
+
+  const [seenSegment, setSeenSegment] = useState<TSegment | null | undefined>(undefined);
+  if (segment !== seenSegment) {
+    setSeenSegment(segment);
+    if (segment && segment.filters.length > 0) setOpen(true);
+  }
+
+  const [seenSurveyType, setSeenSurveyType] = useState<TSurvey["type"] | null>(null);
+  if (surveyType !== seenSurveyType) {
+    setSeenSurveyType(surveyType);
+    if (surveyType === "link") setOpen(false);
+  }
+
+  return [open, setOpen] as const;
+};
+
+export function TargetingCard({
+  localSurvey,
+  setLocalSurvey,
+  contactAttributeKeys,
+  segments,
+  initialSegment,
+  sharedSegmentEdit,
+  setSharedSegmentEdit,
+}: TargetingCardProps) {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const { workspace } = useWorkspace();
+  const workspaceBasePath = `/workspaces/${workspace?.id}`;
+  const [segment, setSegment] = useState<TSegment | null>(localSurvey.segment);
+
+  const [addFilterModalOpen, setAddFilterModalOpen] = useState(false);
+  const [saveAsNewSegmentModalOpen, setSaveAsNewSegmentModalOpen] = useState(false);
+  const [resetAllFiltersModalOpen, setResetAllFiltersModalOpen] = useState(false);
+  const [loadSegmentModalOpen, setLoadSegmentModalOpen] = useState(false);
+  // A shared-segment edit left open when the Settings tab unmounted the card opens again with it.
+  const isReopeningSharedEdit =
+    !!localSurvey.segment && sharedSegmentEdit?.segmentId === localSurvey.segment.id;
+  const [isSegmentEditorOpen, setIsSegmentEditorOpen] = useState(
+    Boolean(localSurvey.segment?.isPrivate) || isReopeningSharedEdit
+  );
+  const [segmentEditorViewOnly, setSegmentEditorViewOnly] = useState(!isReopeningSharedEdit);
+
+  useEffect(() => {
+    setLocalSurvey((localSurveyOld) => ({
+      ...localSurveyOld,
+      segment,
+    }));
+  }, [setLocalSurvey, segment]);
+
+  // An edit of another segment ends once the survey is on a different one (Load, Clone, Reset).
+  useEffect(() => {
+    setSharedSegmentEdit((edit) => keepSharedSegmentEditFor(edit, segment?.id));
+  }, [segment?.id, setSharedSegmentEdit]);
+
+  const isSegmentUsedInOtherSurveys = useMemo(
+    () => (localSurvey.segment ? localSurvey.segment.surveys.length > 1 : false),
+    [localSurvey.segment]
+  );
+
+  const handleCloneSegment = async () => {
+    if (!segment) return;
+
+    try {
+      setSegment(await copySegment(segment.id, localSurvey.id));
+      router.refresh();
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    }
+  };
+
+  const [open, setOpen] = useTargetingCardOpen(segment, localSurvey.type);
+
+  const handleAddFilterInGroup = (filter: TBaseFilter) => {
+    const updatedSegment = structuredClone(segment);
+    if (updatedSegment?.filters.length === 0) {
+      updatedSegment.filters.push({
+        ...filter,
+        connector: null,
+      });
+    } else {
+      updatedSegment?.filters.push(filter);
+    }
+
+    setSegment(updatedSegment);
+  };
+
+  /**
+   * The dialogs below toast the message of what they catch, so a failure carries a readable one. A success
+   * refreshes the route: `segments` (and so the editor's Cancel target) comes from the server render.
+   */
+  const withReadableMessage = async <T,>(request: () => Promise<T>): Promise<T> => {
+    try {
+      const result = await request();
+      router.refresh();
+      return result;
+    } catch (error) {
+      throw new Error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    }
+  };
+
+  const handleLoadNewSegment = (surveyId: string, segmentId: string): Promise<TSurvey> =>
+    withReadableMessage(async () => ({
+      ...localSurvey,
+      segment: await attachSurveySegment(surveyId, segmentId),
+    }));
+
+  const handleSaveAsNewSegmentUpdate = (segmentId: string, data: TSegmentUpdateInput) =>
+    withReadableMessage(() => updateSegment(segmentId, data));
+
+  const handleSaveAsNewSegmentCreate = (data: TSegmentCreateInput) =>
+    withReadableMessage(() => createSegment(data));
+
+  const handleSaveSegment = async (data: TSegmentUpdateInput) => {
+    try {
+      if (!segment) throw new Error(t("workspace.segments.invalid_segment"));
+      await updateSegment(segment.id, data);
+      toast.success(t("workspace.segments.segment_saved_successfully"));
+      // Cancel restores the segment from `segments`, which the server render owns: refresh it.
+      router.refresh();
+
+      setSharedSegmentEdit(null);
+      setIsSegmentEditorOpen(false);
+      setSegmentEditorViewOnly(true);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("workspace.segments.error_saving_segment")));
+    }
+  };
+
+  const handleResetAllFilters = async () => {
+    try {
+      return await resetSurveySegment(localSurvey.id);
+    } catch {
+      toast.error(t("workspace.segments.error_resetting_filters"));
+    }
+  };
+
+  if (localSurvey.type === "link") {
+    return null; // Hide card completely
+  }
+
+  if (!segment) {
+    throw new Error(t("workspace.segments.invalid_segment"));
+  }
+
+  const renderSegmentEditor = () => (
+    <div className="flex w-full flex-col gap-2">
+      <SegmentTitle
+        description={localSurvey.segment?.description}
+        isPrivate={segment?.isPrivate}
+        title={localSurvey.segment?.title}
+      />
+      {Boolean(segment?.filters.length) && (
+        <div className="w-full">
+          <SegmentEditor
+            contactAttributeKeys={contactAttributeKeys}
+            group={segment.filters}
+            key={segment.filters.toString()}
+            segment={segment}
+            segments={segments}
+            setSegment={setSegment}
+          />
+        </div>
+      )}
+
+      <div
+        className={cn(
+          "mt-3 flex items-center gap-2",
+          segment?.isPrivate && !segment.filters.length && "mt-0"
+        )}>
+        <Button
+          onClick={() => {
+            setAddFilterModalOpen(true);
+          }}
+          size="sm"
+          variant="secondary">
+          {t("common.add_filter")}
+        </Button>
+
+        {isSegmentEditorOpen && !segment?.isPrivate ? (
+          <Button
+            onClick={() => {
+              void handleSaveSegment({ filters: segment?.filters ?? [] });
+            }}
+            size="sm"
+            variant="secondary">
+            {t("common.save_changes")}
+          </Button>
+        ) : null}
+
+        {isSegmentEditorOpen && !segment?.isPrivate ? (
+          <Button
+            className="flex items-center gap-2"
+            onClick={() => {
+              setIsSegmentEditorOpen(false);
+              setSegmentEditorViewOnly(true);
+
+              // Back to the filters as stored when the edit opened or was last saved: `initialSegment`
+              // is the page's copy, which an earlier "Save changes" leaves behind.
+              if (segment && sharedSegmentEdit?.segmentId === segment.id) {
+                setSegment({ ...segment, filters: sharedSegmentEdit.savedFilters });
+              } else if (initialSegment) {
+                setSegment(initialSegment);
+              }
+              setSharedSegmentEdit(null);
+            }}
+            size="sm"
+            variant="ghost">
+            {t("common.cancel")}
+          </Button>
+        ) : null}
+      </div>
+
+      <AddFilterModal
+        contactAttributeKeys={contactAttributeKeys}
+        onAddFilter={(filter) => {
+          handleAddFilterInGroup(filter);
+        }}
+        open={addFilterModalOpen}
+        segments={segments}
+        setOpen={setAddFilterModalOpen}
+      />
+      {Boolean(segment) && (
+        <SaveAsNewSegmentModal
+          localSurvey={localSurvey}
+          onCreateSegment={handleSaveAsNewSegmentCreate}
+          onUpdateSegment={handleSaveAsNewSegmentUpdate}
+          open={saveAsNewSegmentModalOpen}
+          segment={segment}
+          setIsSegmentEditorOpen={setIsSegmentEditorOpen}
+          setOpen={setSaveAsNewSegmentModalOpen}
+          setSegment={setSegment}
+        />
+      )}
+    </div>
+  );
+
+  const renderSegmentSummary = () => (
+    <div className="flex flex-col gap-2 rounded-lg">
+      <SegmentTitle
+        description={localSurvey.segment?.description}
+        isPrivate={segment?.isPrivate}
+        title={localSurvey.segment?.title}
+      />
+
+      {segmentEditorViewOnly && segment ? (
+        <div className="opacity-60">
+          <SegmentEditor
+            contactAttributeKeys={contactAttributeKeys}
+            group={segment.filters}
+            key={segment.filters.toString()}
+            segment={segment}
+            segments={segments}
+            setSegment={setSegment}
+            viewOnly={segmentEditorViewOnly}
+          />
+        </div>
+      ) : null}
+
+      <div className="mt-3 flex items-center gap-3">
+        <Button
+          onClick={() => {
+            setSegmentEditorViewOnly(!segmentEditorViewOnly);
+          }}
+          size="sm"
+          variant="secondary">
+          {segmentEditorViewOnly
+            ? t("workspace.segments.hide_filters")
+            : t("workspace.segments.view_filters")}
+          {segmentEditorViewOnly ? (
+            <ChevronUpIcon className="ml-2 size-3" />
+          ) : (
+            <ChevronDownIcon className="ml-2 size-3" />
+          )}
+        </Button>
+
+        {isSegmentUsedInOtherSurveys ? (
+          <Button onClick={() => handleCloneSegment()} size="sm" variant="secondary">
+            {t("workspace.segments.clone_and_edit_segment")}
+          </Button>
+        ) : null}
+        {!isSegmentUsedInOtherSurveys && (
+          <Button
+            onClick={() => {
+              setIsSegmentEditorOpen(true);
+              setSegmentEditorViewOnly(false);
+              setSharedSegmentEdit((edit) => startSharedSegmentEdit(edit, segment));
+            }}
+            size="sm"
+            variant={isSegmentUsedInOtherSurveys ? "ghost" : "secondary"}>
+            {t("workspace.segments.edit_segment")}
+            <PencilIcon className="ml-2 size-3" />
+          </Button>
+        )}
+      </div>
+      {isSegmentUsedInOtherSurveys ? (
+        <p className="mt-1 flex items-center text-xs text-slate-500">
+          <AlertCircle className="mr-1 inline size-3" />
+          <Trans
+            i18nKey="workspace.segments.segment_used_in_other_surveys_make_changes_here"
+            components={{
+              segmentsLink: (
+                <Link className="ml-1 underline" href={`${workspaceBasePath}/segments`} target="_blank" />
+              ),
+            }}
+          />
+        </p>
+      ) : null}
+    </div>
+  );
+
+  return (
+    <Collapsible.Root
+      className="w-full overflow-hidden rounded-lg border border-slate-300 bg-white"
+      onOpenChange={setOpen}
+      open={open}>
+      <Collapsible.CollapsibleTrigger
+        asChild
+        className="h-full w-full cursor-pointer rounded-lg hover:bg-slate-50">
+        <button type="button" className="inline-flex px-4 py-4 text-left">
+          <div className="flex items-center pr-5 pl-2">
+            <CheckIcon
+              className="size-7 rounded-full border border-green-300 bg-green-100 p-1.5 text-green-600"
+              strokeWidth={3}
+            />
+          </div>
+          <div>
+            <p className="font-semibold text-slate-800">{t("workspace.segments.target_audience")}</p>
+            <p className="mt-1 text-sm text-slate-500">{t("workspace.segments.pre_segment_users")}</p>
+          </div>
+        </button>
+      </Collapsible.CollapsibleTrigger>
+      <Collapsible.CollapsibleContent className="min-w-full overflow-auto">
+        <hr className="text-slate-600" />
+
+        <div className="flex flex-col gap-5 p-6">
+          <TargetingIndicator segment={segment} />
+
+          <div className="filter-scrollbar flex flex-col gap-4 overflow-auto rounded-lg border border-slate-300 bg-slate-50 p-4">
+            {Boolean(segment) && (
+              <LoadSegmentModal
+                currentSegment={segment}
+                onSegmentLoad={handleLoadNewSegment}
+                open={loadSegmentModalOpen}
+                segments={segments}
+                setIsSegmentEditorOpen={setIsSegmentEditorOpen}
+                setOpen={setLoadSegmentModalOpen}
+                setSegment={setSegment}
+                surveyId={localSurvey.id}
+              />
+            )}
+
+            {isSegmentEditorOpen ? renderSegmentEditor() : renderSegmentSummary()}
+          </div>
+
+          <div className="flex gap-3">
+            <Button
+              onClick={() => {
+                setLoadSegmentModalOpen(true);
+              }}
+              size="sm"
+              variant="secondary">
+              {t("workspace.segments.load_segment")}
+            </Button>
+
+            {!segment?.isPrivate && Boolean(segment?.filters.length) && (
+              <Button
+                onClick={() => {
+                  setResetAllFiltersModalOpen(true);
+                }}
+                size="sm"
+                variant="secondary">
+                {t("workspace.segments.reset_all_filters")}
+              </Button>
+            )}
+
+            {isSegmentEditorOpen && Boolean(segment?.filters.length) ? (
+              <Button
+                className="flex items-center gap-2"
+                onClick={() => {
+                  setSaveAsNewSegmentModalOpen(true);
+                }}
+                size="sm"
+                variant="secondary">
+                {t("workspace.segments.save_as_new_segment")}
+              </Button>
+            ) : null}
+
+            <AlertDialog
+              confirmBtnLabel={t("workspace.segments.remove_all_filters")}
+              declineBtnLabel={t("common.cancel")}
+              headerText={t("common.are_you_sure")}
+              mainText={t("workspace.segments.this_action_resets_all_filters_in_this_survey")}
+              onConfirm={async () => {
+                const segment = await handleResetAllFilters();
+                if (segment) {
+                  toast.success(t("workspace.segments.filters_reset_successfully"));
+
+                  setSegment(segment);
+                  setResetAllFiltersModalOpen(false);
+
+                  router.refresh();
+                }
+              }}
+              onDecline={() => {
+                setResetAllFiltersModalOpen(false);
+              }}
+              open={resetAllFiltersModalOpen}
+              setOpen={setResetAllFiltersModalOpen}
+            />
+          </div>
+        </div>
+
+        <div>
+          <Alert className="flex items-center rounded-none bg-slate-50" alertRole="status">
+            <AlertDescription className="ml-2">
+              <span className="mr-1 text-slate-600">
+                <Trans
+                  i18nKey="workspace.segments.user_targeting_only_available_when_identifying_users"
+                  components={{
+                    docsLink: (
+                      <Link
+                        href="https://formbricks.com/docs/app-surveys/user-identification"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                      />
+                    ),
+                  }}
+                />
+              </span>
+            </AlertDescription>
+          </Alert>
+        </div>
+      </Collapsible.CollapsibleContent>
+    </Collapsible.Root>
+  );
+}

@@ -1,0 +1,420 @@
+import { notFound, redirect } from "next/navigation";
+import { cache as reactCache } from "react";
+import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
+import { logger } from "@formbricks/logger";
+import { ZId } from "@formbricks/types/common";
+import { AuthenticationError, DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { can } from "@/lib/authorization";
+import { withAuthorizationSurface } from "@/lib/authorization/context";
+import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
+import { getBillingFallbackPath } from "@/lib/membership/navigation";
+import { getMembershipByUserIdOrganizationId } from "@/lib/membership/service";
+import { getAccessFlags } from "@/lib/membership/utils";
+import { getMonthlyOrganizationResponseCount, getOrganization } from "@/lib/organization/service";
+import { getUser } from "@/lib/user/service";
+import { needsMonthlyResponseCount } from "@/lib/utils/billing";
+import { validateInputs } from "@/lib/utils/validate";
+import { canUserNavigateWorkspace } from "@/lib/workspace/auth";
+import { getWorkspace } from "@/lib/workspace/service";
+import { getTranslate } from "@/lingodotdev/server";
+import { getSession } from "@/modules/auth/lib/session";
+import { getDashboardViewerWorkspaceState } from "@/modules/ee/analysis/lib/dashboard-viewer-access";
+import { getEnterpriseLicense } from "@/modules/ee/license-check/lib/license";
+import { getAccessControlPermission } from "@/modules/ee/license-check/lib/utils";
+import { getWorkspacePermissionByUserId } from "@/modules/ee/teams/lib/roles";
+import { getTeamPermissionFlags } from "@/modules/ee/teams/utils/teams";
+import { withPlanDetailsFor } from "@/modules/organization/lib/plan-details";
+import { TWorkspaceAuth, TWorkspaceLayoutData } from "@/modules/workspaces/types/workspace-auth";
+
+/**
+ * Resolves a workspace and returns the caller's authorization context for it.
+ *
+ * This helper is self-contained: it enforces workspace-level access itself rather
+ * than relying on the route layout to gate, so it is safe to reuse from any page or
+ * route. Billing-role members are redirected to billing/enterprise screens; any org
+ * member without a WorkspaceTeam grant (and who is not an owner/manager) is rejected
+ * with a 404 instead of being silently admitted as a writer.
+ *
+ * Opened as the `page` authorization surface (ENG-2388). Every product page funnels through here, so
+ * this wrapper attributes authoritative decisions and checks-per-request telemetry to page traffic.
+ */
+export const getWorkspaceAuth = reactCache(
+  async (workspaceId: string): Promise<TWorkspaceAuth> =>
+    withAuthorizationSurface("page", () => resolveWorkspaceAuth(workspaceId))
+);
+
+const resolveWorkspaceAuth = async (workspaceId: string): Promise<TWorkspaceAuth> => {
+  const t = await getTranslate();
+
+  const [workspace, session] = await Promise.all([getWorkspace(workspaceId), getSession()]);
+
+  // A missing workspace and a workspace this user may not read both 404 (ENG-3974): the page must not
+  // reveal which ids exist, and an error boundary would misreport either as a backend failure.
+  if (!workspace) {
+    return notFound();
+  }
+
+  if (!session) {
+    throw new AuthenticationError(t("common.not_authenticated"));
+  }
+
+  const organization = await getOrganization(workspace.organizationId);
+
+  if (!organization) {
+    throw new ResourceNotFoundError(t("common.organization"), null);
+  }
+
+  const currentUserMembership = await getMembershipByUserIdOrganizationId(session.user.id, organization.id);
+  if (!currentUserMembership) {
+    return notFound();
+  }
+
+  const { isMember, isOwner, isManager, isBilling, isDashboardViewer } = getAccessFlags(
+    currentUserMembership.role
+  );
+
+  // A Dashboard viewer (ADR-0025) only ever sees dashboards. Every product page funnels through here, so
+  // sending the role to the dashboard list closes them all at once, the way the billing redirect below
+  // does. The dashboard pages don't come through here: they use `getDashboardsPageAuth`, which decides
+  // whether the viewer may read this workspace or must see the unavailable page.
+  if (isDashboardViewer) {
+    redirect(`/workspaces/${workspace.id}/dashboards`);
+  }
+
+  // Billing-role members are scoped to billing/enterprise screens only. They must never reach
+  // workspace product data (contacts PII, survey summaries/responses, dashboards). This is the
+  // single choke point every product page flows through, so gating here closes all of them at
+  // once and keeps this helper aligned with the central `workspace.read` contract, which also denies
+  // billing. Individual pages that also guard billing inline remain correct (defense in depth).
+  if (isBilling) {
+    redirect(getBillingFallbackPath(organization.id, IS_FORMBRICKS_CLOUD));
+  }
+
+  // Enforce workspace access here instead of delegating to the route layout, so
+  // getWorkspaceAuth is safe to reuse anywhere. An org member with no WorkspaceTeam
+  // grant for this workspace has no access and must be rejected — not silently
+  // treated as a writer. Runs alongside the permission lookup to avoid extra latency.
+  //
+  // `workspace.read` and not the broader navigation check: the billing redirect above
+  // already returned, so the only roles that reach this line are owner, manager, and
+  // member, for which the two are identical. Asking for the narrower permission means
+  // the choke point no longer depends on the redirect running first to keep the billing
+  // role out of product data — if that ordering were ever disturbed, billing would be
+  // refused here rather than admitted.
+  const [hasWorkspaceAccess, workspacePermission] = await Promise.all([
+    can({ type: "user", id: session.user.id }, "workspace.read", {
+      type: "workspace",
+      id: workspace.id,
+    }),
+    getWorkspacePermissionByUserId(session.user.id, workspace.id),
+  ]);
+
+  if (!hasWorkspaceAccess) {
+    return notFound();
+  }
+
+  const { hasReadAccess, hasReadWriteAccess, hasManageAccess } = getTeamPermissionFlags(workspacePermission);
+
+  // Fail safe: a member is read-only unless they hold an explicit write or manage
+  // grant. Deriving from the *absence* of write access (rather than the presence of
+  // an exact "read" grant) means a member with no resolved permission is treated as
+  // the most restricted, never mislabeled as a writer.
+  const isReadOnly = isMember && !hasReadWriteAccess && !hasManageAccess;
+
+  // The UI counterpart of `workspace.manage`: owners and managers, or a member with a manage
+  // grant. Forms whose action asserts `workspace.manage` must gate on this, not on `isReadOnly`,
+  // or a readWrite member gets an editable form that is refused on save. Derived from the
+  // presence of a grant, so a member with no resolved permission cannot manage.
+  const canManage = isOwner || isManager || hasManageAccess;
+
+  return {
+    workspace,
+    organization,
+    session,
+    currentUserMembership,
+    workspacePermission,
+    isMember,
+    isOwner,
+    isManager,
+    isBilling,
+    hasReadAccess,
+    hasReadWriteAccess,
+    hasManageAccess,
+    isReadOnly,
+    canManage,
+  };
+};
+
+/**
+ * Lightweight layout checks for workspace routes (survey editor, onboarding).
+ *
+ * Opened as the `page` surface for the same reason as `getWorkspaceAuth` (ENG-2388): the navigation
+ * gate below already routes through `can()` via `canUserNavigateWorkspace`, but a layout render is
+ * its own async context, so it needs its own surface to be comparable.
+ */
+export const workspaceIdLayoutChecks = async (workspaceId: string) =>
+  withAuthorizationSurface("page", () => resolveWorkspaceIdLayoutChecks(workspaceId));
+
+const resolveWorkspaceIdLayoutChecks = async (workspaceId: string) => {
+  const t = await getTranslate();
+  const session = await getSession();
+
+  if (!session?.user) {
+    return { t, session: null, user: null, organization: null };
+  }
+
+  const user = await getUser(session.user.id);
+  if (!user) {
+    return { t, session, user: null, organization: null };
+  }
+
+  // Resolved before the access check because the navigation gate is expressed against the
+  // owning organization as well as the workspace. Answering "does it exist" first also
+  // matches getWorkspaceAuth above, so a missing workspace reports itself as missing here
+  // too instead of as a denial.
+  const workspace = await prisma.workspace.findUnique({
+    where: { id: workspaceId },
+    select: {
+      organization: {
+        select: {
+          id: true,
+          createdAt: true,
+          updatedAt: true,
+          name: true,
+          billing: {
+            select: {
+              stripeCustomerId: true,
+              limits: true,
+              usageCycleAnchor: true,
+              stripe: true,
+            },
+          },
+          isAISmartToolsEnabled: true,
+          whitelabel: true,
+        },
+      },
+    },
+  });
+
+  if (!workspace) {
+    return notFound();
+  }
+
+  // Navigation, not data: these layouts are also what a billing-role member has to pass
+  // through on the way to the billing screens, so this keeps admitting that role. The
+  // pages themselves gate their data on workspace.read.
+  const hasAccess = await canUserNavigateWorkspace(session.user.id, {
+    id: workspaceId,
+    organizationId: workspace.organization.id,
+  });
+  if (!hasAccess) {
+    // The survey and creative editors are not for a Dashboard viewer; send one back to its dashboards
+    // rather than 404, as `getWorkspaceAuth` does for every other product page.
+    if ((await getDashboardViewerWorkspaceState(session.user.id, workspaceId)) !== "none") {
+      return redirect(`/workspaces/${workspaceId}/dashboards`);
+    }
+    return notFound();
+  }
+
+  return { t, session, user, organization: workspace.organization };
+};
+
+/**
+ * Fetches workspace with related data in a single optimized database query.
+ */
+export const getWorkspaceWithRelations = reactCache(async (workspaceId: string, userId: string) => {
+  try {
+    const data = await prisma.workspace.findUnique({
+      where: { id: workspaceId },
+      select: {
+        id: true,
+        createdAt: true,
+        updatedAt: true,
+        name: true,
+        organizationId: true,
+        languages: true,
+        recontactDays: true,
+        linkSurveyBranding: true,
+        inAppSurveyBranding: true,
+        config: true,
+        placement: true,
+        clickOutsideClose: true,
+        overlay: true,
+        overlayColor: true,
+        overlayOpacity: true,
+        appSetupCompleted: true,
+        styling: true,
+        logo: true,
+        customHeadScripts: true,
+        organization: {
+          select: {
+            id: true,
+            createdAt: true,
+            updatedAt: true,
+            name: true,
+            billing: {
+              select: {
+                stripeCustomerId: true,
+                limits: true,
+                usageCycleAnchor: true,
+                stripe: true,
+              },
+            },
+            isAISmartToolsEnabled: true,
+            whitelabel: true,
+            displayTimeZone: true,
+            memberships: {
+              where: { userId },
+              select: {
+                userId: true,
+                organizationId: true,
+                accepted: true,
+                role: true,
+              },
+              take: 1,
+            },
+          },
+        },
+      },
+    });
+
+    if (!data) return null;
+
+    if (!data.organization.billing) {
+      throw new ResourceNotFoundError("OrganizationBilling", data.organization.id);
+    }
+
+    return {
+      workspace: {
+        id: data.id,
+        createdAt: data.createdAt,
+        updatedAt: data.updatedAt,
+        name: data.name,
+        organizationId: data.organizationId,
+        languages: data.languages,
+        recontactDays: data.recontactDays,
+        linkSurveyBranding: data.linkSurveyBranding,
+        inAppSurveyBranding: data.inAppSurveyBranding,
+        config: data.config,
+        placement: data.placement,
+        clickOutsideClose: data.clickOutsideClose,
+        overlay: data.overlay,
+        overlayColor: data.overlayColor,
+        overlayOpacity: data.overlayOpacity,
+        styling: data.styling,
+        logo: data.logo,
+        customHeadScripts: data.customHeadScripts,
+        appSetupCompleted: data.appSetupCompleted,
+      },
+      organization: {
+        id: data.organization.id,
+        createdAt: data.organization.createdAt,
+        updatedAt: data.organization.updatedAt,
+        name: data.organization.name,
+        billing: data.organization.billing,
+        isAISmartToolsEnabled: data.organization.isAISmartToolsEnabled,
+        whitelabel: data.organization.whitelabel,
+        displayTimeZone: data.organization.displayTimeZone,
+      },
+      membership: data.organization.memberships[0] || null,
+    };
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      logger.error(error, "Error getting workspace with relations");
+      throw new DatabaseError(error.message);
+    }
+    throw error;
+  }
+});
+
+/**
+ * Fetches all data required for workspace layout rendering.
+ * Resolves the production environment automatically.
+ *
+ * Opened as the `page` surface for the same reason as its two siblings above (ENG-2388). This one
+ * backs the top-level `/workspaces/[workspaceId]` layout, so it is the highest-traffic authorization
+ * gate of the three — its `canUserNavigateWorkspace` call reaches `can()` on essentially every
+ * product navigation. The surface keeps authoritative decision and request-amplification telemetry
+ * attributable without participating in engine selection.
+ */
+export const getWorkspaceLayoutData = reactCache(
+  async (workspaceId: string, userId: string): Promise<TWorkspaceLayoutData> =>
+    withAuthorizationSurface("page", () => resolveWorkspaceLayoutData(workspaceId, userId))
+);
+
+const resolveWorkspaceLayoutData = async (
+  workspaceId: string,
+  userId: string
+): Promise<TWorkspaceLayoutData> => {
+  validateInputs([workspaceId, ZId]);
+  validateInputs([userId, ZId]);
+
+  const t = await getTranslate();
+  const session = await getSession();
+
+  if (!session?.user) {
+    throw new AuthenticationError(t("common.not_authenticated"));
+  }
+
+  if (session.user.id !== userId) {
+    throw new AuthenticationError("User ID mismatch with session");
+  }
+
+  const user = await getUser(userId);
+  if (!user) {
+    throw new AuthenticationError(t("common.not_authenticated"));
+  }
+
+  // Resolved first so the navigation gate below can name the owning organization. This is
+  // the same request-memoized read the rest of this function already relied on, so it costs
+  // nothing extra; it only moves.
+  const relationData = await getWorkspaceWithRelations(workspaceId, userId);
+  if (!relationData) {
+    return notFound();
+  }
+
+  const { workspace, organization, membership } = relationData;
+
+  // Navigation, not data — the layout shell a billing-role member passes through on the way
+  // to billing. Product data on the pages inside stays gated on workspace.read.
+  const hasAccess =
+    (await canUserNavigateWorkspace(userId, {
+      id: workspace.id,
+      organizationId: organization.id,
+    })) ||
+    // A Dashboard viewer has no workspace `read` (ADR-0025), so the navigation gate denies it. The shell
+    // still renders for a workspace one of its teams is granted, entitled or lapsed: the dashboard pages
+    // inside decide between the dashboards and the "not available on this plan" page.
+    (membership?.role === "dashboard_viewer" &&
+      (await getDashboardViewerWorkspaceState(userId, workspace.id)) !== "none");
+  if (!hasAccess || !membership) {
+    return notFound();
+  }
+
+  // A Dashboard viewer sees dashboards and nothing of the organization's plan: no Stripe ids, usage cycle
+  // or limits, and no Cloud response count, which the layout would otherwise ship to its browser.
+  const isDashboardViewer = membership.role === "dashboard_viewer";
+
+  const needsResponseCount =
+    IS_FORMBRICKS_CLOUD && !isDashboardViewer && needsMonthlyResponseCount(organization.billing);
+
+  const [isAccessControlAllowed, workspacePermission, license, responseCount] = await Promise.all([
+    getAccessControlPermission(organization.id),
+    getWorkspacePermissionByUserId(userId, workspace.id),
+    getEnterpriseLicense(),
+    needsResponseCount ? getMonthlyOrganizationResponseCount(organization.id) : 0,
+  ]);
+
+  return {
+    session,
+    user,
+    workspace,
+    organization: withPlanDetailsFor(membership.role, organization),
+    membership,
+    isAccessControlAllowed,
+    workspacePermission,
+    license,
+    responseCount,
+  };
+};

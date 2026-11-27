@@ -1,0 +1,280 @@
+import "server-only";
+import { cache as reactCache } from "react";
+import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
+import { DatabaseError, ResourceNotFoundError } from "@formbricks/types/errors";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { selectPublicSurveyEmbeddedDataLinks } from "@/lib/embedded-data/survey-fields";
+import { getOrganizationBillingWithReadThroughSync } from "@/modules/ee/billing/lib/organization-billing";
+import { transformPrismaSurvey } from "@/modules/survey/lib/utils";
+
+/**
+ * A link-page survey with `archivedAt` always loaded. `TSurvey` types the field as optional, so a survey from
+ * a loader that doesn't select it would read as "not archived"; requiring it here makes the public-access
+ * gate (`lib/public-access.ts`) refuse such a survey at compile time instead (ENG-4032).
+ */
+export type TLinkSurvey = TSurvey & { archivedAt: Date | null };
+
+/**
+ * Comprehensive survey data fetcher for link surveys
+ * Combines all necessary data in a single optimized query
+ */
+export const getSurveyWithMetadata = reactCache(async (surveyId: string): Promise<TLinkSurvey> => {
+  try {
+    const survey = await prisma.survey.findUnique({
+      where: { id: surveyId },
+      select: {
+        // Core survey fields
+        id: true,
+        createdAt: true,
+        updatedAt: true,
+        name: true,
+        type: true,
+        workspaceId: true,
+        createdBy: true,
+        status: true,
+        archivedAt: true,
+        // The renderer reads `publishOn !== null` to tell a scheduled survey from a paused one (ENG-3935);
+        // the return below reads it straight off this row, so dropping it here fails to compile.
+        publishOn: true,
+
+        // Survey configuration
+        welcomeCard: true,
+        questions: true,
+        blocks: true,
+        endings: true,
+        displayOption: true,
+        recontactDays: true,
+        displayLimit: true,
+        autoClose: true,
+        keepEndingCardOpen: true,
+        delay: true,
+        displayPercentage: true,
+        autoComplete: true,
+
+        // Authentication & access
+        isVerifyEmailEnabled: true,
+        redirectUrl: true,
+        pin: true,
+        isBackButtonHidden: true,
+        // Rules before the first question (ENG-6932), run by the survey on load.
+        startLogic: true,
+        isAutoProgressingEnabled: true,
+        isCaptureIpEnabled: true,
+        isAnonymizeResponsesEnabled: true,
+
+        // Single use configuration
+        singleUse: true,
+
+        // Styling & branding
+        workspaceOverwrites: true,
+        styling: true,
+        surveyClosedMessage: true,
+        showLanguageSwitch: true,
+        autoSelectLanguage: true,
+        recaptcha: true,
+        metadata: true,
+
+        // Custom scripts (self-hosted only)
+        customHeadScripts: true,
+        customHeadScriptsMode: true,
+
+        // Stored custom CSS (ENG-3552), source included. Server-side input to the compiled CSS the page
+        // delivers; every path that hands this survey to the browser removes it first
+        // (`omitCustomCssSource` in survey-renderer.tsx and the PIN check, `app/api/internal/link-survey-pin-verifications`).
+        customCss: true,
+
+        // Related data
+        languages: {
+          select: {
+            default: true,
+            enabled: true,
+            language: {
+              select: {
+                id: true,
+                createdAt: true,
+                updatedAt: true,
+                code: true,
+                workspaceId: true,
+                alias: true,
+              },
+            },
+          },
+        },
+        triggers: {
+          select: {
+            actionClass: {
+              select: {
+                id: true,
+                createdAt: true,
+                updatedAt: true,
+                workspaceId: true,
+                name: true,
+                description: true,
+                type: true,
+                key: true,
+                noCodeConfig: true,
+              },
+            },
+          },
+        },
+        segment: {
+          select: {
+            id: true,
+            createdAt: true,
+            updatedAt: true,
+            workspaceId: true,
+            title: true,
+            description: true,
+            isPrivate: true,
+            filters: true,
+            surveys: {
+              select: {
+                id: true,
+              },
+            },
+          },
+        },
+        followUps: true,
+
+        // ENG-1837: the definitions the renderer's recall and logic engines resolve through, and
+        // (ENG-2404) what the legacy `variables` / `hiddenFields` keys are derived from.
+        embeddedDataLinks: selectPublicSurveyEmbeddedDataLinks,
+      },
+    });
+
+    if (!survey) {
+      throw new ResourceNotFoundError("Survey", surveyId);
+    }
+
+    const transformedSurvey = transformPrismaSurvey<TSurvey>(survey);
+
+    // This survey object is handed to a client component on the *public* link-survey page, so every
+    // field in it ends up in the page payload for anonymous visitors. Follow-up configuration carries
+    // internal recipient addresses, subjects and email bodies, and segment filters carry targeting
+    // rules built from contact attributes — none of which the survey renderer reads. They are selected
+    // above only because `TSurvey` requires the keys, so blank them out before they leave the server.
+    return {
+      ...transformedSurvey,
+      archivedAt: survey.archivedAt,
+      // `transformPrismaSurvey` is an unchecked generic, so a select without `publishOn` would compile and
+      // leave it `undefined`, which the renderer reads as "scheduled" (ENG-3935). Reading it off the row
+      // makes that a type error.
+      publishOn: survey.publishOn,
+      followUps: [],
+      ...(transformedSurvey.segment
+        ? { segment: { ...transformedSurvey.segment, filters: [], description: null } }
+        : {}),
+    };
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+    throw error;
+  }
+});
+
+/**
+ * Lightweight survey metadata for use in generateMetadata()
+ * Extracts only needed fields from the cached full survey
+ */
+export const getSurveyMetadata = async (surveyId: string) => {
+  const fullSurvey = await getSurveyWithMetadata(surveyId);
+
+  // Extract only metadata-relevant fields
+  return {
+    id: fullSurvey.id,
+    type: fullSurvey.type,
+    status: fullSurvey.status,
+    workspaceId: fullSurvey.workspaceId,
+    name: fullSurvey.name,
+    styling: fullSurvey.styling,
+  };
+};
+
+/**
+ * Combined response lookup for single use surveys
+ * NO CACHING - responses change frequently during survey taking
+ */
+export const getResponseBySingleUseId = reactCache((surveyId: string, singleUseId: string) => async () => {
+  try {
+    const response = await prisma.response.findFirst({
+      where: {
+        surveyId,
+        singleUseId,
+      },
+      select: {
+        id: true,
+        finished: true,
+      },
+    });
+
+    return response;
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+    throw error;
+  }
+});
+
+/**
+ * Get existing contact response for contact surveys
+ * NO CACHING - response data changes frequently and needs to be fresh
+ */
+export const getExistingContactResponse = reactCache((surveyId: string, contactId: string) => async () => {
+  try {
+    // A contact can hold a finished response and an unfinished attempt at once, so the unordered pick could
+    // return the unfinished one and hide the finished one. Prefer the finished row: the contact page gates
+    // "already answered" on it, and only an unfinished row is left to resume.
+    const response = await prisma.response.findFirst({
+      where: {
+        surveyId,
+        contactId,
+      },
+      orderBy: {
+        finished: "desc",
+      },
+      select: {
+        id: true,
+        finished: true,
+      },
+    });
+
+    return response ?? undefined;
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+    throw error;
+  }
+});
+
+/**
+ * Get organization billing information for survey limits
+ * Cached separately with longer TTL
+ */
+export const getOrganizationBilling = reactCache(async (organizationId: string) => {
+  const billing = await getOrganizationBillingWithReadThroughSync(organizationId);
+  if (!billing) {
+    throw new ResourceNotFoundError("Organization", organizationId);
+  }
+  return billing;
+});
+
+/**
+ * The survey's owner, who carries the rate limits on the emails its public page sends (ENG-3823). Read on
+ * its own so the owner's id is never added to the survey the public page loads. Only the server sets it,
+ * unlike `createdBy`, which an API caller can name.
+ */
+export const getSurveyOwnerId = async (surveyId: string): Promise<string | null> => {
+  try {
+    const survey = await prisma.survey.findUnique({ where: { id: surveyId }, select: { ownerId: true } });
+    return survey?.ownerId ?? null;
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      throw new DatabaseError(error.message);
+    }
+    throw error;
+  }
+};

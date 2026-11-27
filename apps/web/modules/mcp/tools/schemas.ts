@@ -1,0 +1,680 @@
+import { z } from "zod";
+import { ZId } from "@formbricks/types/common";
+import { ZCustomCssScope } from "@formbricks/types/custom-css";
+import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/constants";
+import { ZSurveyRatingElement } from "@formbricks/types/surveys/elements";
+import { EXPRESSION_FUNCTIONS } from "@formbricks/types/surveys/expressions";
+import { ZSurveyFilters, ZSurveyStatus, ZSurveyType } from "@formbricks/types/surveys/types";
+import {
+  MAX_FEEDBACK_RECORDS_PER_BATCH,
+  ZV3FeedbackRecordCreateBodyFields,
+  ZV3FeedbackRecordCreateBodyStrict,
+  ZV3FeedbackRecordFilters,
+  ZV3FeedbackRecordListFilters,
+  ZV3FeedbackRecordSearchFilters,
+  ZV3FeedbackRecordSimilarityFilters,
+  ZV3FeedbackRecordUpdateBodyFields,
+} from "@/app/api/v3/feedbackRecords/lib/schemas";
+import { lengthBoundedArray } from "@/app/api/v3/lib/bounded-array";
+import { ZV3SurveyEmbeddedField } from "@/app/api/v3/surveys/embedded-fields";
+import { ZV3SurveyGenerateBody } from "@/app/api/v3/surveys/generate/schemas";
+import {
+  V3_SURVEY_MAX_BLOCKS,
+  V3_SURVEY_MAX_EMBEDDED_FIELDS,
+  V3_SURVEY_MAX_ENDINGS,
+  V3_SURVEY_MAX_LANGUAGES,
+  V3_SURVEY_MAX_START_LOGIC_RULES,
+  V3_SURVEY_MAX_VARIABLES,
+  ZV3EditSurveyBlocksBody,
+  ZV3SetSurveyBlockOrderBody,
+  ZV3SurveyCustomCss,
+} from "@/app/api/v3/surveys/schemas";
+import { ZV3WorkspaceCustomCssPatchBody } from "@/app/api/v3/workspaces/lib/custom-css-schemas";
+import { confirmArgument } from "./confirm-argument";
+
+/**
+ * Every array argument is declared through `lengthBoundedArray`, never a bare `z.array().max()`: the
+ * SDK validates arguments with Zod's `~standard.validate`, which parses every element before an
+ * array-level `.max()` runs and collects one issue per element — ahead of the scope gate, so a
+ * read-only token can trigger it (ENG-3384). The route-level array budget in `app/api/mcp/route.ts` is
+ * the backstop; these bounds are the ones the tool schemas advertise to the model as `maxItems`.
+ */
+const MCP_MAX_FILTER_VALUES = 10;
+const MCP_MAX_LANGUAGE_CODES = 20;
+
+/**
+ * Every schema here is `.strict()`, so an argument a tool does not declare is a loud error instead of a
+ * silently discarded one (ENG-2256).
+ *
+ * This has teeth only since the SDK v2 migration. v1 was handed a raw `.shape` and rebuilt it via
+ * `objectFromShape()`, which dropped any unknown-keys policy — so `.strict()` here would have been
+ * decorative and a misspelled argument was stripped before our code ran. On a *filter* that failed in
+ * the dangerous direction: `count_feedback_records` with the pre-#8650 spelling `userId` returned the
+ * count for every record in the dataset rather than that user's, and reported success, so the agent had
+ * no signal it had been handed the wrong number. v2 validates the schema instance itself, so strictness
+ * is now enforced where it is declared.
+ *
+ * The cost, accepted deliberately: `additionalProperties: false` is advertised on every tool, so a
+ * client that adds its own keys to `arguments` is rejected rather than tolerated.
+ *
+ * **Structured sub-objects are strict too, not just the outer one.** `.strict()` binds a single object,
+ * so `filter` and its `name`/`status`/`type` children each need it as well — otherwise the same bug
+ * reopens one level down, and worse, quietly: a misspelled `filter.status.include` is dropped, leaves
+ * `filter.status` as `{}`, and the query runs unfiltered while reporting success. Raised in review on
+ * #8859 after the first version of this change only did the outer objects.
+ *
+ * What still accepts an arbitrary nested shape, deliberately: the free-form `z.record` fields (`blocks`,
+ * `metadata`, `welcomeCard`, and the `data` payloads), which the v3 survey document contract validates
+ * once the call reaches the operation.
+ *
+ * The workflow `definition` on the two workflow tools is strict too, through an MCP-only strict variant
+ * of the shared `packages/workflows` contract (ENG-2437); only its builder `ui` metadata stays open.
+ * `./schemas.test.ts` holds the line: every structured object in every MCP tool schema, at any depth,
+ * must be strict or the suite fails.
+ *
+ * Adding a schema? Add `.strict()` with it — and to every structured object nested inside it. Prefer
+ * `z.strictObject({...})` for the nested ones: `.strict()` returns a clone that drops `.describe()`, so
+ * appending it after a `.describe()` silently deletes the description the model reads.
+ *
+ * Array *elements* count as nested objects too — see `ZMcpCreateFeedbackRecordsInput.records`, where the
+ * strictness has to come from the element schema rather than the array.
+ *
+ * And do not turn on @posthog/mcp's `context` injection (`lib/posthog/mcp-tracing.ts` keeps it off): it
+ * injects a `context` argument into every tool's advertised schema, which these schemas would reject.
+ */
+
+export const ZMcpListSurveysInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID whose surveys should be listed."),
+    // Deliberately capped below the HTTP API's 250: for an agent client the binding constraint is
+    // context window, not server cost, so a larger page is a cost rather than a convenience.
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .describe("Maximum number of surveys to return. Defaults to 20.")
+      .default(20),
+    cursor: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Opaque pagination cursor from a previous list_surveys response."),
+    includeTotalCount: z
+      .boolean()
+      .describe(
+        "Whether to include the total matching survey count in the response metadata. Defaults to true."
+      )
+      .default(true),
+    filter: z
+      .object({
+        name: z
+          .strictObject({
+            contains: z.string().max(512).optional().describe("Case-insensitive survey name substring."),
+          })
+          .describe("Filter by survey name.")
+          .optional(),
+        status: z
+          .strictObject({
+            in: lengthBoundedArray(z.union([ZSurveyStatus, z.literal("archived")]), {
+              max: MCP_MAX_FILTER_VALUES,
+              description:
+                "Survey statuses to include, for example draft or inProgress. Add `archived` to include archived surveys, which are otherwise left out.",
+            }).optional(),
+          })
+          .describe("Filter by survey status.")
+          .optional(),
+        type: z
+          .strictObject({
+            in: lengthBoundedArray(ZSurveyType, {
+              max: MCP_MAX_FILTER_VALUES,
+              description: "Survey types to include, for example link.",
+            }).optional(),
+          })
+          .describe("Filter by survey type.")
+          .optional(),
+      })
+      .strict()
+      .describe("Optional supported v3 survey filters.")
+      .optional(),
+    sortBy: ZSurveyFilters.shape.sortBy
+      .optional()
+      .describe("Sort field for pagination. Defaults to the v3 API default of updatedAt."),
+  })
+  .strict();
+
+export const ZMcpGetSurveyInput = z
+  .object({
+    surveyId: z.cuid2().describe("Survey ID to fetch."),
+    lang: lengthBoundedArray(z.string().trim().min(1), {
+      max: MCP_MAX_LANGUAGE_CODES,
+      description: "Optional language codes or configured aliases used to filter translatable survey fields.",
+    }).optional(),
+  })
+  .strict();
+
+const ZMcpSurveyLanguageInput = z.strictObject({
+  code: z.string().trim().min(1).describe("Language code or configured language alias."),
+  default: z.boolean().optional().describe("Whether this language is the default language."),
+  enabled: z.boolean().optional().describe("Whether this language is enabled."),
+});
+
+const ZMcpObjectInput = z.record(z.string(), z.unknown());
+
+/**
+ * The block and element shape, spelled out on the tool surface (ENG-2180).
+ *
+ * `blocks` is the one field a survey cannot omit, and it was advertised as a free-form object pointing
+ * at a "v3 survey document contract" that no tool description defined. The only way to learn the
+ * element types was to probe the live validator — and probing undercounts silently: one agent doing
+ * exactly that reported 16 of the 17 types and had no way to know it had missed one.
+ *
+ * The list is derived from the enum the request is actually validated against, never restated, so the
+ * advertised vocabulary cannot drift from the accepted one. `SURVEY_BLOCK_EXAMPLE` is asserted against
+ * the real create schema in `schemas.test.ts` for the same reason — a worked example that stops
+ * validating is worse than none.
+ */
+const SURVEY_ELEMENT_TYPES = Object.values(TSurveyElementTypeEnum).join(", ");
+
+/** A complete, valid block. Kept minimal: every field here is one the schema requires, plus the optional `code`. */
+export const SURVEY_BLOCK_EXAMPLE = {
+  name: "Feedback",
+  elements: [
+    {
+      id: "improve",
+      code: "improve",
+      type: "openText",
+      headline: { "en-US": "What should we improve?" },
+      required: false,
+    },
+  ],
+};
+
+/**
+ * Show-if (ENG-6931), worked: a follow-up shown only when the answer above it on the same block
+ * matches. Kept as data so a test can prove it still validates.
+ */
+export const SURVEY_SHOW_IF_EXAMPLE = {
+  id: "clshowifgroup00000000001",
+  connector: "and",
+  conditions: [
+    {
+      id: "clshowifcond000000000001",
+      leftOperand: { type: "element", value: "improve" },
+      operator: "contains",
+      rightOperand: { type: "static", value: "price" },
+    },
+  ],
+};
+
+/**
+ * A `rating`'s two extra fields, read off the element schema rather than restated.
+ *
+ * Restating them would reintroduce the drift this whole description exists to avoid, and would already
+ * be wrong: `ZSurveyRatingElement.range` admits `6`, which the base element's optional `range` and
+ * every prose description of it omit. Deriving keeps the advertised values equal to the accepted ones
+ * by construction, the same rule `SURVEY_ELEMENT_TYPES` follows.
+ */
+const RATING_SCALES = (ZSurveyRatingElement.shape.scale as unknown as { options: string[] }).options;
+const RATING_RANGES = (
+  ZSurveyRatingElement.shape.range as unknown as { options: { value: number }[] }
+).options.map((option) => option.value);
+
+/**
+ * Block logic and Set value expressions (ENG-6935, ADR 0030 / 0031), described for agents. The
+ * function list is read off the schema's catalogue, so the advertised functions are the accepted ones.
+ */
+const SURVEY_LOGIC_DESCRIPTION = [
+  "Block logic: a block's `logic` is a list of rules `{ id, conditions, actions[] }`; `conditions` is a",
+  "group `{ id, connector: and|or, conditions[] }` of conditions `{ id, leftOperand, operator, rightOperand? }`",
+  "or nested groups, and an empty group always matches. Operands are `{ type: element|variable|",
+  "hiddenField|reserved|static, value }` (element id, computed or ingested storage key, reserved name).",
+  "A matrix row condition names the row and column by id next to their 0-based positions: left",
+  '`{ type: "element", value: <matrix id>, meta: { row: "1", rowId: <row id> } }`, right',
+  '`{ type: "static", value: "2", columnId: <column id> }` (isAnyOf: `value: ["0","2"], columnIds: [..]`).',
+  "Ids win over positions, survive reordering, and must exist in the matrix; positions alone are accepted.",
+  "Actions: `jumpToBlock` (target block or ending id), `requireAnswer` (target element id) and",
+  "`calculate` (`variableId` = a computed field's storageKey). Set value is a `calculate` with",
+  '`operator: "assign"` and `value: { type: "expression", value: <tree> }`; the tree is a leaf (an operand,',
+  "or `static` number/text) or `{ type: call, fn, args[] }` with fn one of",
+  `${EXPRESSION_FUNCTIONS.join(", ")}.`,
+  "add/multiply/min/max take 2–50 numbers, subtract/divide exactly 2, round a number and optional fixed",
+  "decimals 0–10, abs 1, ifEmpty a value and a same-type fallback, concat 2–50 values (to text), now none",
+  "(UTC ISO timestamp), daysBetween 2 dates (UTC calendar days). Answers: rating/nps/csat/ces and number",
+  "openText are numbers, other openText text, date a date, multipleChoiceSingle its answer code (text);",
+  "other types can't be used. Empty in, empty out (use ifEmpty for defaults); ÷ 0 gives empty; an empty",
+  "result clears the field. The result must match the field's dataType (number, string or date); text in",
+  "arithmetic is refused. At most 12 levels and 200 nodes. A boolean (true/false) computed field takes no",
+  'expression: set it with `operator: "assign"` and `value: { type: "static", value: true|false }` or a',
+  "`variable` / `hiddenField` operand naming another boolean field. Example `score = round(q1 + q2 * 2)`:",
+  `${JSON.stringify({
+    type: "call",
+    fn: "round",
+    args: [
+      {
+        type: "call",
+        fn: "add",
+        args: [
+          { type: "element", value: "q1" },
+          {
+            type: "call",
+            fn: "multiply",
+            args: [
+              { type: "element", value: "q2" },
+              { type: "static", value: 2 },
+            ],
+          },
+        ],
+      },
+    ],
+  })}.`,
+].join(" ");
+
+const SURVEY_BLOCKS_DESCRIPTION = [
+  "Survey blocks. A block is `{ name, elements[], id? }` and an element is `{ id, type, headline, ... }`,",
+  `where \`type\` is one of: ${SURVEY_ELEMENT_TYPES}.`,
+  "Element ids are caller-supplied and become immutable once the survey leaves draft; block ids are",
+  "generated when omitted. Every element except `cta` may carry an optional `code` (the question code",
+  "used in exports and links), and every choice, matrix row/column and picture choice an optional `code`",
+  "(the answer code). Codes start with a lowercase letter (answer codes may start with a digit) followed",
+  "by lowercase letters, digits and `_`, with no `__` and no trailing `_`, at most 30 (question) or 20",
+  "(answer) characters; they may not be SPSS reserved words (all, and, by, eq, ge, gt, le, lt, ne, not,",
+  "or, to, with) or export column names (response_id, language, outcome, ...). Question codes are unique",
+  "across the survey, its Embedded Data names and other questions' ids; answer codes are unique within",
+  "their question. Once the survey leaves draft (active, paused, completed or scheduled) question codes,",
+  "answer codes, question types and option text in every language are locked, and an option that existed",
+  "at launch cannot be deleted (`immutable_*` errors); new questions and options can still be added.",
+  'Translatable fields are keyed by locale code — `{ "en-US": "..." }` — and',
+  "must carry every configured language; the internal `default` key is rejected. Each element type adds",
+  `its own required fields — a \`rating\` needs \`scale\` (${RATING_SCALES.join("|")}) and \`range\``,
+  `(${RATING_RANGES.join("|")}), a \`pictureSelection\` needs two or more choices. An element that is`,
+  "missing one is reported by its position, not by the field name, so add the type's own fields before",
+  "retrying.",
+  "Show-if: a block or an element may carry an optional `showIf`, a condition group in the block `logic`",
+  "format (`{ id, connector: and|or, conditions: [{ id, leftOperand: { type: element|variable|hiddenField|reserved,",
+  "value }, operator, rightOperand? } or a nested group] }`), and is shown only when it matches; an empty group",
+  "or none means always shown. A block whose show-if fails, or whose elements are all hidden, is skipped and its",
+  "`logic` still runs as if submitted with no answers. A hidden element is not validated (a hidden required",
+  "element never blocks) and its answer is not submitted. Reference rule: a block's show-if may use answers from",
+  "earlier blocks only; an element's show-if from earlier blocks and elements above it in the same block, never",
+  "itself or anything below (`misordered_reference` at the exact condition path).",
+  `Example element show-if: ${JSON.stringify(SURVEY_SHOW_IF_EXAMPLE)}.`,
+  "Option show-if and Hidden: each choice (single select, multi select, ranking, picture selection) and each",
+  "matrix row and column may carry its own `showIf` (same format; it may use what its element's show-if may,",
+  "never its own element) and `hidden: true`. A Hidden option is never offered, whatever its show-if says; on a",
+  "published survey hide an option instead of deleting it (deleting a launch option is refused), which keeps its",
+  "id, code and earlier answers. A question left with no option to offer is skipped. Both are allowed on",
+  "published surveys. Ranking conditions may use `includesOneOf` / `includesAllOf` / `doesNotIncludeOneOf` /",
+  '`doesNotIncludeAllOf` with option ids ("was ranked").',
+  'Copied options ("only the brands you know"): a single select, multi select or ranking may set',
+  "`optionsCopiedFrom` to the id of an earlier choice element (earlier block, or above it in the same block), and",
+  "a picture selection to an earlier picture selection. Write the copies yourself: each copied option keeps the",
+  'source option\'s `id` and `code` and carries the show-if "picked in the source":',
+  '`{ "connector": "and", "conditions": [{ "leftOperand": { "type": "element", "value": "<source id>" },',
+  '"operator": "includesOneOf", "rightOperand": { "type": "static", "value": ["<same option id>"] } }] }`',
+  "(`equals` with the id as a string when the source is a single select). Fixed options may sit next to the copies,",
+  'such as "None of these" with id `none`; their codes are filled with the next code free in both elements, and a',
+  "copy's code always follows its source's. Matrix rows are never copied: give them a row `showIf` instead.",
+  "Block rules (`logic`) run when the block is submitted; their actions are `jumpToBlock` (a block or ending id),",
+  "`requireAnswer` (a later element id), `calculate` (set a computed field) and `markLowQuality`,",
+  '`{ "id": "<cuid2>", "objective": "markLowQuality" }` with no target: when the rule fires the response is marked',
+  "Low quality, as a reviewer would mark it (it leaves the Analysis export and Dashboards and can be restored);",
+  "the respondent sees nothing and carries on.",
+  `Example block: ${JSON.stringify(SURVEY_BLOCK_EXAMPLE)}`,
+  SURVEY_LOGIC_DESCRIPTION,
+].join(" ");
+
+/**
+ * Rules before the first question (ENG-6932, json-shapes.md section 4). Spelled out because the tool
+ * surface otherwise never says what a rule is, and these differ from block rules in what they may do.
+ */
+const START_LOGIC_DESCRIPTION = [
+  "Rules before the first question (`startLogic`): run as soon as the survey loads, before the welcome card,",
+  "and also when a start-at link skips ahead. Same rule shape as `blocks[].logic`:",
+  "`{ id, conditions: { id, connector: and|or, conditions[] }, actions[] }`, ids cuid2.",
+  "Allowed actions: `jumpToBlock` to a block id, or to an ending id to screen the respondent out (they see only",
+  "that ending, and a finished response is stored that counts as completed), `calculate` to set a",
+  "computed field (variable), and `markLowQuality` with no target, which marks the response Low quality with",
+  "its first write (a screen-out's finished response included), for example for a known-bad panel source.",
+  "`requireAnswer` and any other action are refused, with the exact path.",
+  "Conditions and values may read `hiddenField` (URL parameters), `variable` and `reserved` operands only:",
+  "nothing has been answered yet, so an `element` operand is refused. The first jump wins; every calculate",
+  "runs; with no jump the respondent goes to the first block (or the start-at target).",
+  'Example: [{ "id": "<cuid2>", "conditions": { "id": "<cuid2>", "connector": "and", "conditions": [{ "id": "<cuid2>",',
+  '"leftOperand": { "type": "hiddenField", "value": "panel_id" }, "operator": "isNotSet" }] },',
+  '"actions": [{ "id": "<cuid2>", "objective": "jumpToBlock", "target": "<ending id>" }] }].',
+].join(" ");
+
+/**
+ * Typed Embedded Data (ENG-6930), described once for create, patch and validate. The legacy
+ * `variables` / `hiddenFields` stay accepted and are derived from these when both are absent.
+ */
+export const SURVEY_EMBEDDED_FIELDS_DESCRIPTION = [
+  "Typed Embedded Data fields: `{ storageKey?, key?, name, source, dataType?, defaultValue?, locked? }`.",
+  "`source` is `computed` (set by logic: `variable` operands and calculate actions name its storageKey, a cuid2",
+  "generated when omitted; dataType string, number, boolean or date — a date is set with a Set value",
+  "expression, a boolean (true/false) only with a one-step assign of true, false or another boolean field,",
+  "and both are left out of the legacy `variables`) or `ingested` (arrives by URL parameter or SDK:",
+  "`hiddenField` operands name its storageKey, which defaults to its name; dataType string, number, boolean",
+  "or date; only these can be `locked`). Link a workspace library field by sending `{ key }` alone: the",
+  "server fills in its definition. This list is the survey's complete set and the legacy",
+  "`variables` / `hiddenFields` are derived from it; send either format, or both describing the same",
+  "fields — a mismatch is refused with 400 naming the path.",
+].join(" ");
+
+/**
+ * `confirm` on every tool that changes survey content (ENG-6930). A survey that is not a draft and has
+ * responses is left untouched without it, and the call answers 428 with the editor's caution text — so
+ * the agent asks the user, then retries.
+ */
+const ZMcpSurveyWriteConfirm = z
+  .boolean()
+  .optional()
+  .describe(
+    "Set true only after the user agreed. Required to change a survey that is not a draft and already has responses; without it nothing changes and the call returns the caution to show the user."
+  );
+
+export const ZMcpCreateSurveyInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID where the survey should be created."),
+    name: z.string().trim().min(1).describe("Survey name."),
+    type: z.literal("link").optional().describe("Survey type. Only link surveys are supported."),
+    status: ZSurveyStatus.optional().describe("Initial survey status. Defaults to draft."),
+    defaultLanguage: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("Default language code or configured language alias. Defaults to en-US."),
+    metadata: ZMcpObjectInput.optional().describe("Survey metadata using the v3 survey document contract."),
+    languages: lengthBoundedArray(ZMcpSurveyLanguageInput, {
+      max: V3_SURVEY_MAX_LANGUAGES,
+      description: "Configured survey languages using the v3 survey document contract.",
+    }).optional(),
+    showLanguageSwitch: z
+      .boolean()
+      .nullable()
+      .optional()
+      .describe("Show respondents a language switch on multi-language surveys. null or omitted means off."),
+    autoSelectLanguage: z
+      .boolean()
+      .nullable()
+      .optional()
+      .describe(
+        "Open the survey in the respondent's browser language when it matches an enabled survey language. null or omitted means off."
+      ),
+    welcomeCard: ZMcpObjectInput.optional().describe("Welcome card using the v3 survey document contract."),
+    blocks: lengthBoundedArray(ZMcpObjectInput, {
+      min: 1,
+      max: V3_SURVEY_MAX_BLOCKS,
+      description: SURVEY_BLOCKS_DESCRIPTION,
+    }),
+    endings: lengthBoundedArray(ZMcpObjectInput, {
+      max: V3_SURVEY_MAX_ENDINGS,
+      description: "Survey endings using the v3 survey document contract.",
+    }).optional(),
+    hiddenFields: ZMcpObjectInput.optional().describe("Hidden fields using the v3 survey document contract."),
+    variables: lengthBoundedArray(ZMcpObjectInput, {
+      max: V3_SURVEY_MAX_VARIABLES,
+      description: "Survey variables using the v3 survey document contract.",
+    }).optional(),
+    startLogic: lengthBoundedArray(ZMcpObjectInput, {
+      max: V3_SURVEY_MAX_START_LOGIC_RULES,
+      description: START_LOGIC_DESCRIPTION,
+    }).optional(),
+    // The v3 entry schema itself (strict), so the advertised shape is the accepted one.
+    embeddedFields: lengthBoundedArray(ZV3SurveyEmbeddedField, {
+      max: V3_SURVEY_MAX_EMBEDDED_FIELDS,
+      description: SURVEY_EMBEDDED_FIELDS_DESCRIPTION,
+    }).optional(),
+    customCss: ZV3SurveyCustomCss.optional(),
+  })
+  .strict();
+
+export const ZMcpPatchSurveyInput = z
+  .object({
+    surveyId: z.cuid2().describe("Survey ID to update."),
+    data: z
+      .record(z.string(), z.unknown())
+      .describe(
+        `Strict top-level v3 survey patch payload. Omitted top-level fields are preserved; provided objects and arrays replace that whole subtree. \`customCss\` is \`{ light, dark }\` source (both keys) or null to clear; omit it to keep the current CSS. \`startLogic\` replaces every rule before the first question; null or [] removes them. \`embeddedFields\`: ${SURVEY_EMBEDDED_FIELDS_DESCRIPTION} ${SURVEY_BLOCKS_DESCRIPTION} ${START_LOGIC_DESCRIPTION}`
+      ),
+    confirm: ZMcpSurveyWriteConfirm,
+  })
+  .strict();
+
+/**
+ * Block-level editing (ENG-3069). The bodies are the v3 REST schemas plus `surveyId`, so the two
+ * surfaces cannot drift: one Zod definition, one set of messages.
+ *
+ * `response_format` defaults to `concise` here but not on REST. A 31-block survey serializes to
+ * ~15k tokens, and returning that from every edit would refill the agent's context as fast as the
+ * old whole-array patch did — the concise payload carries `updatedAt`, which is precisely the
+ * `expectedUpdatedAt` the next call needs, so edits chain without re-reading.
+ */
+const ZMcpBlockResponseFormat = z
+  .enum(["concise", "detailed"])
+  .default("concise")
+  .describe(
+    "concise (default) returns id, updatedAt, blockCount and the ops applied. detailed returns the full survey resource."
+  );
+
+export const ZMcpEditSurveyBlocksInput = ZV3EditSurveyBlocksBody.extend({
+  surveyId: z.cuid2().describe("Survey ID whose blocks should be edited."),
+  response_format: ZMcpBlockResponseFormat.optional(),
+  confirm: ZMcpSurveyWriteConfirm,
+}).strict();
+
+export const ZMcpSetSurveyBlockOrderInput = ZV3SetSurveyBlockOrderBody.extend({
+  surveyId: z.cuid2().describe("Survey ID whose block order should be set."),
+  response_format: ZMcpBlockResponseFormat.optional(),
+  confirm: ZMcpSurveyWriteConfirm,
+}).strict();
+
+export const ZMcpValidateSurveyInput = z
+  .object({
+    operation: z
+      .enum(["create", "patch", "customCss"])
+      .describe(
+        "Validation operation to run. `customCss` processes custom CSS only and returns the compiled result and warnings."
+      ),
+    surveyId: z
+      .cuid2()
+      .optional()
+      .describe(
+        "Survey ID to validate against. Required for patch validation; optional for customCss with scope survey (must belong to workspaceId)."
+      ),
+    workspaceId: ZId.optional().describe(
+      "Workspace ID. Required for, and only accepted by, customCss validation."
+    ),
+    scope: ZCustomCssScope.optional().describe(
+      "customCss validation only: `workspace` (shared survey CSS) or `survey` (one survey's CSS)."
+    ),
+    data: ZMcpObjectInput.describe(
+      `Create or patch payload to validate, or \`{ customCss: { light, dark } | null }\` for customCss. \`embeddedFields\`: ${SURVEY_EMBEDDED_FIELDS_DESCRIPTION} ${SURVEY_BLOCKS_DESCRIPTION} ${START_LOGIC_DESCRIPTION}`
+    ),
+  })
+  .strict();
+
+/**
+ * The v3 generate body, extended only to describe each field: the prompt bounds and the language rules
+ * are the route's own.
+ */
+export const ZMcpGenerateSurveyInput = ZV3SurveyGenerateBody.extend({
+  workspaceId: ZV3SurveyGenerateBody.shape.workspaceId.describe("Workspace the draft is for."),
+  prompt: ZV3SurveyGenerateBody.shape.prompt.describe(
+    "What the survey should ask, in plain words (4 to 1200 characters). Say who it is for and what you want to learn."
+  ),
+  type: ZV3SurveyGenerateBody.shape.type.describe("`link` (default) or `app` (in-app widget)."),
+  language: ZV3SurveyGenerateBody.shape.language.describe(
+    "Preferred language code, used only when the prompt's own language is unclear."
+  ),
+  surveyLanguage: ZV3SurveyGenerateBody.shape.surveyLanguage.describe(
+    "Required language code: the draft is written in it whatever language the prompt is in."
+  ),
+}).strict();
+
+export const ZMcpGetWorkspaceCustomCssInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID whose shared survey CSS should be read."),
+  })
+  .strict();
+
+export const ZMcpPatchWorkspaceCustomCssInput = ZV3WorkspaceCustomCssPatchBody.extend({
+  workspaceId: ZId.describe("Workspace ID whose shared survey CSS should be saved or cleared."),
+}).strict();
+
+/**
+ * Archive and restore take only the id. Neither needs `confirm`: archive is reversible for the archive
+ * retention window (longer while a data-retention exemption holds it), and both are idempotent.
+ */
+export const ZMcpSurveyIdInput = z
+  .object({
+    surveyId: z.cuid2().describe("Survey ID."),
+  })
+  .strict();
+
+/** Deprecated with `delete_survey` (ENG-6575): removed in 7.0, prefer `archive_survey`. */
+export const ZMcpDeleteSurveyInput = z
+  .object({
+    surveyId: z.cuid2().describe("Survey ID to delete."),
+    confirm: confirmArgument,
+  })
+  .strict();
+
+// list_workspaces takes no arguments — it returns the workspaces the authenticated caller can access.
+//
+// The one schema where `.strict()` buys no ENG-2256 protection: with no declared keys there is nothing to
+// misspell, so this is uniformity rather than a fix. Kept strict anyway, as a deliberate call rather than an
+// oversight, but the asymmetry is worth knowing if a client ever trips on it. It advertises
+// `{"type":"object","properties":{},"additionalProperties":false}`, and a client that pads a zero-argument
+// call with a placeholder key would now fail here where v1 dropped it — costly out of proportion, because
+// this is the discovery tool every workspace-scoped tool takes its `workspaceId` from, so losing it looks
+// like the whole server being broken. Raised in review on #8859; no such client is confirmed, and our own
+// QA only exercises Claude Code, so treat a report of "the Formbricks MCP server won't connect" from
+// another client as a reason to look here first.
+export const ZMcpListWorkspacesInput = z.object({}).strict();
+
+// Feedback records live in the Hub, addressed by a tenant that is always resolved server-side from the
+// caller's workspace + feedback dataset. No schema here accepts a tenant_id; the Hub's `tenant_id` is
+// surfaced outward as `dataset_id`.
+const datasetIdField = ZId.optional().describe(
+  "Feedback dataset to target. Optional when the workspace has exactly one active dataset; required when it has more than one. Use list_feedback_datasets to discover ids."
+);
+
+export const ZMcpListFeedbackDatasetsInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID whose feedback datasets should be listed."),
+  })
+  .strict();
+
+export const ZMcpListFeedbackRecordsInput = ZV3FeedbackRecordListFilters.extend({
+  workspaceId: ZId.describe("Workspace ID whose feedback records should be listed."),
+  datasetId: datasetIdField,
+}).strict();
+
+export const ZMcpGetFeedbackRecordInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID that owns the feedback record."),
+    feedbackRecordId: z.uuid().describe("Feedback record ID (UUID) to fetch."),
+    datasetId: datasetIdField,
+  })
+  .strict();
+
+// Extends the plain field object rather than the refined body, so the value/field_type rule is enforced
+// by the operations layer. (Before ENG-2256 that layer was also where a stripped unknown key surfaced,
+// as a missing value; a misspelled key is now rejected by the SDK before the handler runs, so the
+// operations layer only ever sees declared keys.)
+export const ZMcpCreateFeedbackRecordInput = ZV3FeedbackRecordCreateBodyFields.extend({
+  workspaceId: ZId.describe("Workspace ID to create the feedback record in."),
+  datasetId: datasetIdField,
+}).strict();
+
+export const ZMcpCountFeedbackRecordsInput = ZV3FeedbackRecordFilters.extend({
+  workspaceId: ZId.describe("Workspace ID whose feedback records should be counted."),
+  datasetId: datasetIdField,
+}).strict();
+
+// The refined body is used here, unlike the single-record tool: an element schema is not extended with
+// `workspaceId`/`datasetId` (those live on the outer object), so the refined form drops straight in and the
+// value/field_type rule is enforced per element by the schema itself. The single-record tool could do the
+// same — see the note there — it just doesn't need to.
+export const ZMcpCreateFeedbackRecordsInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID to create the feedback records in."),
+    datasetId: datasetIdField,
+    // The strict variant: an unknown key *inside a record* must be rejected, not dropped. Without it
+    // the outer `.strict()` below covers only the top level, so a misspelled `user_id` in a batch
+    // import vanished silently — ENG-2256 in the one place it does the most damage.
+    records: lengthBoundedArray(ZV3FeedbackRecordCreateBodyStrict, {
+      min: 1,
+      max: MAX_FEEDBACK_RECORDS_PER_BATCH,
+      description: `Feedback records to create, 1–${MAX_FEEDBACK_RECORDS_PER_BATCH} per call. Every record is validated before any is written, so an invalid record fails the whole call rather than storing part of the batch.`,
+    }),
+  })
+  .strict();
+
+// The plain field object again (not the refined one), so the at-least-one-field rule is enforced by the
+// operations layer. A choice, not a constraint: `refined.extend({...}).strict()` does work in Zod 4 —
+// verified, including that the refinement survives both calls — so this could equally be enforced here.
+// It is left in the operations layer because that is the one place both the MCP tools and the v3 REST
+// routes pass through, so the rule exists once.
+//
+// `.strict()` here has a sharper edge than on the other tools, and deliberately so: the update set is a
+// `.pick()` of eight mutable fields, so echoing back a record from `get_feedback_record` — the obvious
+// read-modify-write loop — is now rejected rather than having its provenance quietly ignored. That is the
+// ENG-2256 trade taken on purpose: a misspelled `value_text` would otherwise vanish and the "update" would
+// silently change nothing. The rejection is recoverable (Zod's `unrecognized_keys` names every offending
+// key) and the tool description tells the caller to strip them, so the loud version costs one retry where
+// the quiet version cost a lost correction. Note this is the opposite call to the one made for the shared
+// v3 REST body in `app/api/v3/feedbackRecords/lib/schemas.ts` — different clients: an agent re-reads the
+// advertised schema and the error text on every call, a REST integration does not.
+export const ZMcpUpdateFeedbackRecordInput = ZV3FeedbackRecordUpdateBodyFields.extend({
+  workspaceId: ZId.describe("Workspace ID that owns the feedback record."),
+  feedbackRecordId: z.uuid().describe("Feedback record ID (UUID) to update."),
+  datasetId: datasetIdField,
+}).strict();
+
+export const ZMcpDeleteFeedbackRecordInput = z
+  .object({
+    workspaceId: ZId.describe("Workspace ID that owns the feedback record."),
+    feedbackRecordId: z.uuid().describe("Feedback record ID (UUID) to delete permanently."),
+    datasetId: datasetIdField,
+    confirm: confirmArgument,
+  })
+  .strict();
+
+export const ZMcpSearchFeedbackRecordsInput = ZV3FeedbackRecordSearchFilters.extend({
+  workspaceId: ZId.describe("Workspace ID whose feedback records should be searched."),
+  datasetId: datasetIdField,
+}).strict();
+
+export const ZMcpFindSimilarFeedbackRecordsInput = ZV3FeedbackRecordSimilarityFilters.extend({
+  workspaceId: ZId.describe("Workspace ID that owns the feedback record."),
+  feedbackRecordId: z.uuid().describe("Feedback record ID (UUID) to find similar records for."),
+  datasetId: datasetIdField,
+}).strict();
+
+export type TMcpListSurveysInput = z.infer<typeof ZMcpListSurveysInput>;
+export type TMcpListWorkspacesInput = z.infer<typeof ZMcpListWorkspacesInput>;
+export type TMcpGetSurveyInput = z.infer<typeof ZMcpGetSurveyInput>;
+export type TMcpCreateSurveyInput = z.infer<typeof ZMcpCreateSurveyInput>;
+export type TMcpPatchSurveyInput = z.infer<typeof ZMcpPatchSurveyInput>;
+export type TMcpEditSurveyBlocksInput = z.infer<typeof ZMcpEditSurveyBlocksInput>;
+export type TMcpSetSurveyBlockOrderInput = z.infer<typeof ZMcpSetSurveyBlockOrderInput>;
+export type TMcpValidateSurveyInput = z.infer<typeof ZMcpValidateSurveyInput>;
+export type TMcpGenerateSurveyInput = z.infer<typeof ZMcpGenerateSurveyInput>;
+export type TMcpSurveyIdInput = z.infer<typeof ZMcpSurveyIdInput>;
+export type TMcpDeleteSurveyInput = z.infer<typeof ZMcpDeleteSurveyInput>;
+export type TMcpGetWorkspaceCustomCssInput = z.infer<typeof ZMcpGetWorkspaceCustomCssInput>;
+export type TMcpPatchWorkspaceCustomCssInput = z.infer<typeof ZMcpPatchWorkspaceCustomCssInput>;
+export type TMcpListFeedbackDatasetsInput = z.infer<typeof ZMcpListFeedbackDatasetsInput>;
+export type TMcpListFeedbackRecordsInput = z.infer<typeof ZMcpListFeedbackRecordsInput>;
+export type TMcpGetFeedbackRecordInput = z.infer<typeof ZMcpGetFeedbackRecordInput>;
+export type TMcpCreateFeedbackRecordInput = z.infer<typeof ZMcpCreateFeedbackRecordInput>;
+export type TMcpCountFeedbackRecordsInput = z.infer<typeof ZMcpCountFeedbackRecordsInput>;
+export type TMcpCreateFeedbackRecordsInput = z.infer<typeof ZMcpCreateFeedbackRecordsInput>;
+export type TMcpUpdateFeedbackRecordInput = z.infer<typeof ZMcpUpdateFeedbackRecordInput>;
+export type TMcpDeleteFeedbackRecordInput = z.infer<typeof ZMcpDeleteFeedbackRecordInput>;
+export type TMcpSearchFeedbackRecordsInput = z.infer<typeof ZMcpSearchFeedbackRecordsInput>;
+export type TMcpFindSimilarFeedbackRecordsInput = z.infer<typeof ZMcpFindSimilarFeedbackRecordsInput>;

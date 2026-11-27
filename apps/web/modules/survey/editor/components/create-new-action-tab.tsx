@@ -1,0 +1,163 @@
+"use client";
+
+import { useRouter } from "next/navigation";
+import { useMemo } from "react";
+import { FormProvider, useForm } from "react-hook-form";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { ActionClass } from "@formbricks/database/prisma-browser";
+import { TActionClassInput } from "@formbricks/types/action-classes";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { ActionNameDescriptionFields } from "@/modules/ui/components/action-name-description-fields";
+import { Button } from "@/modules/ui/components/button";
+import { CodeActionForm } from "@/modules/ui/components/code-action-form";
+import { FormField } from "@/modules/ui/components/form";
+import { Label } from "@/modules/ui/components/label";
+import { NoCodeActionForm } from "@/modules/ui/components/no-code-action-form";
+import { TabToggle } from "@/modules/ui/components/tab-toggle";
+import { buildActionObject } from "../lib/action-builder";
+import { createActionClassZodResolver, useActionClassKeys, validatePermissions } from "../lib/action-utils";
+import { createActionClass } from "../lib/api-client";
+
+interface CreateNewActionTabProps {
+  readonly actionClasses: ActionClass[];
+  readonly setActionClasses: React.Dispatch<React.SetStateAction<ActionClass[]>>;
+  readonly isReadOnly: boolean;
+  readonly setLocalSurvey?: React.Dispatch<React.SetStateAction<TSurvey>>;
+  readonly setOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  readonly workspaceId: string;
+}
+
+export const CreateNewActionTab = ({
+  actionClasses,
+  setActionClasses,
+  setOpen,
+  isReadOnly,
+  setLocalSurvey,
+  workspaceId,
+}: CreateNewActionTabProps) => {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const actionClassNames = useMemo(
+    () => actionClasses.map((actionClass) => actionClass.name),
+    [actionClasses]
+  );
+
+  const actionClassKeys = useActionClassKeys(actionClasses);
+
+  const form = useForm<TActionClassInput>({
+    defaultValues: {
+      name: "",
+      description: "",
+      workspaceId,
+      type: "noCode",
+      noCodeConfig: {
+        type: "click",
+        elementSelector: {
+          cssSelector: undefined,
+          innerHtml: undefined,
+        },
+        urlFilters: [],
+      },
+    },
+    resolver: createActionClassZodResolver(actionClassNames, actionClassKeys, t),
+    mode: "onChange",
+  });
+
+  const { control, handleSubmit, watch, reset } = form;
+  const { isSubmitting } = form.formState;
+
+  const submitHandler = async (data: TActionClassInput) => {
+    try {
+      validatePermissions(isReadOnly, t);
+      const updatedAction = buildActionObject(data, workspaceId, t);
+      await createAndHandleAction(updatedAction);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const createAndHandleAction = async (updatedAction: TActionClassInput) => {
+    let newActionClass: ActionClass;
+    try {
+      newActionClass = await createActionClass(workspaceId, updatedAction);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+      return;
+    }
+
+    if (setActionClasses) {
+      setActionClasses((prevActionClasses: ActionClass[]) => [...prevActionClasses, newActionClass]);
+    }
+
+    if (setLocalSurvey) {
+      setLocalSurvey((prev) => ({
+        ...prev,
+        triggers: prev.triggers.concat({ actionClass: newActionClass }),
+      }));
+    }
+
+    reset();
+    resetAllStates();
+    router.refresh();
+    toast.success(t("workspace.actions.action_created_successfully"));
+  };
+
+  const resetAllStates = () => {
+    reset();
+    setOpen(false);
+  };
+
+  return (
+    <div>
+      <FormProvider {...form}>
+        <form onSubmit={handleSubmit(submitHandler)} aria-label="create-action-form">
+          <div className="w-full space-y-4">
+            <div className="w-3/5">
+              <FormField
+                name={`type`}
+                control={control}
+                render={({ field }) => (
+                  <div>
+                    <Label className="font-semibold">{t("workspace.actions.action_type")}</Label>
+                    <TabToggle
+                      id="type"
+                      options={[
+                        { value: "noCode", label: t("common.no_code") },
+                        { value: "code", label: t("common.code") },
+                      ]}
+                      {...field}
+                      defaultSelected={field.value}
+                    />
+                  </div>
+                )}
+              />
+            </div>
+
+            <ActionNameDescriptionFields
+              control={control}
+              isReadOnly={isReadOnly}
+              nameInputId="actionNameInput"
+              descriptionInputId="actionDescriptionInput"
+            />
+
+            {watch("type") === "code" ? (
+              <CodeActionForm form={form} isReadOnly={isReadOnly} />
+            ) : (
+              <NoCodeActionForm form={form} isReadOnly={isReadOnly} />
+            )}
+          </div>
+          <div className="sticky bottom-0 flex justify-end gap-x-2 bg-white pt-4">
+            <Button type="button" variant="secondary" onClick={resetAllStates}>
+              {t("common.cancel")}
+            </Button>
+            <Button type="submit" loading={isSubmitting}>
+              {t("workspace.actions.create_action")}
+            </Button>
+          </div>
+        </form>
+      </FormProvider>
+    </div>
+  );
+};

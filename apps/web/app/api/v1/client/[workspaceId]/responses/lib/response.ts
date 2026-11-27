@@ -1,0 +1,152 @@
+import "server-only";
+import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
+import { TContactAttributes } from "@formbricks/types/contact-attribute";
+import { type TIngestFlag } from "@formbricks/types/embedded-data-ingest";
+import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { TResponseWithQuotaFull } from "@formbricks/types/quota";
+import {
+  TClientResponseInput,
+  TResponse,
+  TResponseInput,
+  ZClientResponseInput,
+} from "@formbricks/types/responses";
+import {
+  type TClientResponseCreateContext,
+  type TCreateResponseTxContext,
+  buildClientResponse,
+  createResponseWithQuotaEvaluation as createClientResponseWithQuotaEvaluation,
+} from "@/app/api/client/[workspaceId]/responses/lib/response";
+import { handleClientResponseCreateError } from "@/app/api/client/[workspaceId]/responses/lib/response-error";
+import { buildPrismaResponseData } from "@/app/api/v1/lib/utils";
+import { assertDisplayOwnership } from "@/lib/display/service";
+import { getOrganization } from "@/lib/organization/service";
+import { withoutNotShownAnswers } from "@/lib/response/not-shown-answers";
+import { calculateTtcTotal } from "@/lib/response/utils";
+import { getOrganizationIdFromWorkspaceId } from "@/lib/utils/helper";
+import { validateInputs } from "@/lib/utils/validate";
+import { getContactByUserId } from "./contact";
+
+export const responseSelection = {
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+  surveyId: true,
+  finished: true,
+  data: true,
+  meta: true,
+  ttc: true,
+  variables: true,
+  contactAttributes: true,
+  singleUseId: true,
+  language: true,
+  outcome: true,
+  displayId: true,
+  endingId: true,
+  contact: {
+    select: {
+      id: true,
+      attributes: {
+        select: { attributeKey: true, value: true },
+      },
+    },
+  },
+  tags: {
+    select: {
+      tag: {
+        select: {
+          id: true,
+          createdAt: true,
+          updatedAt: true,
+          name: true,
+          workspaceId: true,
+        },
+      },
+    },
+  },
+} satisfies Prisma.ResponseSelect;
+
+export const createResponseWithQuotaEvaluation = async (
+  responseInput: TClientResponseInput,
+  ingestFlags?: readonly TIngestFlag[],
+  // Optional caller-owned transaction — see the comment on the client helper this delegates to.
+  txContext?: TCreateResponseTxContext
+): Promise<TResponseWithQuotaFull> => {
+  return await createClientResponseWithQuotaEvaluation(
+    responseInput,
+    { resolveContext: resolveCreateResponseContext, createResponse },
+    ingestFlags,
+    txContext
+  );
+};
+
+/** The reads a create needs, made before its transaction opens — see `TClientResponseCreateContext`. */
+export const resolveCreateResponseContext = async ({
+  workspaceId,
+  userId,
+}: Pick<TResponseInput, "workspaceId" | "userId">): Promise<TClientResponseCreateContext> => {
+  try {
+    const organizationId = await getOrganizationIdFromWorkspaceId(workspaceId);
+    const organization = await getOrganization(organizationId);
+    if (!organization) {
+      throw new ResourceNotFoundError("Organization", organizationId);
+    }
+
+    const contact: { id: string; attributes: TContactAttributes } | null = userId
+      ? await getContactByUserId(workspaceId, userId)
+      : null;
+    return { contact };
+  } catch (error) {
+    return handleClientResponseCreateError(error);
+  }
+};
+
+export const createResponse = async (
+  responseInput: TClientResponseInput,
+  { contact }: TClientResponseCreateContext,
+  tx: Prisma.TransactionClient,
+  ingestFlags?: readonly TIngestFlag[]
+): Promise<TResponse> => {
+  validateInputs([responseInput, ZClientResponseInput]);
+
+  const { workspaceId, finished, ttc: initialTtc } = responseInput;
+
+  try {
+    const ttc = initialTtc && finished ? calculateTtcTotal(initialTtc) : (initialTtc ?? {});
+
+    if (responseInput.displayId) {
+      await assertDisplayOwnership(
+        responseInput.displayId,
+        workspaceId,
+        responseInput.surveyId,
+        contact?.id ?? null,
+        tx
+      );
+    }
+
+    const prismaClient = tx ?? prisma;
+    // ENG-6936: an answer to anything the not-shown record lists is not stored, as on an update.
+    const data = await withoutNotShownAnswers(
+      prismaClient,
+      responseInput.surveyId,
+      responseInput.notShown,
+      responseInput.data
+    );
+
+    const prismaData = buildPrismaResponseData(
+      { ...responseInput, data, createdAt: undefined, updatedAt: undefined },
+      contact,
+      ttc,
+      ingestFlags
+    );
+
+    const responsePrisma = await prismaClient.response.create({
+      data: prismaData,
+      select: responseSelection,
+    });
+
+    return buildClientResponse(responsePrisma, contact);
+  } catch (error) {
+    return handleClientResponseCreateError(error);
+  }
+};

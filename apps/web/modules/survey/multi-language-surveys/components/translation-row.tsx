@@ -1,0 +1,102 @@
+"use client";
+
+import DOMPurify from "isomorphic-dompurify";
+import { useTranslation } from "react-i18next";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { PublishedLockNotice } from "@/modules/survey/editor/components/published-lock-notice";
+import { Input } from "@/modules/ui/components/input";
+import { type TranslatableString } from "../lib/types";
+import { RichTextTranslationInput } from "./rich-text-translation-input";
+
+interface TranslationRowProps {
+  readonly s: TranslatableString;
+  readonly value: string;
+  readonly onChange: (path: string, value: string) => void;
+  readonly localSurvey: TSurvey;
+  readonly languageCode: string;
+  readonly disabled?: boolean;
+  /** An option text the published survey already has in this language: shown, not editable. */
+  readonly locked?: boolean;
+}
+
+const DefaultTextCell = ({
+  text,
+  isRichText,
+  noTextLabel,
+}: {
+  readonly text: string;
+  readonly isRichText: boolean;
+  readonly noTextLabel: string;
+}) => {
+  if (!text) {
+    return <div className="text-sm text-slate-400 italic">{noTextLabel}</div>;
+  }
+
+  if (isRichText) {
+    return (
+      <div
+        className="text-sm text-slate-700"
+        dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(text) }}
+      />
+    );
+  }
+
+  return <div className="text-sm text-slate-700">{text}</div>;
+};
+
+export const TranslationRow = ({
+  s,
+  value,
+  onChange,
+  localSurvey,
+  languageCode,
+  disabled,
+  locked,
+}: TranslationRowProps) => {
+  const { t } = useTranslation();
+
+  const defaultText = s.value.default || "";
+
+  return (
+    <tr className="border-b last:border-b-0" data-testid={`translation-row-${s.path}`}>
+      <td className="py-2 pr-2 align-top">
+        <span className="inline-block rounded-sm bg-slate-100 px-1.5 py-0.5 text-xs font-medium text-slate-600">
+          {s.displayId}
+        </span>
+        <div className="mt-0.5 text-[10px] text-slate-400">{s.fieldLabel}</div>
+      </td>
+      <td className="py-2 pr-2 align-top">
+        <DefaultTextCell
+          text={defaultText}
+          isRichText={s.isRichText}
+          noTextLabel={t("common.no_text_found")}
+        />
+      </td>
+      <td className="py-2 align-top">
+        <div className="flex items-start gap-1">
+          {s.isRichText ? (
+            <RichTextTranslationInput
+              path={s.path}
+              value={value}
+              onChange={onChange}
+              localSurvey={localSurvey}
+              languageCode={languageCode}
+              elementId={s.elementId}
+              disabled={disabled || locked}
+            />
+          ) : (
+            <Input
+              dir="auto"
+              className="text-sm"
+              value={value}
+              onChange={(e) => onChange(s.path, e.target.value)}
+              placeholder=""
+              disabled={disabled || locked}
+            />
+          )}
+          {locked && <PublishedLockNotice kind="optionText" className="mt-1" />}
+        </div>
+      </td>
+    </tr>
+  );
+};

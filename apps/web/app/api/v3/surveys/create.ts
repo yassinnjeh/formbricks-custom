@@ -1,0 +1,464 @@
+import "server-only";
+import { prisma } from "@formbricks/database";
+import { logger } from "@formbricks/logger";
+import type { TCustomCssStored, TCustomCssWarning } from "@formbricks/types/custom-css";
+import type { TLinkedEmbeddedField } from "@formbricks/types/embedded-data-resolver";
+import type { TSurvey, TSurveyCreateInput } from "@formbricks/types/surveys/types";
+import { getV3AuthorizationActor } from "@/app/api/v3/lib/auth";
+import { type TV3SurveyWriteReport, toV3CustomCssError } from "@/app/api/v3/lib/custom-css";
+import { getV3CustomCssPrincipal } from "@/app/api/v3/lib/custom-css-rate-limit";
+import { loggableError } from "@/app/api/v3/lib/loggable-error";
+import type { InvalidParam } from "@/app/api/v3/lib/response";
+import type { TV3Authentication } from "@/app/api/v3/lib/types";
+import { getActionClasses, getActionClassesInTransaction } from "@/lib/actionClass/service";
+import { getOrganizationByWorkspaceId } from "@/lib/organization/service";
+import { isDefaultEndingCardButtonLink } from "@/lib/survey/default-ending-card";
+import { addsRichTextLink } from "@/lib/survey/rich-text-links";
+import { createSurvey, getSurveyWithCustomCss, selectSurveyWithCustomCss } from "@/lib/survey/service";
+import { getElementsFromBlocks, transformPrismaSurvey } from "@/lib/survey/utils";
+import { resolveSurveyCreationFacts } from "@/lib/survey/visibility/creation";
+import { assertWorkspaceSurveyLimit } from "@/lib/survey/visibility/limit";
+import { SurveyWriteAfterCommitError, type TSurveyWriteTransaction } from "@/lib/survey/write-transaction";
+import { resolveCustomCssWrite } from "@/modules/custom-css/lib/service";
+import { getExternalUrlsPermission } from "@/modules/survey/lib/permission";
+import { buildV3SurveyCreateInput, getV3SurveyCreateInputInvalidParams } from "./create-input";
+import { v3DistributionToScalars } from "./distribution";
+import {
+  type TV3SurveyEmbeddedField,
+  V3SurveyEmbeddedFieldsError,
+  toLinkedEmbeddedFields,
+} from "./embedded-fields";
+import { getV3LibraryFieldIdsByKey, resolveV3EmbeddedFieldLibraryKeys } from "./embedded-fields-library";
+import { type TV3SurveyLanguageRequest, ensureV3WorkspaceLanguages } from "./languages";
+import { prepareV3SurveyCreate } from "./prepare";
+import { V3SurveyReferenceValidationError } from "./reference-validation";
+import type { TV3CreateSurveyBody } from "./schemas";
+import {
+  V3_CONTACTS_NOT_ENABLED_MESSAGE,
+  assertV3SurveyTargetingFilterReferences,
+  resolveV3ContactsEntitlement,
+} from "./targeting";
+import { resolveV3SurveyTriggers } from "./triggers";
+import { getV3SurveyMediaInvalidParams } from "./validation";
+import { resolveV3SurveyTargetingActor, resolveV3VisibleSurveyWhere } from "./visibility-context";
+
+export type TV3SurveyCreateOptions = {
+  skipExternalUrlPermissionCheck?: boolean;
+  /**
+   * Imports keep links in rich text on every plan (ENG-3607), so they skip only the rich-text half
+   * of the external-URL gate; CTA buttons and ending links stay gated.
+   */
+  skipRichTextLinkPermissionCheck?: boolean;
+  surveyCreateInputOverrides?: Partial<TSurveyCreateInput>;
+  /** Filled with the custom CSS warnings when the create processed custom CSS. */
+  report?: TV3SurveyWriteReport;
+  /**
+   * ENG-6850: a transaction the caller opened, passed on to {@link executeV3SurveyCreate}, so an
+   * import's references and the survey land together or not at all. The checks before the write
+   * (permissions, custom CSS) read as they do without one.
+   */
+  transaction?: TSurveyWriteTransaction;
+};
+
+export class V3SurveyCreatePermissionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "V3SurveyCreatePermissionError";
+  }
+}
+
+/**
+ * The create document passed this route's request schema but failed the stricter schema the survey
+ * service applies on write (`ZSurveyCreateInput` + `surveyRefinement`) — e.g. a CTA `buttonUrl`
+ * scheme the element schema allows but the refinement rejects.
+ *
+ * This is raised from an explicit pre-write parse rather than by catching `ValidationError` in the
+ * response mapper, and the distinction matters: `createSurvey` runs `validateInputs` again itself,
+ * and it also calls out to code *after* its transaction commits (`subscribeOrganizationMembers-
+ * ToSurveyResponses` → `updateUser`, which re-validates the user's stored `notificationSettings`
+ * JSON). A `ValidationError` from there means the survey row already exists, so answering it with a
+ * 4xx would tell the caller nothing was written and invite a duplicate retry. Anything that is not
+ * this error keeps its 500.
+ */
+export class V3SurveyInputValidationError extends Error {
+  invalidParams: InvalidParam[];
+
+  constructor(invalidParams: InvalidParam[]) {
+    super("Survey document failed validation");
+    this.name = "V3SurveyInputValidationError";
+    this.invalidParams = invalidParams;
+  }
+}
+
+function getCreatedBy(authentication: TV3Authentication): string | null {
+  if (authentication && "user" in authentication && authentication.user?.id) {
+    return authentication.user.id;
+  }
+
+  return null;
+}
+
+function hasExternalUrlReferences(
+  input: TV3CreateSurveyBody,
+  options: Pick<TV3SurveyCreateOptions, "skipRichTextLinkPermissionCheck">
+): boolean {
+  const hasExternalEndingLink = input.endings.some((ending) => {
+    if (ending.type === "endScreen") {
+      return Boolean(ending.buttonLink) && !isDefaultEndingCardButtonLink(ending.buttonLink);
+    }
+
+    return Boolean(ending.url);
+  });
+  const hasExternalCtaButton = getElementsFromBlocks(input.blocks).some(
+    (element) => element.type === "cta" && element.buttonExternal
+  );
+
+  return (
+    hasExternalEndingLink ||
+    hasExternalCtaButton ||
+    (!options.skipRichTextLinkPermissionCheck && addsRichTextLink(input))
+  );
+}
+
+async function assertV3SurveyCreatePermissions(
+  input: TV3CreateSurveyBody,
+  organizationId?: string,
+  options: Pick<
+    TV3SurveyCreateOptions,
+    "skipExternalUrlPermissionCheck" | "skipRichTextLinkPermissionCheck"
+  > = {}
+): Promise<void> {
+  if (options.skipExternalUrlPermissionCheck || !hasExternalUrlReferences(input, options)) {
+    return;
+  }
+
+  const resolvedOrganizationId =
+    organizationId ?? (await getOrganizationByWorkspaceId(input.workspaceId))?.id ?? null;
+  if (!resolvedOrganizationId) {
+    throw new V3SurveyCreatePermissionError(
+      `Unable to verify external URL permissions for workspaceId '${input.workspaceId}'.`
+    );
+  }
+
+  const isExternalUrlsAllowed = await getExternalUrlsPermission(resolvedOrganizationId);
+  if (!isExternalUrlsAllowed) {
+    throw new V3SurveyCreatePermissionError(
+      "External URLs are not enabled for this organization. Upgrade to use external survey links."
+    );
+  }
+}
+
+function hasV3SurveyTargetingFilters(input: TV3CreateSurveyBody): boolean {
+  return input.type === "app" && (input.targeting?.filters.length ?? 0) > 0;
+}
+
+/**
+ * Contact targeting (segment filters) is an enterprise feature. Gate non-empty targeting before any
+ * write so an unentitled request fails with a 403 instead of creating a survey it can't fully configure.
+ */
+async function assertV3SurveyTargetingPermission(
+  input: TV3CreateSurveyBody,
+  organizationId?: string
+): Promise<void> {
+  if (!hasV3SurveyTargetingFilters(input)) {
+    return;
+  }
+
+  const { resolvedOrganizationId, isContactsEnabled } = await resolveV3ContactsEntitlement(
+    input.workspaceId,
+    organizationId
+  );
+  if (!resolvedOrganizationId) {
+    throw new V3SurveyCreatePermissionError(
+      `Unable to verify contact targeting permissions for workspaceId '${input.workspaceId}'.`
+    );
+  }
+  if (!isContactsEnabled) {
+    throw new V3SurveyCreatePermissionError(V3_CONTACTS_NOT_ENABLED_MESSAGE);
+  }
+}
+
+/**
+ * Map the app-only `distribution` block onto the create input. Display scalars carry concrete
+ * defaults (matching the DB defaults), and triggers are resolved to full action-class objects.
+ */
+async function buildV3AppSurveyCreateFields(
+  input: TV3CreateSurveyBody,
+  transaction: TSurveyWriteTransaction | undefined
+): Promise<Partial<TSurveyCreateInput>> {
+  const distribution = input.distribution;
+  if (!distribution) {
+    return {};
+  }
+
+  const fields: Partial<TSurveyCreateInput> = { ...v3DistributionToScalars(distribution), triggers: [] };
+
+  if (distribution.triggers.length > 0) {
+    const actionClasses = transaction
+      ? await getActionClassesInTransaction(transaction.tx, input.workspaceId)
+      : await getActionClasses(input.workspaceId);
+    fields.triggers = resolveV3SurveyTriggers(distribution.triggers, actionClasses);
+  }
+
+  return fields;
+}
+
+/**
+ * Finalize a freshly created app survey by re-reading it. `createSurvey` already re-reads inside its
+ * transaction, so the survey it returns carries its private segment and targeting filters; what it
+ * lacks is the Decimal→number transform for `displayPercentage`, which this read applies so the
+ * response carries the numeric display fields.
+ */
+async function finalizeV3AppSurveyCreate(
+  survey: TSurvey,
+  input: TV3CreateSurveyBody,
+  transaction: TSurveyWriteTransaction | undefined
+): Promise<TSurvey> {
+  if (input.type !== "app") {
+    return survey;
+  }
+
+  // Under a caller's transaction the survey is not committed yet, so only that transaction can read it.
+  if (transaction) {
+    const reread = await transaction.tx.survey.findUnique({
+      where: { id: survey.id },
+      select: selectSurveyWithCustomCss,
+    });
+    return reread ? transformPrismaSurvey<TSurvey>(reread) : survey;
+  }
+
+  return (await getSurveyWithCustomCss(survey.id)) ?? survey;
+}
+
+/**
+ * ENG-3641: survey CSS on create goes through the shared custom CSS service — Scale on Cloud, then the
+ * caller's custom CSS budget, then the processor — before anything is written. No CSS (omitted, null or
+ * empty source) needs none of them.
+ */
+async function resolveV3SurveyCreateCustomCss(
+  input: TV3CreateSurveyBody,
+  organizationId: string | undefined,
+  authentication: TV3Authentication
+): Promise<{ stored: TCustomCssStored | null; warnings?: TCustomCssWarning[] }> {
+  if (!input.customCss) {
+    return { stored: null };
+  }
+
+  const outcome = await resolveCustomCssWrite({
+    scope: "survey",
+    organizationId:
+      organizationId ??
+      (async () => {
+        const organization = await getOrganizationByWorkspaceId(input.workspaceId);
+        if (!organization) {
+          throw new V3SurveyCreatePermissionError(
+            `Unable to verify custom CSS permissions for workspaceId '${input.workspaceId}'.`
+          );
+        }
+        return organization.id;
+      }),
+    existing: null,
+    input: input.customCss,
+    principal: getV3CustomCssPrincipal(authentication),
+  });
+
+  if (!outcome.ok) {
+    throw toV3CustomCssError(outcome);
+  }
+
+  return { stored: outcome.stored, warnings: outcome.warnings };
+}
+
+/**
+ * ENG-6930: the document's typed fields as the `{ field, link }` rows `createSurvey` reconciles, each
+ * library entry pointing at the workspace row its key names.
+ */
+async function toV3SurveyCreateEmbeddedFields(
+  input: TV3CreateSurveyBody,
+  transaction: TSurveyWriteTransaction | undefined
+): Promise<TLinkedEmbeddedField[] | undefined> {
+  // Complete by now: prepare filled in every default (`settleV3EmbeddedFieldFormats`).
+  const entries = input.embeddedFields as TV3SurveyEmbeddedField[] | undefined;
+  if (!entries) {
+    return undefined;
+  }
+
+  const linked = toLinkedEmbeddedFields(
+    entries,
+    await getV3LibraryFieldIdsByKey(transaction?.tx ?? prisma, input.workspaceId, entries)
+  );
+  if (!linked.ok) {
+    throw new V3SurveyEmbeddedFieldsError(linked.invalidParams);
+  }
+  return linked.fields;
+}
+
+export async function executeV3SurveyCreate(params: {
+  input: TV3CreateSurveyBody;
+  authentication: TV3Authentication;
+  languageRequests: TV3SurveyLanguageRequest[];
+  organizationId?: string;
+  requestId?: string;
+  surveyCreateInputOverrides?: Partial<TSurveyCreateInput>;
+  /** Already resolved by the shared custom CSS service; never the caller's raw input. */
+  customCss?: TCustomCssStored | null;
+  /**
+   * ENG-6845: a transaction the caller opened, so the survey lands together with the caller's own
+   * writes or not at all. The languages this create adds, the survey and its private segment are
+   * written through it, and the References the caller created in it are visible to the checks here.
+   * Omitted, `createSurvey` opens its own transaction, as it always has.
+   */
+  transaction?: TSurveyWriteTransaction;
+}) {
+  const {
+    input,
+    authentication,
+    languageRequests,
+    requestId,
+    surveyCreateInputOverrides,
+    customCss,
+    transaction,
+  } = params;
+  const mediaInvalidParams = getV3SurveyMediaInvalidParams(input.blocks);
+  if (mediaInvalidParams.length > 0) {
+    throw new V3SurveyReferenceValidationError(mediaInvalidParams);
+  }
+
+  // Resolve/validate app distribution (incl. trigger ids) and targeting attribute-key references
+  // before any DB write, so an invalid reference fails with a 422 instead of a partial write.
+  const appCreateFields = input.type === "app" ? await buildV3AppSurveyCreateFields(input, transaction) : {};
+  if (input.type === "app") {
+    const visibleSurveyWhere = await resolveV3VisibleSurveyWhere(
+      authentication,
+      params.organizationId ?? (await getOrganizationByWorkspaceId(input.workspaceId))?.id
+    );
+    await assertV3SurveyTargetingFilterReferences(
+      input.workspaceId,
+      input.targeting?.filters ?? [],
+      visibleSurveyWhere,
+      transaction?.tx
+    );
+  }
+
+  // ENG-3282: who owns the survey and whether it starts restricted, decided by the principal — never by
+  // the body, whose schema has no such fields. Both reads happen before any write, as does the cap.
+  const actor = getV3AuthorizationActor(authentication);
+  const organizationId =
+    actor?.type === "user"
+      ? (params.organizationId ?? (await getOrganizationByWorkspaceId(input.workspaceId))?.id ?? null)
+      : null;
+  if (actor?.type === "user" && !organizationId) {
+    throw new V3SurveyCreatePermissionError(
+      `Unable to resolve the organization for workspaceId '${input.workspaceId}'.`
+    );
+  }
+  await assertWorkspaceSurveyLimit(input.workspaceId);
+  const creationFacts = await resolveSurveyCreationFacts({ actor, organizationId });
+
+  const embeddedFields = await toV3SurveyCreateEmbeddedFields(input, transaction);
+  const languages = await ensureV3WorkspaceLanguages(
+    input.workspaceId,
+    languageRequests,
+    requestId,
+    transaction?.tx
+  );
+  const surveyCreateInput = buildV3SurveyCreateInput(input, {
+    languages,
+    embeddedFields,
+    createdBy: getCreatedBy(authentication),
+    overrides: { ...appCreateFields, ...surveyCreateInputOverrides },
+  });
+
+  // Run the survey service's own write schema here, before any DB work, so a document this route's
+  // request schema admits but `surveyRefinement` rejects (a CTA `buttonUrl` of `tel:…` being the
+  // known case) fails with a typed error the route can answer 422. `createSurvey` validates this
+  // same input again; catching its `ValidationError` instead would be wrong, because it also throws
+  // one from post-commit work where the survey row already exists. See V3SurveyInputValidationError.
+  const createInputInvalidParams = getV3SurveyCreateInputInvalidParams(surveyCreateInput);
+  if (createInputInvalidParams.length > 0) {
+    throw new V3SurveyInputValidationError(createInputInvalidParams);
+  }
+
+  // App targeting filters are created atomically with the survey's private segment inside
+  // `createSurvey` (a single transaction), so a failed targeting write can't leave a partial survey.
+  const privateSegmentFilters = input.type === "app" ? (input.targeting?.filters ?? []) : [];
+  const targetingActor = await resolveV3SurveyTargetingActor(
+    authentication,
+    params.organizationId ?? (await getOrganizationByWorkspaceId(input.workspaceId))?.id
+  );
+  let survey: TSurvey;
+  try {
+    survey = await createSurvey(input.workspaceId, surveyCreateInput, {
+      creationFacts,
+      privateSegmentFilters,
+      customCss,
+      targetingActor,
+      ...(transaction ? { transaction } : {}),
+    });
+  } catch (error) {
+    if (!(error instanceof SurveyWriteAfterCommitError)) throw error;
+    // The survey committed and is answered as created: with the same re-read a create that finished
+    // gets, so an app survey's `displayPercentage` is a number, not Prisma's `Decimal`.
+    const created = error.result as TSurvey;
+    // Best effort: the re-read failing must not turn a created survey into a 500, but it is logged, so a
+    // broken re-read does not go unnoticed.
+    const finalized = await finalizeV3AppSurveyCreate(created, input, transaction).catch(
+      (rereadError: unknown) => {
+        logger.error(
+          { ...loggableError(rereadError), surveyId: created.id },
+          "Survey create committed, but its re-read after the failed after-commit work failed too"
+        );
+        return created;
+      }
+    );
+    throw new SurveyWriteAfterCommitError(finalized, error.cause);
+  }
+
+  return await finalizeV3AppSurveyCreate(survey, input, transaction);
+}
+
+export async function createV3Survey(
+  input: TV3CreateSurveyBody,
+  authentication: TV3Authentication,
+  requestId?: string,
+  organizationId?: string,
+  options: TV3SurveyCreateOptions = {}
+) {
+  // ENG-6930: library fields linked by key get the library's definition before anything is judged.
+  const resolved = await resolveV3EmbeddedFieldLibraryKeys(input.workspaceId, input);
+  if (!resolved.ok) {
+    throw new V3SurveyEmbeddedFieldsError(resolved.invalidParams);
+  }
+
+  const preparation = prepareV3SurveyCreate(resolved.input);
+  if (!preparation.ok) {
+    throw preparation.origin === "embeddedFields"
+      ? new V3SurveyEmbeddedFieldsError(preparation.validation.invalidParams)
+      : new V3SurveyReferenceValidationError(preparation.validation.invalidParams);
+  }
+
+  await assertV3SurveyCreatePermissions(input, organizationId, options);
+  await assertV3SurveyTargetingPermission(preparation.document, organizationId);
+  const customCss = await resolveV3SurveyCreateCustomCss(
+    preparation.document,
+    organizationId,
+    authentication
+  );
+
+  // Before the create: a create that commits and then fails its after-commit work is still answered
+  // as created, with these warnings.
+  if (options.report && customCss.warnings) {
+    options.report.customCssWarnings = customCss.warnings;
+  }
+
+  return executeV3SurveyCreate({
+    input: preparation.document,
+    authentication,
+    languageRequests: preparation.languageRequests,
+    organizationId,
+    requestId,
+    surveyCreateInputOverrides: options.surveyCreateInputOverrides,
+    customCss: customCss.stored,
+    ...(options.transaction ? { transaction: options.transaction } : {}),
+  });
+}

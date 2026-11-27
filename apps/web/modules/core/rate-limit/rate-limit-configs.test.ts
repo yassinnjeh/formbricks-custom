@@ -1,0 +1,452 @@
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { WEBHOOK_CALLS_PER_MINUTE_PER_WORKFLOW } from "@formbricks/workflows";
+import { ZRateLimitConfig } from "@/modules/core/rate-limit/types/rate-limit";
+import { applyRateLimit } from "./helpers";
+import { checkRateLimit } from "./rate-limit";
+import { rateLimitConfigs } from "./rate-limit-configs";
+
+const { mockEval, mockRedisClient, mockGetRedisClient } = vi.hoisted(() => {
+  const _mockEval = vi.fn();
+  const _mockRedisClient = { evalSha: _mockEval, eval: _mockEval };
+  const _mockGetRedisClient = vi.fn().mockResolvedValue(_mockRedisClient);
+  return { mockEval: _mockEval, mockRedisClient: _mockRedisClient, mockGetRedisClient: _mockGetRedisClient };
+});
+
+// Mock dependencies for integration tests
+vi.mock("@/lib/constants", () => ({
+  REDIS_URL: "redis://localhost:6379",
+  RATE_LIMITING_DISABLED: false,
+  SENTRY_DSN: "https://test@sentry.io/test",
+}));
+
+vi.mock("@/lib/cache", () => ({
+  cache: {
+    getRedisClient: mockGetRedisClient,
+    runRedisOperation: vi.fn((operation: (client: typeof mockRedisClient) => Promise<unknown>) =>
+      operation(mockRedisClient)
+    ),
+  },
+}));
+
+vi.mock("@formbricks/logger", () => ({
+  logger: {
+    debug: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("@sentry/nextjs", () => ({
+  addBreadcrumb: vi.fn(),
+  captureException: vi.fn(),
+}));
+
+vi.mock("@formbricks/cache", () => ({
+  createCacheKey: {
+    rateLimit: {
+      core: vi.fn(
+        (namespace, identifier, windowStart) => `fb:rate_limit:${namespace}:${identifier}:${windowStart}`
+      ),
+    },
+  },
+}));
+
+describe("rateLimitConfigs", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Reset the mock to return our mock client (async)
+    mockGetRedisClient.mockResolvedValue(mockRedisClient);
+  });
+
+  test("the Webhook per-workflow and per-token limits are the number the trigger panel shows", () => {
+    expect(rateLimitConfigs.api.v3WorkflowWebhook.allowedPerInterval).toBe(
+      WEBHOOK_CALLS_PER_MINUTE_PER_WORKFLOW
+    );
+    expect(rateLimitConfigs.api.v3WorkflowWebhookToken.allowedPerInterval).toBe(
+      WEBHOOK_CALLS_PER_MINUTE_PER_WORKFLOW
+    );
+  });
+
+  describe("Configuration Structure", () => {
+    test("should have all required config groups", () => {
+      expect(rateLimitConfigs).toHaveProperty("auth");
+      expect(rateLimitConfigs).toHaveProperty("api");
+      expect(rateLimitConfigs).toHaveProperty("actions");
+      expect(rateLimitConfigs).toHaveProperty("storage");
+    });
+
+    test("should have all auth configurations", () => {
+      const authConfigs = Object.keys(rateLimitConfigs.auth);
+      expect(authConfigs).toEqual([
+        "loginFailuresPerAccount",
+        "signup",
+        "forgotPassword",
+        "forgotPasswordPerAccount",
+        "resetPassword",
+        "verifyEmail",
+        "verifyEmailPerAccount",
+        "samlCallback",
+      ]);
+      expect(rateLimitConfigs.auth.resetPassword).toEqual({
+        interval: 3600,
+        allowedPerInterval: 5,
+        namespace: "auth:reset-password",
+        failClosed: true,
+      });
+      // Per-account cap on forgot-password mail (ENG-3640): loosening it re-opens inbox flooding.
+      expect(rateLimitConfigs.auth.forgotPasswordPerAccount).toEqual({
+        interval: 3600,
+        allowedPerInterval: 3,
+        namespace: "auth:forgot:account",
+        failClosed: true,
+      });
+      // Below email_verification's per-recipient cap of 5, so strangers cannot spend all of it (ENG-3823).
+      expect(rateLimitConfigs.auth.verifyEmailPerAccount).toEqual({
+        interval: 3600,
+        allowedPerInterval: 3,
+        namespace: "auth:verify:account",
+        failClosed: true,
+      });
+      // The email-token endpoint is gone (the sign-up answer carries the display token), and its bucket
+      // with it.
+      expect(rateLimitConfigs.auth).not.toHaveProperty("emailToken");
+      // How often one IP can make the SAML callback parse an anonymous XML document (ENG-3973).
+      expect(rateLimitConfigs.auth.samlCallback).toEqual({
+        interval: 60,
+        allowedPerInterval: 120,
+        namespace: "auth:saml-callback",
+      });
+    });
+
+    test("should have all API configurations", () => {
+      const apiConfigs = Object.keys(rateLimitConfigs.api);
+      expect(apiConfigs).toEqual([
+        "v1",
+        "v2",
+        "v3",
+        "internal",
+        "v3StateMutation",
+        "mcpAuth",
+        "v3WorkflowWebhook",
+        "v3WorkflowWebhookToken",
+        "v3WorkflowTestRequests",
+        "v3WorkflowTestRuns",
+        "v3SurveyGenerate",
+        "internalAiTranslate",
+        "v3SurveyVisibility",
+        "v3SurveysFullList",
+        "v3CustomCss",
+        "v3ChartQueries",
+        "v3ChartQueriesInFlight",
+        "internalChartGeneration",
+        "internalDatasetPurge",
+        "internalRetentionExport",
+        "internalFeedbackCsvImport",
+        "internalHeicConversion",
+        "client",
+        "clientEnvironment",
+        "clientCreativeEvents",
+      ]);
+      // One `view=full` survey page carries up to 50 whole documents (ENG-6861); looser is a DoS regression.
+      expect(rateLimitConfigs.api.v3SurveysFullList).toEqual({
+        interval: 60,
+        allowedPerInterval: 30,
+        namespace: "api:v3:surveys:full-list",
+      });
+      // The API twin of `actions.stateMutation`, per principal, for writes that fan out to the pipeline.
+      expect(rateLimitConfigs.api.v3StateMutation).toEqual({
+        interval: 60,
+        allowedPerInterval: 120,
+        namespace: "api:v3:state-mutation",
+      });
+      // Chart data, preview and field values share one bucket sized for dashboards (ENG-6586).
+      // One LLM-backed chart generation per user per minute bounds AI spend; looser is a cost regression.
+      expect(rateLimitConfigs.api.internalChartGeneration).toEqual({
+        interval: 60,
+        allowedPerInterval: 1,
+        namespace: "api:internal:charts:generate",
+      });
+      expect(rateLimitConfigs.api.v3ChartQueries).toEqual({
+        interval: 60,
+        allowedPerInterval: 600,
+        namespace: "api:v3:charts:queries",
+      });
+      // 20 running at once; each slot's lease is twice the 60 s Cube query timeout.
+      expect(rateLimitConfigs.api.v3ChartQueriesInFlight).toEqual({
+        interval: 120,
+        allowedPerInterval: 20,
+        namespace: "api:v3:charts:in-flight",
+      });
+      // Per IP: one events request per page view, from every visitor behind one office NAT.
+      expect(rateLimitConfigs.api.clientCreativeEvents).toEqual({
+        interval: 60,
+        allowedPerInterval: 600,
+        namespace: "api:client:creative-events",
+      });
+      // The values, not just the key: each export streams an organisation's whole retention history,
+      // names people, and runs a pre-flight count, so a loosened quota is a load and privacy regression.
+      expect(rateLimitConfigs.api.internalRetentionExport).toEqual({
+        interval: 3600,
+        allowedPerInterval: 10,
+        namespace: "api:internal:retention-runs:export",
+      });
+      // Every conversion decodes a whole photo on the server, so a loosened quota is a CPU regression.
+      expect(rateLimitConfigs.api.internalHeicConversion).toEqual({
+        interval: 60,
+        allowedPerInterval: 20,
+        namespace: "api:internal:heic-conversions",
+      });
+      // One call per target language, each up to 8192 output tokens: a loosened quota is a cost regression.
+      expect(rateLimitConfigs.api.internalAiTranslate).toEqual({
+        interval: 60,
+        allowedPerInterval: 20,
+        namespace: "api:internal:ai-translations",
+      });
+    });
+
+    test("should have all action configurations", () => {
+      const actionConfigs = Object.keys(rateLimitConfigs.actions);
+      expect(actionConfigs).toEqual([
+        "emailUpdate",
+        "passwordResetRequest",
+        "accountDeletion",
+        "surveyFollowUp",
+        "sendLinkSurveyEmail",
+        "validateSurveyPinFailuresPerSurvey",
+        "validateSurveyPin",
+        "twoFactorManage",
+        "webhookTest",
+        "webhookSecretReveal",
+        "licenseRecheck",
+        "unsplash",
+        "inviteMember",
+        "inviteMemberPerUser",
+        "createOrganization",
+        "generateExampleResponses",
+        "integrationMutation",
+        "feedbackSourceMutation",
+        "historicalResponseImport",
+        "feedbackDirectoryMutation",
+        "feedbackRecordDeletion",
+        "stateMutation",
+      ]);
+
+      // Exact values, not just presence: this quota is the only thing bounding one account from
+      // exhausting the instance-wide UNSPLASH_ACCESS_KEY, so a loosened interval, allowance or
+      // namespace is a security regression and should fail here rather than in production.
+      expect(rateLimitConfigs.actions.unsplash).toEqual({
+        interval: 60,
+        allowedPerInterval: 30,
+        namespace: "action:unsplash",
+      });
+      expect(rateLimitConfigs.actions.inviteMember).toEqual({
+        interval: 3600 * 24,
+        allowedPerInterval: 50,
+        namespace: "action:invite-member",
+        failClosed: true,
+      });
+      expect(rateLimitConfigs.actions.inviteMemberPerUser).toEqual({
+        interval: 3600 * 24,
+        allowedPerInterval: 50,
+        namespace: "action:invite-member:user",
+        failClosed: true,
+      });
+      expect(rateLimitConfigs.actions.createOrganization).toEqual({
+        interval: 3600 * 24,
+        allowedPerInterval: 5,
+        namespace: "action:create-organization",
+        failClosed: true,
+      });
+      expect(rateLimitConfigs.actions.historicalResponseImport).toEqual({
+        interval: 3600,
+        allowedPerInterval: 10,
+        namespace: "action:historical-response-import",
+      });
+      expect(rateLimitConfigs.actions.stateMutation).toEqual({
+        interval: 60,
+        allowedPerInterval: 120,
+        namespace: "action:state-mutation",
+      });
+    });
+
+    test("should have all storage configurations", () => {
+      const storageConfigs = Object.keys(rateLimitConfigs.storage);
+      expect(storageConfigs).toEqual([
+        "upload",
+        "uploadPerWorkspace",
+        "delete",
+        "attachmentsExport",
+        "responsesExport",
+      ]);
+    });
+  });
+
+  describe("Zod Validation", () => {
+    test("all configurations should pass Zod validation", () => {
+      const allConfigs = [
+        ...Object.values(rateLimitConfigs.auth),
+        ...Object.values(rateLimitConfigs.api),
+        ...Object.values(rateLimitConfigs.actions),
+        ...Object.values(rateLimitConfigs.storage),
+      ];
+
+      for (const config of allConfigs) {
+        expect(() => ZRateLimitConfig.parse(config)).not.toThrow();
+      }
+    });
+  });
+
+  describe("Configuration Logic", () => {
+    test("all namespaces should be unique", () => {
+      const allNamespaces: string[] = [];
+
+      // Collect all namespaces
+      Object.values(rateLimitConfigs.auth).forEach((config) => allNamespaces.push(config.namespace));
+      Object.values(rateLimitConfigs.api).forEach((config) => allNamespaces.push(config.namespace));
+      Object.values(rateLimitConfigs.actions).forEach((config) => allNamespaces.push(config.namespace));
+      Object.values(rateLimitConfigs.storage).forEach((config) => allNamespaces.push(config.namespace));
+
+      const uniqueNamespaces = new Set(allNamespaces);
+      expect(uniqueNamespaces.size).toBe(allNamespaces.length);
+    });
+
+    // docs/adr/0016-abuse-limits-fail-closed.md: abuse limits refuse while Redis is down, throughput
+    // limits never do, or a Redis blip would take the whole app down.
+    test("abuse limits fail closed and throughput limits fail open", () => {
+      const { auth, api, actions } = rateLimitConfigs;
+      const abuseLimits = [
+        auth.signup,
+        auth.forgotPassword,
+        auth.forgotPasswordPerAccount,
+        auth.resetPassword,
+        auth.verifyEmail,
+        auth.verifyEmailPerAccount,
+        api.mcpAuth,
+        actions.emailUpdate,
+        actions.passwordResetRequest,
+        actions.accountDeletion,
+        actions.surveyFollowUp,
+        actions.sendLinkSurveyEmail,
+        actions.validateSurveyPin,
+        actions.inviteMember,
+        actions.inviteMemberPerUser,
+        actions.createOrganization,
+        api.v3WorkflowTestRequests,
+      ];
+      const throughputLimits = [
+        api.v1,
+        api.v2,
+        api.v3,
+        api.client,
+        api.clientEnvironment,
+        actions.stateMutation,
+      ];
+
+      for (const config of abuseLimits) {
+        expect(config, config.namespace).toHaveProperty("failClosed", true);
+      }
+      for (const config of throughputLimits) {
+        expect(config, config.namespace).not.toHaveProperty("failClosed");
+      }
+    });
+  });
+
+  describe("Integration with Rate Limiting", () => {
+    test("should work with checkRateLimit function", async () => {
+      mockEval.mockResolvedValue([1, 1]);
+
+      const config = rateLimitConfigs.auth.loginFailuresPerAccount;
+      const result = await checkRateLimit(config, "test-identifier");
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data.allowed).toBe(true);
+      }
+    });
+
+    test("should work with applyRateLimit helper", async () => {
+      mockEval.mockResolvedValue([1, 1]);
+
+      const config = rateLimitConfigs.api.v1;
+      await expect(applyRateLimit(config, "api-key-123")).resolves.toEqual({ allowed: true });
+    });
+
+    test("should enforce limits correctly for each config type", async () => {
+      const testCases = [
+        { config: rateLimitConfigs.auth.loginFailuresPerAccount, identifier: "user-login" },
+        { config: rateLimitConfigs.auth.signup, identifier: "user-signup" },
+        { config: rateLimitConfigs.api.v1, identifier: "api-v1-key" },
+        { config: rateLimitConfigs.api.v2, identifier: "api-v2-key" },
+        { config: rateLimitConfigs.api.v3, identifier: "api-v3-key" },
+        { config: rateLimitConfigs.api.v3SurveyGenerate, identifier: "api-v3-survey-generate-key" },
+        { config: rateLimitConfigs.api.client, identifier: "client-api-key" },
+        { config: rateLimitConfigs.api.clientEnvironment, identifier: "environment-id" },
+        { config: rateLimitConfigs.actions.emailUpdate, identifier: "user-profile" },
+        { config: rateLimitConfigs.actions.accountDeletion, identifier: "user-account-delete" },
+        { config: rateLimitConfigs.actions.unsplash, identifier: "user-unsplash" },
+        { config: rateLimitConfigs.storage.upload, identifier: "storage-upload" },
+        { config: rateLimitConfigs.storage.uploadPerWorkspace, identifier: "storage-upload-workspace" },
+        { config: rateLimitConfigs.storage.delete, identifier: "storage-delete" },
+      ];
+
+      for (const { config, identifier } of testCases) {
+        // Test allowed request
+        mockEval.mockClear();
+        mockEval.mockResolvedValue([1, 1]);
+        const allowedResult = await checkRateLimit(config, identifier);
+        expect(allowedResult.ok).toBe(true);
+        expect(allowedResult).toHaveProperty("data.allowed", true);
+
+        // Test exceeded limit
+        mockEval.mockClear();
+        mockEval.mockResolvedValue([config.allowedPerInterval + 1, 0]);
+        const exceededResult = await checkRateLimit(config, identifier);
+        expect(exceededResult.ok).toBe(true);
+        expect(exceededResult).toHaveProperty("data.allowed", false);
+      }
+    });
+
+    test("should properly configure storage upload rate limit", async () => {
+      const config = rateLimitConfigs.storage.upload;
+
+      // Verify configuration values
+      expect(config.interval).toBe(60); // 1 minute
+      expect(config.allowedPerInterval).toBe(5); // 5 requests per minute
+      expect(config.namespace).toBe("storage:upload");
+    });
+
+    test("should properly configure storage upload per workspace rate limit", async () => {
+      const config = rateLimitConfigs.storage.uploadPerWorkspace;
+
+      // Verify configuration values
+      expect(config.interval).toBe(60); // 1 minute
+      expect(config.allowedPerInterval).toBe(100); // 100 requests per minute
+      expect(config.namespace).toBe("storage:upload:workspace");
+    });
+
+    test("should properly configure storage delete rate limit", async () => {
+      const config = rateLimitConfigs.storage.delete;
+
+      // Verify configuration values
+      expect(config.interval).toBe(60); // 1 minute
+      expect(config.allowedPerInterval).toBe(5); // 5 requests per minute
+      expect(config.namespace).toBe("storage:delete");
+    });
+
+    test("should properly configure client environment rate limit", async () => {
+      const config = rateLimitConfigs.api.clientEnvironment;
+
+      expect(config.interval).toBe(60);
+      expect(config.allowedPerInterval).toBe(1000);
+      expect(config.namespace).toBe("api:client:environment");
+    });
+
+    test("should properly configure v3 survey generation rate limit", async () => {
+      const config = rateLimitConfigs.api.v3SurveyGenerate;
+
+      expect(config.interval).toBe(60);
+      expect(config.allowedPerInterval).toBe(10);
+      expect(config.namespace).toBe("api:v3:surveys:generate");
+    });
+  });
+});

@@ -1,0 +1,223 @@
+import { setNonce as setStyleSingletonNonce } from "get-nonce";
+import { type ComponentChild, type FunctionComponent, h, render } from "preact";
+import { resolveSurveyLanguage } from "@formbricks/i18n-utils/survey-language-match";
+import { SurveyPortalContainerContext } from "@formbricks/survey-ui";
+import { SurveyContainerProps } from "@formbricks/types/formbricks-surveys";
+import { RenderSurvey } from "@/components/general/render-survey";
+import { I18nProvider } from "@/components/i18n/provider";
+import { setAppearance } from "@/lib/appearance";
+import { FILE_PICK_EVENT } from "@/lib/constants";
+import {
+  CustomCssOwnerContext,
+  applyCustomCss,
+  getCustomCssGeneration,
+  releaseCustomCss,
+  removeCustomCss,
+  syncCustomCssNonce,
+} from "@/lib/custom-css";
+import { getI18nLanguage } from "@/lib/i18n-utils";
+import { setLocaleBaseUrl } from "@/lib/i18n.config";
+import { getPreviewPortalContainer } from "@/lib/preview-boundary";
+import { setFontBaseUrl } from "@/lib/signature-font-url";
+import { addCustomThemeToDom, addStylesToDom, setStyleNonce } from "@/lib/styles";
+
+// survey-ui is typed against React; in this bundle `react` resolves to preact/compat, so at runtime its
+// context is a Preact one and its Provider renders like any Preact component.
+const PortalContainerProvider = SurveyPortalContainerContext.Provider as unknown as FunctionComponent<{
+  value: HTMLElement | null;
+}>;
+
+export const renderSurveyInline = (props: SurveyContainerProps) => {
+  const inlineProps: SurveyContainerProps = {
+    ...props,
+    mode: "inline",
+  };
+
+  renderSurvey(inlineProps);
+};
+
+/**
+ * The host's `onClose`, preceded by releasing the custom CSS this render applied. Closing then does not
+ * depend on the survey's tree being unmounted — a host that drops the container without unmounting it
+ * (js-core's `closeSurvey`) would otherwise keep the stylesheet. Guarded by the render's generation, so
+ * a survey that closes after a newer one rendered leaves that one's CSS alone.
+ *
+ * An app survey always gets the handler, host callback or not: RenderSurvey closes through its own
+ * handler either way and only calls this one afterwards, so its presence changes nothing on screen. A
+ * link survey keeps its own contract and gets one only when the host passed one.
+ */
+const withCustomCssRelease = (
+  onClose: SurveyContainerProps["onClose"],
+  owner: number,
+  isLinkSurvey: boolean
+): SurveyContainerProps["onClose"] => {
+  if (!onClose && isLinkSurvey) return onClose;
+  return () => {
+    releaseCustomCss(owner);
+    onClose?.();
+  };
+};
+
+export const renderSurvey = (renderProps: SurveyContainerProps) => {
+  // render SurveyNew
+  // if survey type is link, we don't pass the placement, overlay, clickOutside, onClose
+
+  const { mode, containerId, languageCode, appUrl } = renderProps;
+
+  // Where the on-demand locale bundles live, beside the renderer itself.
+  setLocaleBaseUrl(appUrl);
+  // And the typed-signature font, fetched only if a respondent opens a Signature's Type tab.
+  setFontBaseUrl(appUrl);
+
+  // Before the first render, so the survey never paints in the wrong appearance.
+  setAppearance(renderProps.appearance);
+  addStylesToDom();
+  // Page font only for an app survey: a link survey keeps the survey font on any page (ENG-3864).
+  addCustomThemeToDom({
+    styling: renderProps.styling,
+    pageFont: renderProps.pageFont === true && renderProps.survey.type !== "link",
+  });
+  // Only from the explicit prop (ENG-3552): CSS on `props.survey` or `props.styling` is never read.
+  // Before the render, so the first paint already has it; replaces whatever an earlier survey applied.
+  applyCustomCss(renderProps.customCss);
+  const customCssOwner = getCustomCssGeneration();
+  const props: SurveyContainerProps = {
+    ...renderProps,
+    onClose: withCustomCssRelease(renderProps.onClose, customCssOwner, renderProps.survey.type === "link"),
+  };
+  const withCustomCssOwner = (child: ComponentChild) =>
+    h(CustomCssOwnerContext.Provider, { value: customCssOwner }, child);
+
+  const language = getI18nLanguage(languageCode, props.survey.languages);
+
+  // SDK clients may request a legacy code (e.g. "hi") that is no longer a survey content key after
+  // canonicalization (content is keyed "hi-IN"). Render the survey under the resolved canonical code so
+  // content lookups — and recall parsing, which indexes content directly — don't hit `undefined`. The
+  // "default" sentinel is preserved (content stores its value under the "default" key).
+  const surveyLanguageCode = languageCode === "default" ? languageCode : language;
+
+  if (mode === "inline") {
+    if (!containerId) {
+      throw new Error("renderSurvey: containerId is required for inline mode");
+    }
+
+    const element = document.getElementById(containerId);
+    if (!element) {
+      throw new Error(`renderSurvey: Element with id ${containerId} not found.`);
+    }
+
+    // In a dashboard preview, dropdown menus mount inside the preview's contained box instead of
+    // <body>, so customer CSS (which reaches every #fbjs root) cannot lay them over the admin app.
+    // Respondent surfaces have no boundary, so their menus keep mounting in <body>.
+    const portalContainer = props.isPreviewMode ? getPreviewPortalContainer(element) : null;
+    const withPortalContainer = (child: ComponentChild) =>
+      withCustomCssOwner(h(PortalContainerProvider, { value: portalContainer }, child));
+
+    // if survey type is link, we don't pass the placement, overlay, clickOutside, onClose
+    if (props.survey.type === "link") {
+      const {
+        placement: _placement,
+        overlay: _overlay,
+        onClose: _onClose,
+        clickOutside: _clickOutside,
+        ...surveyInlineProps
+      } = props;
+
+      render(
+        withPortalContainer(
+          h(
+            I18nProvider,
+            { language },
+            h(RenderSurvey, {
+              ...surveyInlineProps,
+              languageCode: surveyLanguageCode,
+            })
+          )
+        ),
+        element
+      );
+    } else {
+      // For non-link surveys, pass placement through so it can be used in StackedCard, and onClose so
+      // the host learns the survey closed: RenderSurvey renders nothing once closed, and a host that
+      // never hears about it (the editor preview, which reopens on close) is left with an empty card.
+      const { overlay: _overlay, clickOutside: _clickOutside, ...surveyInlineProps } = props;
+
+      render(
+        withPortalContainer(
+          h(
+            I18nProvider,
+            { language },
+            h(RenderSurvey, {
+              ...surveyInlineProps,
+              languageCode: surveyLanguageCode,
+            })
+          )
+        ),
+        element
+      );
+    }
+  } else {
+    const modalContainer = document.createElement("div");
+    modalContainer.id = "formbricks-modal-container";
+    document.body.appendChild(modalContainer);
+
+    render(
+      withCustomCssOwner(
+        h(
+          I18nProvider,
+          { language },
+          h(RenderSurvey, {
+            ...props,
+            languageCode: surveyLanguageCode,
+          })
+        )
+      ),
+      modalContainer
+    );
+  }
+};
+
+export const renderSurveyModal = renderSurvey;
+
+/**
+ * Sets the CSP nonce for every style element the renderer owns, including the custom CSS ones, which
+ * are re-applied so a stylesheet the browser refused without the nonce gets it now, and the scroll
+ * lock of its menus.
+ */
+export const setNonce = (nonce: string | undefined): void => {
+  setStyleNonce(nonce);
+  syncCustomCssNonce();
+  // The scroll lock of survey-ui's menus injects its own <style> (react-style-singleton), which reads
+  // the nonce from get-nonce.
+  setStyleSingletonNonce(nonce ?? "");
+};
+
+/**
+ * Removes the custom CSS stylesheet, for hosts that tear a survey down without its `onClose` — js-core's
+ * `closeSurvey` on logout or reset — so no stale customer CSS stays in the page.
+ */
+export { removeCustomCss };
+
+export const onFilePick = (files: { name: string; type: string; base64: string }[]) => {
+  const fileUploadEvent = new CustomEvent(FILE_PICK_EVENT, { detail: files });
+  globalThis.dispatchEvent(fileUploadEvent);
+};
+
+// Initialize the global formbricksSurveys object if it doesn't exist
+if (globalThis.window !== undefined) {
+  (globalThis.window as any).formbricksSurveys = {
+    renderSurveyInline,
+    renderSurveyModal,
+    renderSurvey,
+    onFilePick,
+    setNonce,
+    setAppearance,
+    removeCustomCss,
+    // The SDK resolves an app survey's display language through this, so js-core stays free of the
+    // canonical language table this bundle already carries for the renderer. `satisfies` keeps what
+    // is assigned here in step with the declared global (./vite-env.d.ts).
+    resolveSurveyLanguage: resolveSurveyLanguage satisfies NonNullable<
+      Window["formbricksSurveys"]
+    >["resolveSurveyLanguage"],
+  } as typeof globalThis.window.formbricksSurveys;
+}

@@ -1,0 +1,13 @@
+name: Set up image browser validation
+description: Install the repository-pinned browser test runner without building the application
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version-file: .nvmrc
+    - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+    - shell: bash
+      run: pnpm install --frozen-lockfile --ignore-scripts
+    - shell: bash
+      run: timeout --kill-after=10s 420 bash scripts/install-playwright-ci.sh chromium

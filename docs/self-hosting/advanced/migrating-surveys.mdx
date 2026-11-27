@@ -1,0 +1,103 @@
+---
+title: "Migrating Surveys"
+description: "Move surveys from one Formbricks instance to another as Formbricks files: export each survey, import it on the other side, and finish what the file leaves out."
+icon: "right-left"
+---
+
+To move a survey to another instance, export it as a Formbricks file and import the file there. A staging box to production, a self-hosted instance to Formbricks Cloud, one company's instance to another after a split: it works the same way each time. No API keys, no scripts, and no AI. Formbricks files work on every plan.
+
+Pick the path that fits what you're moving:
+
+| You want to move                                      | Use                                                                         |
+| ----------------------------------------------------- | --------------------------------------------------------------------------- |
+| Some surveys, without their responses                 | Formbricks files (this page)                                                |
+| Some surveys, with their responses                    | The management API scripts in [Migrating Survey Responses](/self-hosting/advanced/migrating-survey-responses) |
+| A whole instance: users, organizations, everything    | [Backup and restore](/self-hosting/operate/backup-restore)                  |
+
+<Note>
+  Moving or recovering a whole instance? Use [backup and restore](/self-hosting/operate/backup-restore).
+  Keep databases, permission state, storage, secrets and configuration together. A PostgreSQL dump and
+  an S3 copy alone are not a complete recovery plan.
+</Note>
+
+## What carries over
+
+A Formbricks file carries the survey's content: questions, blocks, endings, welcome card, languages and translations, hidden fields, variables, logic and recall. For app surveys it also carries triggers, display settings and targeting filters, with the actions and contact attributes they use. The import finds those in the target workspace or creates them.
+
+It does not carry:
+
+- **Responses**, displays, contacts and tags. To bring responses along, use [Migrating Survey Responses](/self-hosting/advanced/migrating-survey-responses) instead of this page.
+- **The survey ID.** The imported survey gets a new one, so its link changes.
+- **Styling, survey settings, follow-ups and quotas.**
+- **Images and videos.** The file links to them on the source instance, so they load only while it is up and reachable.
+
+See [What a Formbricks file holds](/surveys/import-export/overview#what-a-formbricks-file-holds) for the full list, and [What the import removes](/surveys/import-export/overview#what-the-import-removes) for the parts a target workspace may not be able to hold.
+
+## Before you start
+
+<Steps>
+  <Step title="Match the versions">
+    Run the same Formbricks version on the target as on the source, or a newer one. A file from a newer
+    version is refused until you update the target.
+  </Step>
+  <Step title="Check your access">
+    On the source, you need to see the surveys; read-only access is enough. On the target, you need write
+    access to the workspace you import into.
+  </Step>
+  <Step title="Allow large uploads on the target">
+    If a reverse proxy sits in front of the target, let request bodies of up to 16 MB through to
+    `/api/internal/surveys/`. See [Self-hosting: proxy body
+    size](/surveys/import-export/overview#self-hosting-proxy-body-size).
+  </Step>
+</Steps>
+
+## Step 1: Export from the source
+
+For each survey, go to **Surveys** on the source instance, click **⋮** on the survey's card, then **Export → Formbricks file (.json)**. The file downloads as `<survey name>.formbricks.json`.
+
+## Step 2: Import into the target
+
+<Steps>
+  <Step title="Open the import dialog">
+    On the target instance, open the workspace, go to **Surveys**, open the **New Survey** menu and choose
+    **Import survey**.
+  </Step>
+  <Step title="Drop the file">
+    Drop the `.formbricks.json` file into the dialog, or click to choose it.
+  </Step>
+  <Step title="Read the report">
+    The review shows the survey and the **Import report**: the actions and attributes the import will create,
+    and anything it removes. Click **Download** to keep a copy.
+  </Step>
+  <Step title="Save and continue">
+    The survey is created as a draft named `<survey name> (imported)` and opens in the editor. Nothing is
+    published.
+  </Step>
+</Steps>
+
+The survey and everything it needs are created together, or not at all. If an import fails, nothing is left behind, and you can fix the problem and try again.
+
+## Step 3: Finish by hand
+
+- **Work through the import report** from the top.
+- **Rename the survey** if you don't want the "(imported)" suffix, then publish it.
+- **Re-point everything that used the old survey ID.** A link survey's URL is
+  `https://your-instance.com/s/<surveyId>`, so every shared link, QR code, email campaign and embed snippet
+  needs the new one. Old links keep working only while the source instance runs.
+- **Rebuild what the file leaves out:** styling, survey settings, follow-ups and quotas.
+- **Replace images and videos** if the source instance is going away.
+- **Check app surveys.** No-code actions the import created still match the source's pages; update them if
+  the target app lives on other URLs. Rebuild any targeting filters the report says were removed before
+  you publish: a live app survey without targeting is shown to everyone. Then point `Formbricks.setup()` at
+  the target: both `workspaceId` and `appUrl` still name the source.
+
+## Moving changes later
+
+**Update** only works in the workspace a survey lives in. The survey you imported has a new ID on the target, so a file exported again from the source doesn't match it: importing that file creates another copy.
+
+To change a migrated survey, edit it on the target. Or export it from the target, edit the file, and import it back there with **Update**. See [Update a survey from a file](/surveys/import-export/overview#update-a-survey-from-a-file).
+
+---
+
+**Need help?** Reach out in
+[GitHub Discussions](https://github.com/formbricks/formbricks/discussions).

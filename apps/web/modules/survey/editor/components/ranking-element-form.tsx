@@ -1,0 +1,285 @@
+"use client";
+
+import { DndContext } from "@dnd-kit/core";
+import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { useAutoAnimate } from "@formkit/auto-animate/react";
+import { createId } from "@paralleldrive/cuid2";
+import { PlusIcon } from "lucide-react";
+import { type JSX, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import type {
+  TSurveyElement,
+  TSurveyElementChoice,
+  TSurveyRankingElement,
+} from "@formbricks/types/surveys/elements";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { TUserLocale } from "@formbricks/types/user";
+import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
+import { ElementFormInput } from "@/modules/survey/components/element-form-input";
+import { ElementOptionChoice } from "@/modules/survey/editor/components/element-option-choice";
+import { type TSetOptionHidden } from "@/modules/survey/editor/components/option-hide-button";
+import { NO_ELEMENT_LOCK, TElementLock } from "@/modules/survey/editor/lib/published-lock";
+import {
+  ensureSpecialChoicesOrder,
+  getShuffleOptionAfterAddingSpecialChoice,
+  getShuffleOptionAfterRemovingSpecialChoice,
+} from "@/modules/survey/editor/lib/special-choices";
+import { Button } from "@/modules/ui/components/button";
+import { Label } from "@/modules/ui/components/label";
+
+interface RankingElementFormProps {
+  readonly localSurvey: TSurvey;
+  readonly element: TSurveyRankingElement;
+  readonly elementIdx: number;
+  readonly updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
+  readonly selectedLanguageCode: string;
+  readonly isInvalid: boolean;
+  readonly locale: TUserLocale;
+  readonly isStorageConfigured: boolean;
+  readonly isExternalUrlsAllowed?: boolean;
+  readonly lock?: TElementLock;
+  /** The Hide quick action on each option (ENG-6949). */
+  readonly onSetOptionHidden?: TSetOptionHidden;
+}
+
+export const RankingElementForm = ({
+  element,
+  elementIdx,
+  updateElement,
+  isInvalid,
+  localSurvey,
+  selectedLanguageCode,
+  locale,
+  isStorageConfigured = true,
+  isExternalUrlsAllowed,
+  lock = NO_ELEMENT_LOCK,
+  onSetOptionHidden,
+}: RankingElementFormProps): JSX.Element => {
+  const { t } = useTranslation();
+  const lastChoiceRef = useRef<HTMLInputElement>(null);
+  const [isInvalidValue, setIsInvalidValue] = useState<string | null>(null);
+
+  const surveyLanguageCodes = extractLanguageCodes(localSurvey.languages);
+  const surveyLanguages = localSurvey.languages ?? [];
+
+  const updateChoice = (choiceIdx: number, updatedAttributes: Partial<TSurveyElementChoice>) => {
+    if (element.choices) {
+      const newChoices = element.choices.map((choice, idx) => {
+        if (idx !== choiceIdx) return choice;
+        return { ...choice, ...updatedAttributes };
+      });
+
+      updateElement(elementIdx, { choices: newChoices });
+    }
+  };
+
+  const hasOtherChoice = element.choices.some((choice) => choice.id === "other");
+
+  const addChoice = (choiceIdx: number) => {
+    const choices = !element.choices ? [] : element.choices;
+
+    const newChoice = {
+      id: createId(),
+      label: createI18nString("", surveyLanguageCodes),
+    };
+
+    updateElement(elementIdx, {
+      choices: ensureSpecialChoicesOrder([
+        ...choices.slice(0, choiceIdx + 1),
+        newChoice,
+        ...choices.slice(choiceIdx + 1),
+      ]),
+    });
+  };
+
+  const addOption = () => {
+    const choices = !element.choices ? [] : element.choices;
+
+    if (choices.length >= 25) {
+      return;
+    }
+
+    const newChoice = {
+      id: createId(),
+      label: createI18nString("", surveyLanguageCodes),
+    };
+
+    updateElement(elementIdx, { choices: ensureSpecialChoicesOrder([...choices, newChoice]) });
+  };
+
+  const addOtherChoice = () => {
+    if (hasOtherChoice || element.choices.length >= 25) return;
+
+    const otherChoice = {
+      id: "other",
+      label: createI18nString(t("common.other"), surveyLanguageCodes),
+    };
+    const nextShuffleOption = getShuffleOptionAfterAddingSpecialChoice(element.shuffleOption);
+
+    updateElement(elementIdx, {
+      choices: ensureSpecialChoicesOrder([...element.choices, otherChoice]),
+      ...(!element.otherOptionPlaceholder && {
+        otherOptionPlaceholder: createI18nString(
+          t("workspace.surveys.edit.please_specify"),
+          surveyLanguageCodes
+        ),
+      }),
+      ...(nextShuffleOption && { shuffleOption: nextShuffleOption }),
+    });
+  };
+
+  const deleteChoice = (choiceIdx: number) => {
+    if (lock.isOptionLocked("choices", element.choices[choiceIdx].id)) return;
+    const newChoices = element.choices.filter((_, idx) => idx !== choiceIdx);
+    const choiceValue = element.choices[choiceIdx].label[selectedLanguageCode];
+
+    if (isInvalidValue === choiceValue) {
+      setIsInvalidValue(null);
+    }
+
+    const nextShuffleOption = getShuffleOptionAfterRemovingSpecialChoice(element.shuffleOption, newChoices);
+
+    updateElement(elementIdx, {
+      choices: newChoices,
+      ...(nextShuffleOption && { shuffleOption: nextShuffleOption }),
+    });
+  };
+
+  useEffect(() => {
+    if (lastChoiceRef.current) {
+      lastChoiceRef.current?.focus();
+    }
+  }, [element.choices?.length]);
+
+  const [parent] = useAutoAnimate();
+
+  return (
+    <form>
+      <ElementFormInput
+        id="headline"
+        value={element.headline}
+        label={t("workspace.surveys.edit.question") + "*"}
+        localSurvey={localSurvey}
+        elementIdx={elementIdx}
+        isInvalid={isInvalid}
+        updateElement={updateElement}
+        locale={locale}
+        isStorageConfigured={isStorageConfigured}
+        focusOnMount={!element.headline?.default || element.headline.default.trim() === ""}
+        isExternalUrlsAllowed={isExternalUrlsAllowed}
+      />
+
+      <div ref={parent}>
+        {element.subheader !== undefined && (
+          <div className="inline-flex w-full items-center">
+            <div className="w-full">
+              <ElementFormInput
+                id="subheader"
+                value={element.subheader}
+                label={t("common.description")}
+                localSurvey={localSurvey}
+                elementIdx={elementIdx}
+                isInvalid={isInvalid}
+                updateElement={updateElement}
+                locale={locale}
+                isStorageConfigured={isStorageConfigured}
+                focusOnMount={!element.subheader?.default || element.subheader.default.trim() === ""}
+                isExternalUrlsAllowed={isExternalUrlsAllowed}
+              />
+            </div>
+          </div>
+        )}
+        {element.subheader === undefined && (
+          <Button
+            size="sm"
+            variant="secondary"
+            className="mt-3"
+            type="button"
+            onClick={() => {
+              updateElement(elementIdx, {
+                subheader: createI18nString("", surveyLanguageCodes),
+              });
+            }}>
+            <PlusIcon className="mr-1 size-4" />
+            {t("workspace.surveys.edit.add_description")}
+          </Button>
+        )}
+      </div>
+
+      <div className="mt-3">
+        <Label htmlFor="choices">{t("workspace.surveys.edit.options")}</Label>
+        <div className="mt-2" id="choices">
+          <DndContext
+            id="ranking-choices"
+            onDragEnd={(event) => {
+              const { active, over } = event;
+
+              if (!active || !over || active.id === "other" || over.id === "other") {
+                return;
+              }
+
+              const activeIndex = element.choices.findIndex((choice) => choice.id === active.id);
+              const overIndex = element.choices.findIndex((choice) => choice.id === over.id);
+
+              const newChoices = [...element.choices];
+
+              newChoices.splice(activeIndex, 1);
+              newChoices.splice(overIndex, 0, element.choices[activeIndex]);
+
+              updateElement(elementIdx, { choices: newChoices });
+            }}>
+            <SortableContext items={element.choices} strategy={verticalListSortingStrategy}>
+              <div className="flex flex-col gap-2" ref={parent}>
+                {element.choices?.map((choice, choiceIdx) => (
+                  <ElementOptionChoice
+                    key={choice.id}
+                    choice={choice}
+                    choiceIdx={choiceIdx}
+                    elementIdx={elementIdx}
+                    updateChoice={updateChoice}
+                    deleteChoice={deleteChoice}
+                    addChoice={addChoice}
+                    isInvalid={isInvalid}
+                    localSurvey={localSurvey}
+                    surveyLanguages={surveyLanguages}
+                    element={element}
+                    updateElement={updateElement}
+                    surveyLanguageCodes={surveyLanguageCodes}
+                    locale={locale}
+                    isStorageConfigured={isStorageConfigured}
+                    lock={lock}
+                    onSetOptionHidden={onSetOptionHidden}
+                  />
+                ))}
+              </div>
+            </SortableContext>
+          </DndContext>
+
+          <div className="mt-2 flex flex-1 items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                type="button"
+                disabled={element.choices?.length >= 25}
+                onClick={() => addOption()}>
+                {t("workspace.surveys.edit.add_option")}
+                <PlusIcon />
+              </Button>
+              {!hasOtherChoice && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  type="button"
+                  disabled={element.choices?.length >= 25}
+                  onClick={addOtherChoice}>
+                  {t("workspace.surveys.edit.add_other")}
+                </Button>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </form>
+  );
+};

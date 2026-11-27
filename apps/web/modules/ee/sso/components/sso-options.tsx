@@ -1,0 +1,72 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { FORMBRICKS_LOGGED_IN_WITH_LS, readLocalStorage } from "@/lib/localStorage";
+import { AzureButton } from "./azure-button";
+import { GithubButton } from "./github-button";
+import { GoogleButton } from "./google-button";
+import { OpenIdButton } from "./open-id-button";
+import { SamlButton } from "./saml-button";
+
+interface SSOOptionsProps {
+  readonly googleOAuthEnabled: boolean;
+  readonly githubOAuthEnabled: boolean;
+  readonly azureOAuthEnabled: boolean;
+  readonly oidcOAuthEnabled: boolean;
+  readonly oidcDisplayName?: string;
+  readonly returnToUrl: string;
+  readonly samlSsoEnabled: boolean;
+  readonly samlConnectionExists: boolean;
+  readonly source: "signin" | "signup";
+}
+
+export const SSOOptions = ({
+  googleOAuthEnabled,
+  githubOAuthEnabled,
+  azureOAuthEnabled,
+  oidcOAuthEnabled,
+  oidcDisplayName,
+  returnToUrl,
+  samlSsoEnabled,
+  samlConnectionExists,
+  source,
+}: SSOOptionsProps) => {
+  const { t } = useTranslation();
+  const [lastLoggedInWith, setLastLoggedInWith] = useState("");
+
+  useEffect(() => {
+    // eslint-disable-next-line react/set-state-in-effect -- localStorage exists only after hydration; the server renders the default
+    setLastLoggedInWith(readLocalStorage(FORMBRICKS_LOGGED_IN_WITH_LS) ?? "");
+  }, []);
+
+  return (
+    <div className="space-y-2">
+      {googleOAuthEnabled && (
+        <GoogleButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Google"} source={source} />
+      )}
+      {githubOAuthEnabled && (
+        <GithubButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Github"} source={source} />
+      )}
+      {azureOAuthEnabled && (
+        <AzureButton returnToUrl={returnToUrl} lastUsed={lastLoggedInWith === "Azure"} source={source} />
+      )}
+      {oidcOAuthEnabled && (
+        <OpenIdButton
+          returnToUrl={returnToUrl}
+          lastUsed={lastLoggedInWith === "OpenID"}
+          text={t("auth.continue_with_oidc", { oidcDisplayName })}
+          source={source}
+        />
+      )}
+      {samlSsoEnabled && (
+        <SamlButton
+          returnToUrl={returnToUrl}
+          lastUsed={lastLoggedInWith === "Saml"}
+          source={source}
+          connectionExists={samlConnectionExists}
+        />
+      )}
+    </div>
+  );
+};

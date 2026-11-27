@@ -1,0 +1,873 @@
+import { randomUUID } from "crypto";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { StorageErrorCode } from "@formbricks/storage";
+import {
+  deleteFile,
+  deleteFilesByWorkspaceId,
+  deleteSurveyUploadFolder,
+  deleteWorkspaceFilesBestEffort,
+  getFileStreamForDownload,
+  getSignedUrlForUpload,
+} from "./service";
+
+// Mock external dependencies
+vi.mock("crypto", () => ({
+  randomUUID: vi.fn(),
+}));
+
+vi.mock("@formbricks/logger", () => ({
+  logger: {
+    error: vi.fn(),
+  },
+}));
+
+vi.mock("@formbricks/storage", () => ({
+  StorageErrorCode: {
+    Unknown: "unknown",
+    S3ClientError: "s3_client_error",
+    S3CredentialsError: "s3_credentials_error",
+    FileNotFoundError: "file_not_found_error",
+    InvalidInput: "invalid_input",
+  },
+  deleteFile: vi.fn(),
+  deleteFilesByPrefix: vi.fn(),
+  getFileStream: vi.fn(),
+  getSignedDownloadUrl: vi.fn(),
+  getSignedUploadUrl: vi.fn(),
+}));
+
+// Import mocked dependencies
+const { logger } = await import("@formbricks/logger");
+const storageModule = await import("@formbricks/storage");
+const {
+  deleteFile: deleteFileFromS3,
+  deleteFilesByPrefix,
+  getSignedUploadUrl,
+  getFileStream,
+} = storageModule;
+type MockedSignedUploadReturn = Awaited<ReturnType<typeof getSignedUploadUrl>>;
+type MockedFileStreamReturn = Awaited<ReturnType<typeof getFileStream>>;
+type MockedDeleteFileReturn = Awaited<ReturnType<typeof deleteFile>>;
+type MockedDeleteFilesByPrefixReturn = Awaited<ReturnType<typeof deleteFilesByPrefix>>;
+
+const mockUUID = "test-uuid-123-456-789-10";
+
+describe("storage service", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(randomUUID).mockReturnValue(mockUUID);
+  });
+
+  describe("getSignedUrlForUpload", () => {
+    test("should generate signed URL for upload with unique filename", async () => {
+      const mockSignedUrlResponse = {
+        ok: true,
+        data: {
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockSignedUrlResponse);
+
+      const result = await getSignedUrlForUpload("test-image.jpg", "env-123", "public");
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data).toEqual({
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+          fileUrl: `/storage/env-123/public/test-image--fid--${mockUUID}.jpg`,
+        });
+      }
+
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        `test-image--fid--${mockUUID}.jpg`,
+        "image/jpeg",
+        "env-123/public",
+        1024 * 1024 * 10 // 10MB default
+      );
+    });
+
+    // The write check for a Signature answer requires exactly this name (`fileNamePattern`), so the
+    // renaming here and the pattern in `uploadElementKinds` have to agree, and the per-kind size cap
+    // has to reach the presigned policy rather than stop at the route.
+    test("should store a signature upload under the name the Signature file name pattern requires, with the cap in the policy", async () => {
+      const { uploadElementKinds } = await import("./survey-upload-elements");
+      vi.mocked(randomUUID).mockReturnValue("0b8a4a3e-1111-4222-8333-444455556666");
+      vi.mocked(getSignedUploadUrl).mockResolvedValue({
+        ok: true,
+        data: { signedUrl: "https://s3.example.com/upload", presignedFields: {} },
+      });
+
+      const result = await getSignedUrlForUpload(
+        "signature.png",
+        "ws-1",
+        "private",
+        uploadElementKinds.signature.maxFileSizeBytes,
+        ["surveys", "survey-1", "elements", "sig-1"]
+      );
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        const storedName = result.data.fileUrl.split("/").pop() ?? "";
+        expect(uploadElementKinds.signature.fileNamePattern.test(storedName)).toBe(true);
+      }
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        "signature--fid--0b8a4a3e-1111-4222-8333-444455556666.png",
+        "image/png",
+        "ws-1/private/surveys/survey-1/elements/sig-1",
+        1024 * 1024
+      );
+    });
+
+    // Regression (ENG-7108): the uploader's own type string used to be signed into the upload, so
+    // `image/png;,text/html` was stored and later served as HTML.
+    test.each([
+      ["photo.PNG", "image/png", "png"],
+      ["report.pdf", "application/pdf", "pdf"],
+      ["sheet.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"],
+    ])("should sign the type derived from the extension of %s", async (fileName, expectedType, ext) => {
+      vi.mocked(getSignedUploadUrl).mockResolvedValue({
+        ok: true,
+        data: { signedUrl: "https://s3.example.com/upload", presignedFields: {} },
+      });
+
+      await getSignedUrlForUpload(fileName, "ws-1", "public");
+
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        expect.stringMatching(new RegExp(String.raw`--fid--.+\.${ext}$`, "i")),
+        expectedType,
+        "ws-1/public",
+        1024 * 1024 * 10
+      );
+    });
+
+    test("should refuse a file whose extension has no allowed type, without signing anything", async () => {
+      const result = await getSignedUrlForUpload("page.html", "ws-1", "public");
+
+      expect(result).toEqual({ ok: false, error: { code: StorageErrorCode.InvalidInput } });
+      expect(getSignedUploadUrl).not.toHaveBeenCalled();
+    });
+
+    test("should return relative URL for private files", async () => {
+      const mockSignedUrlResponse = {
+        ok: true,
+        data: {
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockSignedUrlResponse);
+
+      const result = await getSignedUrlForUpload("test-doc.pdf", "env-123", "private");
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data.fileUrl).toBe(`/storage/env-123/private/test-doc--fid--${mockUUID}.pdf`);
+      }
+    });
+
+    test("should generate scoped private upload URL when path segments are provided", async () => {
+      const mockSignedUrlResponse = {
+        ok: true,
+        data: {
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockSignedUrlResponse);
+
+      const result = await getSignedUrlForUpload("test-doc.pdf", "ws-123", "private", 1024 * 1024 * 10, [
+        "surveys",
+        "survey-123",
+        "elements",
+        "element-123",
+      ]);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data.fileUrl).toBe(
+          `/storage/ws-123/private/surveys/survey-123/elements/element-123/test-doc--fid--${mockUUID}.pdf`
+        );
+      }
+
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        `test-doc--fid--${mockUUID}.pdf`,
+        "application/pdf",
+        "ws-123/private/surveys/survey-123/elements/element-123",
+        1024 * 1024 * 10
+      );
+    });
+
+    test.each(["", ".", "..", "bad segment", "bad/segment", "bad\\segment", "bad?segment", "bad#segment"])(
+      "should reject unsafe scoped private upload path segment %s",
+      async (unsafeSegment) => {
+        const result = await getSignedUrlForUpload("test-doc.pdf", "ws-123", "private", 1024 * 1024 * 10, [
+          "surveys",
+          unsafeSegment,
+        ]);
+
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.error.code).toBe(StorageErrorCode.InvalidInput);
+        }
+        expect(getSignedUploadUrl).not.toHaveBeenCalled();
+      }
+    );
+
+    test("should properly sanitize filenames with special characters like # in URL", async () => {
+      const mockSignedUrlResponse = {
+        ok: true,
+        data: {
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockSignedUrlResponse);
+
+      const result = await getSignedUrlForUpload("test#file.txt", "env-123", "public");
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        // The filename should be URL-encoded to prevent # from being treated as a URL fragment
+        expect(result.data.fileUrl).toBe(`/storage/env-123/public/testfile--fid--${mockUUID}.txt`);
+      }
+
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        `testfile--fid--${mockUUID}.txt`,
+        "text/plain",
+        "env-123/public",
+        1024 * 1024 * 10 // 10MB default
+      );
+    });
+
+    test("should handle files with multiple dots in filename", async () => {
+      const mockSignedUrlResponse = {
+        ok: true,
+        data: {
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockSignedUrlResponse);
+
+      const result = await getSignedUrlForUpload("my.backup.file.pdf", "env-123", "public");
+
+      expect(result.ok).toBe(true);
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        `my.backup.file--fid--${mockUUID}.pdf`,
+        "application/pdf",
+        "env-123/public",
+        1024 * 1024 * 10
+      );
+    });
+
+    test("should use custom maxFileUploadSize when provided", async () => {
+      const mockSignedUrlResponse = {
+        ok: true,
+        data: {
+          signedUrl: "https://s3.example.com/upload",
+          presignedFields: { key: "value" },
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockSignedUrlResponse);
+
+      await getSignedUrlForUpload(
+        "large-file.pdf",
+        "env-123",
+        "public",
+        1024 * 1024 * 50 // 50MB
+      );
+
+      expect(getSignedUploadUrl).toHaveBeenCalledWith(
+        `large-file--fid--${mockUUID}.pdf`,
+        "application/pdf",
+        "env-123/public",
+        1024 * 1024 * 50
+      );
+    });
+
+    test("should return error when getSignedUploadUrl fails", async () => {
+      const mockErrorResponse = {
+        ok: false,
+        error: {
+          code: StorageErrorCode.S3ClientError,
+        },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockErrorResponse);
+
+      const result = await getSignedUrlForUpload("test-file.pdf", "env-123", "public");
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe(StorageErrorCode.S3ClientError);
+      }
+    });
+
+    test("should handle unexpected errors and return unknown error", async () => {
+      vi.mocked(getSignedUploadUrl).mockRejectedValue(new Error("Unexpected error"));
+
+      const result = await getSignedUrlForUpload("test-file.pdf", "env-123", "public");
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe(StorageErrorCode.Unknown);
+      }
+      expect(logger.error).toHaveBeenCalledWith(
+        { error: expect.any(Error) },
+        "Error getting signed url for upload"
+      );
+    });
+
+    test("should return InvalidInput when sanitized filename is empty or invalid", async () => {
+      const mockErrorResponse = {
+        ok: false,
+        error: { code: StorageErrorCode.InvalidInput },
+      } as MockedSignedUploadReturn;
+
+      vi.mocked(getSignedUploadUrl).mockResolvedValue(mockErrorResponse);
+
+      const result = await getSignedUrlForUpload("----.png", "env-123", "public");
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe(StorageErrorCode.InvalidInput);
+      }
+    });
+  });
+
+  describe("deleteFile", () => {
+    test("should call deleteFileFromS3 with correct file key", async () => {
+      const mockSuccessResult = {
+        ok: true,
+        data: undefined,
+      } as MockedDeleteFileReturn;
+
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockSuccessResult);
+
+      const result = await deleteFile("env-123", "public", "test-file.jpg");
+
+      expect(result).toEqual(mockSuccessResult);
+      expect(deleteFileFromS3).toHaveBeenCalledWith("env-123/public/test-file.jpg");
+    });
+
+    test("should handle private access type", async () => {
+      const mockSuccessResult = {
+        ok: true,
+        data: undefined,
+      } as MockedDeleteFileReturn;
+
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockSuccessResult);
+
+      const result = await deleteFile("env-456", "private", "private-doc.pdf");
+
+      expect(result).toEqual(mockSuccessResult);
+      expect(deleteFileFromS3).toHaveBeenCalledWith("env-456/private/private-doc.pdf");
+    });
+
+    test("should handle when deleteFileFromS3 returns error", async () => {
+      const mockErrorResult = {
+        ok: false,
+        error: {
+          code: StorageErrorCode.Unknown,
+        },
+      } as MockedDeleteFileReturn;
+
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockErrorResult);
+
+      const result = await deleteFile("env-123", "public", "test-file.jpg");
+
+      expect(result).toEqual(mockErrorResult);
+      expect(deleteFileFromS3).toHaveBeenCalledWith("env-123/public/test-file.jpg");
+    });
+
+    test("should fall back to fallbackId path when primary returns FileNotFoundError", async () => {
+      const mockNotFound = {
+        ok: false,
+        error: { code: StorageErrorCode.FileNotFoundError },
+      } as MockedDeleteFileReturn;
+      const mockSuccess = { ok: true, data: undefined } as MockedDeleteFileReturn;
+
+      vi.mocked(deleteFileFromS3).mockResolvedValueOnce(mockNotFound).mockResolvedValueOnce(mockSuccess);
+
+      const result = await deleteFile("ws-456", "public", "file.jpg", "env-123");
+
+      expect(result).toEqual(mockSuccess);
+      expect(deleteFileFromS3).toHaveBeenCalledTimes(2);
+      expect(deleteFileFromS3).toHaveBeenNthCalledWith(1, "ws-456/public/file.jpg");
+      expect(deleteFileFromS3).toHaveBeenNthCalledWith(2, "env-123/public/file.jpg");
+    });
+
+    test("should not fall back when primary delete succeeds", async () => {
+      const mockSuccess = { ok: true, data: undefined } as MockedDeleteFileReturn;
+
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockSuccess);
+
+      const result = await deleteFile("ws-456", "public", "file.jpg", "env-123");
+
+      expect(result).toEqual(mockSuccess);
+      expect(deleteFileFromS3).toHaveBeenCalledTimes(1);
+      expect(deleteFileFromS3).toHaveBeenCalledWith("ws-456/public/file.jpg");
+    });
+
+    test("should not fall back on non-FileNotFound errors", async () => {
+      const mockError = {
+        ok: false,
+        error: { code: StorageErrorCode.S3ClientError },
+      } as MockedDeleteFileReturn;
+
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockError);
+
+      const result = await deleteFile("ws-456", "public", "file.jpg", "env-123");
+
+      expect(result).toEqual(mockError);
+      expect(deleteFileFromS3).toHaveBeenCalledTimes(1);
+    });
+
+    // Regression: the key is `${id}/${accessType}/${fileName}`, so a `..` segment would delete
+    // objects outside the workspace prefix the caller was authorized against.
+    test.each([
+      "../../ws-victim/private/secret.pdf",
+      "sub/../../../ws-victim/private/secret.pdf",
+      "%2e%2e/%2e%2e/ws-victim/private/secret.pdf",
+      "./file.jpg",
+      // A bare `%` elsewhere in the name must not stop the encoded traversal being read.
+      "%2e%2e/100%--fid--1.png",
+      "%2e%2e%2f100%--fid--1.png",
+      "a%2f..%2fb",
+    ])("should reject traversal in the file name: %s", async (fileName) => {
+      const result = await deleteFile("ws-456", "public", fileName);
+
+      expect(result.ok).toBe(false);
+      expect(deleteFileFromS3).not.toHaveBeenCalled();
+    });
+
+    // Regression (ENG-3077): the route used to decode the name a second time before calling deleteFile, so
+    // a file with `%` in its name was deleted under a key that does not exist.
+    test.each([
+      ["a literal %20", "Test%20tiara--fid--1.png"],
+      ["a bare %", "100%--fid--1.png"],
+    ])("should delete under the name as given, with %s", async (_label, fileName) => {
+      const mockSuccess = { ok: true, data: undefined } as MockedDeleteFileReturn;
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockSuccess);
+
+      const result = await deleteFile("ws-456", "private", fileName, "env-123");
+
+      expect(result).toEqual(mockSuccess);
+      expect(deleteFileFromS3).toHaveBeenCalledWith(`ws-456/private/${fileName}`);
+    });
+
+    // A backend or proxy that merges `//` or maps `\` to `/` would read these as another survey's key.
+    test.each(["surveys//x/elements/e/f", "/surveys/x/f", "a\\b"])(
+      "should reject an empty segment or a backslash in the file name: %s",
+      async (fileName) => {
+        const result = await deleteFile("ws-456", "private", fileName);
+
+        expect(result).toEqual({ ok: false, error: { code: StorageErrorCode.InvalidInput } });
+        expect(deleteFileFromS3).not.toHaveBeenCalled();
+      }
+    );
+
+    test("should still allow nested file paths without dot segments", async () => {
+      const mockSuccess = { ok: true, data: undefined } as MockedDeleteFileReturn;
+      vi.mocked(deleteFileFromS3).mockResolvedValue(mockSuccess);
+
+      const result = await deleteFile("ws-456", "public", "survey-1/q-2/file.jpg");
+
+      expect(result).toEqual(mockSuccess);
+      expect(deleteFileFromS3).toHaveBeenCalledWith("ws-456/public/survey-1/q-2/file.jpg");
+    });
+  });
+
+  describe("deleteFilesByWorkspaceId", () => {
+    test("should delete files under workspaceId and all environmentId prefixes", async () => {
+      const mockSuccessResult = {
+        ok: true,
+        data: undefined,
+      } as MockedDeleteFilesByPrefixReturn;
+
+      vi.mocked(deleteFilesByPrefix).mockResolvedValue(mockSuccessResult);
+
+      const result = await deleteFilesByWorkspaceId("ws-456", ["env-123", "env-789"]);
+
+      expect(result).toEqual(mockSuccessResult);
+      expect(deleteFilesByPrefix).toHaveBeenCalledTimes(3);
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("ws-456");
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("env-123");
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("env-789");
+    });
+
+    test("should return error if any prefix deletion fails", async () => {
+      const mockSuccessResult = {
+        ok: true,
+        data: undefined,
+      } as MockedDeleteFilesByPrefixReturn;
+
+      const mockErrorResult = {
+        ok: false,
+        error: {
+          code: StorageErrorCode.Unknown,
+        },
+      } as MockedDeleteFilesByPrefixReturn;
+
+      vi.mocked(deleteFilesByPrefix)
+        .mockResolvedValueOnce(mockSuccessResult)
+        .mockResolvedValueOnce(mockErrorResult);
+
+      const result = await deleteFilesByWorkspaceId("ws-456", ["env-123"]);
+
+      expect(result.ok).toBe(false);
+    });
+  });
+
+  // ENG-3197: this is the guarantee both deletion paths lean on. It runs after the database cascade
+  // has committed, so it must never throw, and it must never drop the legacy prefix.
+  describe("deleteWorkspaceFilesBestEffort", () => {
+    const mockSuccessResult = { ok: true, data: undefined } as MockedDeleteFilesByPrefixReturn;
+
+    test("should delete both the workspace prefix and the legacy environment prefix", async () => {
+      vi.mocked(deleteFilesByPrefix).mockResolvedValue(mockSuccessResult);
+
+      await deleteWorkspaceFilesBestEffort({ id: "ws-456", legacyEnvironmentId: "env-123" });
+
+      expect(deleteFilesByPrefix).toHaveBeenCalledTimes(2);
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("ws-456");
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("env-123");
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["null", null],
+      ["undefined", undefined],
+    ])("should not pass a %s legacyEnvironmentId through as a prefix", async (_label, legacyId) => {
+      vi.mocked(deleteFilesByPrefix).mockResolvedValue(mockSuccessResult);
+
+      await deleteWorkspaceFilesBestEffort({ id: "ws-456", legacyEnvironmentId: legacyId });
+
+      expect(deleteFilesByPrefix).toHaveBeenCalledTimes(1);
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("ws-456");
+    });
+
+    test("should log and report failure when the storage call returns an error", async () => {
+      vi.mocked(deleteFilesByPrefix).mockResolvedValue({
+        ok: false,
+        error: { code: StorageErrorCode.S3CredentialsError },
+      });
+
+      await expect(
+        deleteWorkspaceFilesBestEffort({ id: "ws-456", legacyEnvironmentId: null })
+      ).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalled();
+    });
+
+    test("should log and resolve when the storage call rejects", async () => {
+      vi.mocked(deleteFilesByPrefix).mockRejectedValue(new Error("bucket unreachable"));
+
+      await expect(
+        deleteWorkspaceFilesBestEffort({ id: "ws-456", legacyEnvironmentId: "env-123" })
+      ).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalled();
+    });
+  });
+
+  // ENG-3373: runs after a survey delete has committed, so it must never throw; ENG-3612: it reports
+  // the outcome so the cleanup drain can retry.
+  describe("deleteSurveyUploadFolder", () => {
+    test("should delete only the survey's own upload folder", async () => {
+      vi.mocked(deleteFilesByPrefix).mockResolvedValue({
+        ok: true,
+        data: undefined,
+      });
+
+      await expect(deleteSurveyUploadFolder({ workspaceId: "ws-456", surveyId: "survey-1" })).resolves.toBe(
+        true
+      );
+
+      // Must match the key the client upload route writes, and end in "/" so survey-1 cannot also
+      // match survey-10.
+      expect(deleteFilesByPrefix).toHaveBeenCalledTimes(1);
+      expect(deleteFilesByPrefix).toHaveBeenCalledWith("ws-456/private/surveys/survey-1/");
+      expect(logger.error).not.toHaveBeenCalled();
+    });
+
+    test("should log and resolve when the storage call returns an error", async () => {
+      vi.mocked(deleteFilesByPrefix).mockResolvedValue({
+        ok: false,
+        error: { code: StorageErrorCode.S3CredentialsError },
+      });
+
+      await expect(deleteSurveyUploadFolder({ workspaceId: "ws-456", surveyId: "survey-1" })).resolves.toBe(
+        false
+      );
+
+      expect(logger.error).toHaveBeenCalled();
+    });
+
+    test("should log and report failure when the storage call rejects", async () => {
+      vi.mocked(deleteFilesByPrefix).mockRejectedValue(new Error("bucket unreachable"));
+
+      await expect(deleteSurveyUploadFolder({ workspaceId: "ws-456", surveyId: "survey-1" })).resolves.toBe(
+        false
+      );
+
+      expect(logger.error).toHaveBeenCalled();
+    });
+  });
+
+  describe("getFileStreamForDownload", () => {
+    // Regression: `fileName` comes from the `[...filePath]` route param and the key is
+    // `${id}/${accessType}/${fileName}`, so a `..` segment let a caller name an object outside their
+    // own workspace prefix — reachable with no auth at all through the `public/` access type, which
+    // skips authorizePrivateDownload. The `%2e` case is a `%252e%252e` URL after Next's own param decoding:
+    // the name is not decoded into the key, but it is still refused so the guard does not depend on a proxy
+    // or backend leaving `%2e` alone.
+    test.each([
+      "../../ws-victim/private/secret.pdf",
+      "sub/../../../ws-victim/private/secret.pdf",
+      "%2e%2e/%2e%2e/ws-victim/private/secret.pdf",
+      "./secret.pdf",
+      // A bare `%` elsewhere in the name must not stop the encoded traversal being read.
+      "%2e%2e/100%--fid--1.png",
+      "%2e%2e%2f100%--fid--1.png",
+      "a%2f..%2fb",
+    ])("should reject traversal in the file name: %s", async (fileName) => {
+      const result = await getFileStreamForDownload(fileName, "ws-attacker", "public");
+
+      expect(result.ok).toBe(false);
+      expect(getFileStream).not.toHaveBeenCalled();
+    });
+
+    test("should still allow nested file paths without dot segments", async () => {
+      const mockStreamResult = {
+        ok: true,
+        data: { body: new ReadableStream(), contentType: "image/jpeg", contentLength: 1 },
+      } as MockedFileStreamReturn;
+      vi.mocked(getFileStream).mockResolvedValue(mockStreamResult);
+
+      const result = await getFileStreamForDownload("survey-1/q-2/file.jpg", "ws-456", "public");
+
+      expect(result.ok).toBe(true);
+      expect(getFileStream).toHaveBeenCalledWith("ws-456/public/survey-1/q-2/file.jpg");
+    });
+
+    test("should return file stream for public file", async () => {
+      const mockStream = new ReadableStream();
+      const mockStreamResult = {
+        ok: true,
+        data: {
+          body: mockStream,
+          contentType: "image/jpeg",
+          contentLength: 12345,
+        },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockStreamResult);
+
+      const result = await getFileStreamForDownload("test-image.jpg", "env-123", "public");
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data.body).toBe(mockStream);
+        expect(result.data.contentType).toBe("image/jpeg");
+        expect(result.data.contentLength).toBe(12345);
+      }
+      expect(getFileStream).toHaveBeenCalledWith("env-123/public/test-image.jpg");
+    });
+
+    test("should return file stream for private file", async () => {
+      const mockStream = new ReadableStream();
+      const mockStreamResult = {
+        ok: true,
+        data: {
+          body: mockStream,
+          contentType: "application/pdf",
+          contentLength: 54321,
+        },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockStreamResult);
+
+      const result = await getFileStreamForDownload("document.pdf", "env-456", "private");
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data.contentType).toBe("application/pdf");
+      }
+      expect(getFileStream).toHaveBeenCalledWith("env-456/private/document.pdf");
+    });
+
+    // Regression (ENG-3077): the route hands over the name its router already decoded once, and objects
+    // are stored under that name. A second decode turned a stored `%20` into a space (a key that does not
+    // exist) and threw on a bare `%`.
+    test.each([
+      ["a literal %20", "Test%20tiara--fid--1.png"],
+      ["a bare %", "100%--fid--1.png"],
+    ])("should build the key from the name as given, with %s", async (_label, fileName) => {
+      const mockStreamResult = {
+        ok: true,
+        data: { body: new ReadableStream(), contentType: "image/png", contentLength: 1000 },
+      } as MockedFileStreamReturn;
+      vi.mocked(getFileStream).mockResolvedValue(mockStreamResult);
+
+      const result = await getFileStreamForDownload(fileName, "env-123", "private");
+
+      expect(result.ok).toBe(true);
+      expect(getFileStream).toHaveBeenCalledWith(`env-123/private/${fileName}`);
+    });
+
+    test("should retry the fallback id with the same name as given", async () => {
+      vi.mocked(getFileStream)
+        .mockResolvedValueOnce({
+          ok: false,
+          error: { code: StorageErrorCode.FileNotFoundError },
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          data: { body: new ReadableStream(), contentType: "image/png", contentLength: 1 },
+        });
+
+      const result = await getFileStreamForDownload(
+        "Test%20tiara--fid--1.png",
+        "ws-456",
+        "private",
+        "env-123"
+      );
+
+      expect(result.ok).toBe(true);
+      expect(getFileStream).toHaveBeenNthCalledWith(1, "ws-456/private/Test%20tiara--fid--1.png");
+      expect(getFileStream).toHaveBeenNthCalledWith(2, "env-123/private/Test%20tiara--fid--1.png");
+    });
+
+    test("should return error when getFileStream fails with FileNotFoundError and no fallback", async () => {
+      const mockErrorResult = {
+        ok: false,
+        error: {
+          code: StorageErrorCode.FileNotFoundError,
+        },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockErrorResult);
+
+      const result = await getFileStreamForDownload("missing-file.jpg", "env-123", "public");
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe(StorageErrorCode.FileNotFoundError);
+      }
+      expect(getFileStream).toHaveBeenCalledTimes(1);
+    });
+
+    test("should fall back to fallbackId path when primary path returns FileNotFoundError", async () => {
+      const mockErrorResult = {
+        ok: false,
+        error: { code: StorageErrorCode.FileNotFoundError },
+      } as MockedFileStreamReturn;
+
+      const mockStream = new ReadableStream();
+      const mockStreamResult = {
+        ok: true,
+        data: { body: mockStream, contentType: "image/jpeg", contentLength: 5000 },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValueOnce(mockErrorResult).mockResolvedValueOnce(mockStreamResult);
+
+      const result = await getFileStreamForDownload("legacy-file.jpg", "ws-456", "public", "env-123");
+
+      expect(result.ok).toBe(true);
+      expect(getFileStream).toHaveBeenCalledTimes(2);
+      expect(getFileStream).toHaveBeenNthCalledWith(1, "ws-456/public/legacy-file.jpg");
+      expect(getFileStream).toHaveBeenNthCalledWith(2, "env-123/public/legacy-file.jpg");
+    });
+
+    test("should not fall back when primary path succeeds", async () => {
+      const mockStream = new ReadableStream();
+      const mockStreamResult = {
+        ok: true,
+        data: { body: mockStream, contentType: "image/jpeg", contentLength: 5000 },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockStreamResult);
+
+      const result = await getFileStreamForDownload("file.jpg", "ws-456", "public", "env-123");
+
+      expect(result.ok).toBe(true);
+      expect(getFileStream).toHaveBeenCalledTimes(1);
+      expect(getFileStream).toHaveBeenCalledWith("ws-456/public/file.jpg");
+    });
+
+    test("should not fall back on non-FileNotFound errors", async () => {
+      const mockErrorResult = {
+        ok: false,
+        error: { code: StorageErrorCode.S3ClientError },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockErrorResult);
+
+      const result = await getFileStreamForDownload("file.jpg", "ws-456", "public", "env-123");
+
+      expect(result.ok).toBe(false);
+      expect(getFileStream).toHaveBeenCalledTimes(1);
+    });
+
+    test("should return error when getFileStream fails with S3ClientError", async () => {
+      const mockErrorResult = {
+        ok: false,
+        error: {
+          code: StorageErrorCode.S3ClientError,
+        },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockErrorResult);
+
+      const result = await getFileStreamForDownload("some-file.jpg", "env-123", "public");
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe(StorageErrorCode.S3ClientError);
+      }
+    });
+
+    test("should handle unexpected errors and return unknown error", async () => {
+      vi.mocked(getFileStream).mockRejectedValue(new Error("Unexpected S3 error"));
+
+      const result = await getFileStreamForDownload("test-file.jpg", "env-123", "public");
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.error.code).toBe(StorageErrorCode.Unknown);
+      }
+      expect(logger.error).toHaveBeenCalledWith(
+        { error: expect.any(Error) },
+        "Error getting file stream for download"
+      );
+    });
+
+    test("should handle filename with fid pattern", async () => {
+      const mockStream = new ReadableStream();
+      const mockStreamResult = {
+        ok: true,
+        data: {
+          body: mockStream,
+          contentType: "image/jpeg",
+          contentLength: 5000,
+        },
+      } as MockedFileStreamReturn;
+
+      vi.mocked(getFileStream).mockResolvedValue(mockStreamResult);
+
+      const result = await getFileStreamForDownload("photo--fid--abc123-def456.jpg", "env-123", "public");
+
+      expect(result.ok).toBe(true);
+      expect(getFileStream).toHaveBeenCalledWith("env-123/public/photo--fid--abc123-def456.jpg");
+    });
+  });
+});

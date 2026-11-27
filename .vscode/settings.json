@@ -1,0 +1,12 @@
+{
+  "javascript.updateImportsOnFileMove.enabled": "always",
+  // oxlint (oxc.oxc-vscode) runs with the type-aware rules, as `pnpm lint:code` does.
+  "oxc.typeAware": true,
+  "sonarlint.connectedMode.project": {
+    "connectionId": "formbricks",
+    "projectKey": "formbricks_formbricks"
+  },
+  "typescript.preferences.importModuleSpecifier": "non-relative",
+  "typescript.tsdk": "node_modules/typescript/lib",
+  "typescript.updateImportsOnFileMove.enabled": "always"
+}

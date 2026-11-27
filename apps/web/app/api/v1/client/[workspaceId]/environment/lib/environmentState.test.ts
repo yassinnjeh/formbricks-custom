@@ -1,0 +1,519 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { DEFAULT_CREATIVE_STYLE } from "@formbricks/creatives";
+import { prisma } from "@formbricks/database";
+import { logger } from "@formbricks/logger";
+import { TActionClass } from "@formbricks/types/action-classes";
+import { ResourceNotFoundError } from "@formbricks/types/errors";
+import { TJsWorkspaceStateSurvey, TJsWorkspaceStateWorkspaceSetting } from "@formbricks/types/js";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { cache } from "@/lib/cache";
+import { capturePostHogEvent } from "@/lib/posthog";
+import { getOrganizationIdFromWorkspaceId } from "@/lib/utils/helper";
+import { WorkspaceStateData, getWorkspaceStateData } from "./data";
+import { getWorkspaceState } from "./environmentState";
+
+vi.mock("server-only", () => ({}));
+// Banner words come from the dashboard translator (getTranslate); its session-locale lookup is unused here.
+vi.mock("@/lingodotdev/language", () => ({ getLocale: vi.fn() }));
+
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/utils/validate", () => ({ validateInputs: vi.fn() }));
+vi.mock("@/modules/storage/utils", () => ({ resolveStorageUrlsInObject: vi.fn((obj: unknown) => obj) }));
+vi.mock("@/modules/survey/lib/utils", () => ({ transformPrismaSurvey: vi.fn() }));
+
+// Mock dependencies
+vi.mock("@/lib/cache", () => ({
+  cache: {
+    get: vi.fn(),
+    set: vi.fn(),
+  },
+}));
+
+vi.mock("@formbricks/database", () => ({
+  prisma: {
+    workspace: {
+      update: vi.fn(),
+    },
+    project: {
+      findUnique: vi.fn(),
+    },
+  },
+}));
+vi.mock("@formbricks/logger", () => ({
+  logger: {
+    debug: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+vi.mock("./data");
+// `./data` is auto-mocked, which still loads its imports; keep the custom CSS delivery chain and the
+// licence check out of it.
+vi.mock("@/modules/survey/link/lib/respondent-custom-css", () => ({ resolveRespondentCustomCss: vi.fn() }));
+vi.mock("@/modules/ee/license-check/lib/utils", () => ({ getIsCreativesEnabled: vi.fn() }));
+vi.mock("@/app/lib/api/api-backwards-compat", () => ({
+  addLegacyProjectOverwritesToList: vi.fn((surveys: unknown[]) =>
+    surveys.map((survey) => {
+      const typedSurvey = survey as Record<string, unknown>;
+      return {
+        ...typedSurvey,
+        projectOverwrites: typedSurvey.workspaceOverwrites ?? null,
+      };
+    })
+  ),
+  // Same contract as the real helper: an explicitly provided `project` is kept as it is.
+  addLegacyProjectToEnvironmentState: vi.fn((data: Record<string, unknown>) =>
+    "project" in data ? data : { ...data, project: data.workspace }
+  ),
+}));
+vi.mock("@/lib/utils/validate", () => ({ validateInputs: vi.fn() }));
+vi.mock("@/modules/storage/utils", () => ({ resolveStorageUrlsInObject: vi.fn((o: unknown) => o) }));
+vi.mock("@/modules/survey/lib/utils", () => ({ transformPrismaSurvey: vi.fn((s: unknown) => s) }));
+vi.mock("@/lib/constants", () => ({
+  IS_FORMBRICKS_CLOUD: true,
+  RECAPTCHA_SITE_KEY: "mock_recaptcha_site_key",
+  RECAPTCHA_SECRET_KEY: "mock_recaptcha_secret_key",
+  IS_RECAPTCHA_CONFIGURED: true,
+  IS_PRODUCTION: true,
+  ENTERPRISE_LICENSE_KEY: "mock_enterprise_license_key",
+  POSTHOG_KEY: "phc_test_key",
+}));
+
+vi.mock("@/lib/posthog", () => ({
+  capturePostHogEvent: vi.fn(),
+}));
+
+vi.mock("@/lib/utils/helper", () => ({
+  getOrganizationIdFromWorkspaceId: vi.fn().mockResolvedValue("mock-org-id"),
+}));
+
+// Mock @formbricks/cache
+vi.mock("@formbricks/cache", () => ({
+  ErrorCode: {
+    RedisConnectionError: "redis_connection_error",
+    RedisOperationError: "redis_operation_error",
+  },
+  createCacheKey: {
+    workspace: {
+      state: vi.fn((workspaceId: string) => `fb:env:${workspaceId}:state`),
+    },
+  },
+}));
+
+const workspaceId = "test-workspace-id";
+
+const mockWorkspace: TJsWorkspaceStateWorkspaceSetting = {
+  id: workspaceId,
+  recontactDays: 30,
+  inAppSurveyBranding: true,
+  placement: "bottomRight",
+  clickOutsideClose: true,
+  overlay: "none",
+  styling: {
+    allowStyleOverwrite: false,
+  },
+};
+
+const mockSurveys: TSurvey[] = [
+  {
+    id: "survey-app-inProgress",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    name: "App Survey In Progress",
+    type: "app",
+    status: "inProgress",
+    displayLimit: null,
+    endings: [],
+    followUps: [],
+    isBackButtonHidden: false,
+    isVerifyEmailEnabled: false,
+    workspaceOverwrites: null,
+    showLanguageSwitch: false,
+    questions: [],
+    displayOption: "displayOnce",
+    recontactDays: null,
+    autoClose: null,
+    delay: 0,
+    displayPercentage: null,
+    autoComplete: null,
+    singleUse: null,
+    triggers: [],
+    languages: [],
+    pin: null,
+    segment: null,
+    styling: null,
+    surveyClosedMessage: null,
+    hiddenFields: { enabled: false },
+    welcomeCard: { enabled: false, showResponseCount: false, timeToFinish: false },
+    variables: [],
+    createdBy: null,
+    recaptcha: { enabled: false, threshold: 0.5 },
+  } as unknown as TSurvey,
+];
+
+const mockActionClasses = [
+  {
+    id: "action-1",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    name: "Action 1",
+    description: null,
+    type: "code",
+    noCodeConfig: null,
+    workspaceId,
+    key: "action1",
+  },
+] as unknown as TActionClass[];
+
+const mockWorkspaceStateData: WorkspaceStateData = {
+  workspace: {
+    id: workspaceId,
+    appSetupCompleted: true,
+    workspaceSettings: mockWorkspace,
+  },
+  // The fixtures are full surveys; the state carries the respondent shape (compiled custom CSS only).
+  surveys: mockSurveys as unknown as TJsWorkspaceStateSurvey[],
+  actionClasses: mockActionClasses,
+  creatives: [],
+};
+
+describe("getWorkspaceState", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+
+    vi.mocked(cache.get).mockResolvedValue({ ok: true, data: null });
+    vi.mocked(cache.set).mockResolvedValue({ ok: true, data: undefined });
+
+    // Default mocks for successful retrieval
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(mockWorkspaceStateData);
+    vi.mocked(getOrganizationIdFromWorkspaceId).mockResolvedValue("mock-org-id");
+  });
+
+  afterEach(() => {
+    vi.resetAllMocks();
+  });
+
+  test("should return the correct environment state", async () => {
+    const result = await getWorkspaceState(workspaceId);
+
+    // Backwards compat: response includes `project` alongside `workspace`,
+    // and each survey includes `projectOverwrites` alongside `workspaceOverwrites`
+    const surveysWithLegacy = mockSurveys.map((s) => ({
+      ...s,
+      projectOverwrites: (s as Record<string, unknown>).workspaceOverwrites ?? null,
+    }));
+
+    const expectedData = {
+      recaptchaSiteKey: "mock_recaptcha_site_key",
+      surveys: surveysWithLegacy,
+      actionClasses: mockActionClasses,
+      workspace: mockWorkspace,
+      project: mockWorkspace,
+    };
+
+    expect(result.data).toEqual(expectedData);
+    expect(getWorkspaceStateData).toHaveBeenCalledWith(workspaceId);
+    expect(prisma.workspace.update).not.toHaveBeenCalled();
+  });
+
+  test("sends the workspace custom CSS once: not repeated in the legacy project alias (ENG-3552)", async () => {
+    const compiledCss = "@layer fb-workspace { #fbjs .x { color: red !important } }";
+    vi.mocked(getWorkspaceStateData).mockResolvedValue({
+      ...mockWorkspaceStateData,
+      workspace: {
+        ...mockWorkspaceStateData.workspace,
+        workspaceSettings: { ...mockWorkspace, customCss: { light: compiledCss } },
+      },
+    });
+
+    const result = await getWorkspaceState(workspaceId);
+    const data = result.data as typeof result.data & { project: Record<string, unknown> };
+
+    expect(data.workspace.customCss).toEqual({ light: compiledCss });
+    // Old SDKs read `project` and know nothing of custom CSS; everything else in it is unchanged.
+    expect(data.project).toEqual(mockWorkspace);
+    expect(JSON.stringify(data).split(compiledCss)).toHaveLength(2);
+  });
+
+  test("adds creatives only when the workspace has deliverable ones (ENG-3994)", async () => {
+    const creative: WorkspaceStateData["creatives"][number] = {
+      id: "creative-1",
+      type: "feedbackButton",
+      defaultLanguage: "en-US",
+      languages: [{ default: true, enabled: true, language: { code: "en-US", alias: null } }],
+      languageMatch: { keys: {}, bases: {} },
+      surveyLanguageMatch: { keys: {}, bases: {} },
+      autoSelectLanguage: false,
+      style: DEFAULT_CREATIVE_STYLE,
+      content: { label: { "en-US": "Feedback" }, icon: null },
+      position: { desktop: { edge: "right", offset: 50 }, phone: null },
+      destination: { type: "link", url: "https://example.com" },
+      showOn: "pageView",
+      triggers: [],
+      conditions: null,
+      displayPercentage: null,
+      startAt: null,
+      endAt: null,
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue({ ...mockWorkspaceStateData, creatives: [creative] });
+
+    const withCreatives = await getWorkspaceState(workspaceId);
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(mockWorkspaceStateData);
+    const withoutCreatives = await getWorkspaceState(workspaceId);
+
+    expect(withCreatives.data.creatives).toEqual([creative]);
+    // Old SDKs and cached states never see the key unless there is something to show.
+    expect(withoutCreatives.data).not.toHaveProperty("creatives");
+  });
+
+  test("should throw ResourceNotFoundError if workspace not found", async () => {
+    vi.mocked(getWorkspaceStateData).mockRejectedValue(new ResourceNotFoundError("workspace", workspaceId));
+    await expect(getWorkspaceState(workspaceId)).rejects.toThrow(ResourceNotFoundError);
+  });
+
+  test("should throw ResourceNotFoundError if organization not found", async () => {
+    vi.mocked(getWorkspaceStateData).mockRejectedValue(new ResourceNotFoundError("organization", null));
+    await expect(getWorkspaceState(workspaceId)).rejects.toThrow(ResourceNotFoundError);
+  });
+
+  test("should update workspace when app setup not completed", async () => {
+    const incompleteData = {
+      ...mockWorkspaceStateData,
+      workspace: {
+        ...mockWorkspaceStateData.workspace,
+        appSetupCompleted: false,
+      },
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(incompleteData);
+
+    const result = await getWorkspaceState(workspaceId);
+
+    expect(prisma.workspace.update).toHaveBeenCalledWith({
+      where: { id: workspaceId },
+      data: { appSetupCompleted: true },
+    });
+    expect(result.data).toBeDefined();
+  });
+
+  test("should include recaptchaSiteKey if recaptcha variables are set", async () => {
+    const result = await getWorkspaceState(workspaceId);
+
+    expect(result.data.recaptchaSiteKey).toBe("mock_recaptcha_site_key");
+  });
+
+  test("should cache workspace state with the correct key and TTL", async () => {
+    await getWorkspaceState(workspaceId);
+
+    expect(cache.get).toHaveBeenCalledWith(`fb:env:${workspaceId}:state`);
+    expect(cache.set).toHaveBeenCalledWith(
+      `fb:env:${workspaceId}:state`,
+      expect.objectContaining({ data: expect.any(Object) }),
+      60 * 1000
+    );
+  });
+
+  test("bounds database refreshes for a hot workspace while Redis is unavailable", async () => {
+    const outageWorkspaceId = "outage-workspace";
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    vi.mocked(cache.get).mockResolvedValue({ ok: false, error: { code: "redis_connection_error" } });
+
+    await getWorkspaceState(outageWorkspaceId);
+    await getWorkspaceState(outageWorkspaceId);
+    expect(getWorkspaceStateData).toHaveBeenCalledTimes(1);
+    expect(cache.set).not.toHaveBeenCalled();
+
+    clock.mockReturnValue(now + 10_001);
+    await getWorkspaceState(outageWorkspaceId);
+    expect(getWorkspaceStateData).toHaveBeenCalledTimes(2);
+    clock.mockRestore();
+  });
+
+  test("uses Redis again when it recovers after an outage", async () => {
+    const recoveringWorkspaceId = "recovering-workspace";
+    vi.mocked(cache.get).mockResolvedValueOnce({
+      ok: false,
+      error: { code: "redis_connection_error" },
+    });
+
+    const duringOutage = await getWorkspaceState(recoveringWorkspaceId);
+    const recovered = { data: { ...duringOutage.data, recaptchaSiteKey: "recovered" } };
+    vi.mocked(cache.get).mockResolvedValue({ ok: true, data: recovered });
+
+    await expect(getWorkspaceState(recoveringWorkspaceId)).resolves.toEqual(recovered);
+    expect(getWorkspaceStateData).toHaveBeenCalledOnce();
+  });
+
+  test("coalesces concurrent database refreshes during a Redis outage", async () => {
+    vi.mocked(cache.get).mockResolvedValue({ ok: false, error: { code: "redis_connection_error" } });
+    let finishLoad: ((value: WorkspaceStateData) => void) | undefined;
+    vi.mocked(getWorkspaceStateData).mockReturnValue(
+      new Promise<WorkspaceStateData>((resolve) => {
+        finishLoad = resolve;
+      })
+    );
+
+    const first = getWorkspaceState("concurrent-outage-workspace");
+    const second = getWorkspaceState("concurrent-outage-workspace");
+    await vi.waitFor(() => expect(getWorkspaceStateData).toHaveBeenCalledOnce());
+    finishLoad?.(mockWorkspaceStateData);
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(getWorkspaceStateData).toHaveBeenCalledOnce();
+  });
+
+  test("falls back and logs safely when the cache read throws", async () => {
+    vi.mocked(cache.get).mockRejectedValueOnce(new Error("cache read failed"));
+
+    await expect(getWorkspaceState("thrown-read-workspace")).resolves.toHaveProperty("data");
+    expect(getWorkspaceStateData).toHaveBeenCalledOnce();
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.objectContaining({ errName: "Error" }),
+      "Workspace state cache read threw; using outage fallback"
+    );
+    expect(JSON.stringify(vi.mocked(logger.debug).mock.calls)).not.toContain("cache read failed");
+  });
+
+  test("returns fresh state and logs safely when the cache write throws", async () => {
+    vi.mocked(cache.set).mockRejectedValueOnce(new Error("cache write failed"));
+
+    await expect(getWorkspaceState("thrown-write-workspace")).resolves.toHaveProperty("data");
+    expect(getWorkspaceStateData).toHaveBeenCalledOnce();
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ errName: "Error" }),
+      "Workspace state cache write threw"
+    );
+    expect(JSON.stringify(vi.mocked(logger.error).mock.calls)).not.toContain("cache write failed");
+  });
+
+  test("evicts the oldest fallback state when a Redis outage exceeds the local entry limit", async () => {
+    vi.mocked(cache.get).mockResolvedValue({ ok: false, error: { code: "redis_connection_error" } });
+
+    for (let index = 0; index < 101; index += 1) {
+      await getWorkspaceState(`eviction-workspace-${index}`);
+    }
+    expect(getWorkspaceStateData).toHaveBeenCalledTimes(101);
+
+    await getWorkspaceState("eviction-workspace-0");
+    expect(getWorkspaceStateData).toHaveBeenCalledTimes(102);
+  });
+
+  test("should propagate database update errors", async () => {
+    const incompleteData = {
+      ...mockWorkspaceStateData,
+      workspace: {
+        ...mockWorkspaceStateData.workspace,
+        appSetupCompleted: false,
+      },
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(incompleteData);
+    vi.mocked(prisma.workspace.update).mockRejectedValue(new Error("Database error"));
+
+    // Should throw error since Promise.all will fail if database update fails
+    await expect(getWorkspaceState(workspaceId)).rejects.toThrow("Database error");
+  });
+
+  test("should include recaptchaSiteKey when IS_RECAPTCHA_CONFIGURED is true", async () => {
+    const result = await getWorkspaceState(workspaceId);
+
+    expect(result.data).toHaveProperty("recaptchaSiteKey");
+    expect(result.data.recaptchaSiteKey).toBe("mock_recaptcha_site_key");
+  });
+
+  test("should handle different survey types and statuses", async () => {
+    const mixedSurveys = [
+      ...mockSurveys,
+      {
+        ...mockSurveys[0],
+        id: "survey-web-draft",
+        type: "app", // Use valid survey type
+        status: "draft",
+      } as TSurvey,
+      {
+        ...mockSurveys[0],
+        id: "survey-link-completed",
+        type: "link",
+        status: "completed",
+      } as TSurvey,
+    ];
+
+    const modifiedData = {
+      ...mockWorkspaceStateData,
+      surveys: mixedSurveys as unknown as TJsWorkspaceStateSurvey[],
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(modifiedData);
+
+    const result = await getWorkspaceState(workspaceId);
+
+    // Backwards compat: each survey includes `projectOverwrites`
+    const expectedSurveys = mixedSurveys.map((s) => ({
+      ...s,
+      projectOverwrites: (s as Record<string, unknown>).workspaceOverwrites ?? null,
+    }));
+    expect(result.data.surveys).toEqual(expectedSurveys);
+  });
+
+  test("should handle empty surveys array", async () => {
+    const emptyData = {
+      ...mockWorkspaceStateData,
+      surveys: [],
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(emptyData);
+
+    const result = await getWorkspaceState(workspaceId);
+
+    expect(result.data.surveys).toEqual([]);
+  });
+
+  test("should handle empty actionClasses array", async () => {
+    const emptyData = {
+      ...mockWorkspaceStateData,
+      actionClasses: [],
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(emptyData);
+
+    const result = await getWorkspaceState(workspaceId);
+
+    expect(result.data.actionClasses).toEqual([]);
+  });
+
+  test("should capture app_connected PostHog event when app setup completes", async () => {
+    const noCodeAction = {
+      ...mockActionClasses[0],
+      id: "action-2",
+      type: "noCode" as const,
+      key: null,
+    };
+    const incompleteWorkspaceData = {
+      ...mockWorkspaceStateData,
+      workspace: {
+        ...mockWorkspaceStateData.workspace,
+        appSetupCompleted: false,
+      },
+      actionClasses: [...mockActionClasses, noCodeAction],
+    };
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(incompleteWorkspaceData);
+
+    await getWorkspaceState(workspaceId);
+
+    expect(capturePostHogEvent).toHaveBeenCalledWith(
+      workspaceId,
+      "app_connected",
+      {
+        num_surveys: 1,
+        num_code_actions: 1,
+        num_no_code_actions: 1,
+        organization_id: "mock-org-id",
+        workspace_id: workspaceId,
+      },
+      { organizationId: "mock-org-id", workspaceId }
+    );
+  });
+
+  test("should not capture app_connected event when app setup already completed", async () => {
+    vi.mocked(getWorkspaceStateData).mockResolvedValue(mockWorkspaceStateData);
+
+    await getWorkspaceState(workspaceId);
+
+    expect(capturePostHogEvent).not.toHaveBeenCalled();
+  });
+});

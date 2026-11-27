@@ -1,0 +1,78 @@
+import React, { useState } from "react";
+import { cn } from "@/lib/cn";
+
+interface Option<T> {
+  value: T;
+  label: string;
+  /** Disables this option alone, e.g. a level the user can't choose; `disabled` disables them all. */
+  disabled?: boolean;
+}
+
+interface TabToggleProps<T> {
+  id: string;
+  options: Option<T>[];
+  defaultSelected?: T;
+  /** Makes the toggle controlled, for a selection that can also change elsewhere on the page. */
+  value?: T;
+  onChange: (value: T) => void;
+  disabled?: boolean;
+}
+
+export const TabToggle = <T extends string | number>({
+  id,
+  options,
+  defaultSelected,
+  value,
+  onChange,
+  disabled,
+}: Readonly<TabToggleProps<T>>) => {
+  const [uncontrolledOption, setUncontrolledOption] = useState<T | undefined>(defaultSelected);
+  const selectedOption = value ?? uncontrolledOption;
+
+  const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    // The DOM value is always a string; hand back the option's own value so numbers stay numbers.
+    const nextOption = options.find((option) => option.value.toString() === event.target.value);
+    if (!nextOption) return;
+    setUncontrolledOption(nextOption.value);
+    onChange(nextOption.value);
+  };
+
+  return (
+    <div role="radiogroup" aria-labelledby={`${id}-toggle-label`} className="flex flex-col">
+      <div className="mt-1 flex overflow-hidden rounded-md bg-slate-100 p-1">
+        {options.map((option) => {
+          const isDisabled = disabled || option.disabled;
+          return (
+            <label
+              key={option.value}
+              // Scoped by the toggle's id: two toggles with an option of the same value on one page
+              // (the appearance and overlay toggles both have "light"/"dark") must not share ids.
+              htmlFor={`${id}-${option.value.toString()}`}
+              // `relative` keeps the sr-only (absolute) radio inside the label. Without a positioned
+              // ancestor nearby it was placed against the page's outer column, escaped any scrolling
+              // panel's clipping and, below the fold, made the whole page taller (the HTTP request
+              // panel's empty space when scrolled to its end).
+              className={cn(
+                "relative flex-1 cursor-pointer rounded-md py-2 text-center text-sm text-slate-800",
+                selectedOption === option.value && "bg-white",
+                "focus:ring-2 focus:ring-brand-dark/50 focus:outline-hidden",
+                isDisabled && "cursor-not-allowed opacity-50"
+              )}>
+              <input
+                type="radio"
+                name={id}
+                disabled={isDisabled}
+                id={`${id}-${option.value.toString()}`}
+                value={option.value.toString()}
+                checked={selectedOption === option.value}
+                onChange={handleChange}
+                className="sr-only"
+              />
+              {option.label}
+            </label>
+          );
+        })}
+      </div>
+    </div>
+  );
+};

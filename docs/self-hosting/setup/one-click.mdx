@@ -1,0 +1,300 @@
+---
+title: "One-Click Setup"
+description: "How to set up Formbricks instance with a one-click script"
+icon: "rocket"
+---
+
+See [deployment components](/self-hosting/deployment-components) for the stack, managed alternatives and
+the release-specific image inventory.
+
+<Note>
+  The one-click installer supports Debian 12/13 and Ubuntu hosts. Fresh Debian 12 and 13 arm64 Docker-in-Docker
+  containers were verified through app startup and a clean apt update. For other distributions or derivatives,
+  use the [manual Docker setup](/self-hosting/setup/docker).
+</Note>
+
+Use this script to set up Formbricks on a Debian or Ubuntu server. It installs Docker when needed and configures
+Postgres, SpiceDB, Traefik, and an optional SSL certificate.
+
+<Note>
+  This setup uses **Traefik** as a **reverse proxy**, essential for directing incoming traffic to the correct
+  container and enabling secure internet access to Formbricks. Traefik is chosen for its simplicity and
+  automatic SSL management via Let’s Encrypt.
+</Note>
+
+<Warning>
+  The bundled RustFS option in this one-click setup is designed for convenience on a single server. It is a
+  good fit for small-scale or low-complexity self-hosted deployments, but it is not the ideal RustFS
+  architecture for high-availability or larger production environments. For stricter production requirements,
+  use external object storage or run a dedicated RustFS deployment separately from the Formbricks one-click
+  stack.
+</Warning>
+
+<Note>
+  The installer stores generated PostgreSQL, Hub, Cube, and AuthZed credentials in `./formbricks/.env` and
+  restricts the file to `0600`. PostgreSQL has a raw password for the database plus a URL-encoded companion for
+  connection strings. When bundled RustFS is enabled, its generated credentials are stored there too. Keep that
+  file private, include it in your server backup plan, and avoid checking it into source control or copying it to
+  shared locations.
+</Note>
+
+<Note>
+  For better RustFS performance and stability, prefer local SSD or NVMe-backed storage for the host volume
+  behind `rustfs-data`. Avoid NFS and other network filesystems for bundled RustFS data, and use XFS on
+  dedicated storage disks when you manage the host layout yourself.
+</Note>
+
+For other operating systems or a more customized installation, please refer to the advanced installation guide with [Docker](/self-hosting/setup/docker).
+
+### Requirements
+
+- A Debian 12/13 or Ubuntu server with SSH access, `curl`, and a user with `sudo` privileges.
+
+- A custom domain with an **A and/or AAAA record** pointing to your server. Every A and AAAA record on the domain
+  must point to this server: remove any that point elsewhere, such as an AAAA record left over from a previous
+  host or added by default by your DNS provider.
+
+- Ports **80** and **443** are open in your VM's Security Group and host firewall. Traefik serves HTTPS on port
+  443, which Let's Encrypt also uses to validate the SSL certificate, and plain HTTP on port 80 (redirected to
+  HTTPS by default). If your domain has an AAAA record, open both ports for IPv6 too.
+
+### Deployment
+
+Run this command in your terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/formbricks/formbricks/stable/docker/formbricks.sh -o formbricks.sh && chmod +x formbricks.sh && ./formbricks.sh install
+```
+
+<Info>
+  The v6 one-click stack is based on the production Docker Compose file and includes the Formbricks Hub API,
+  `hub-worker`, and Cube as part of the baseline (Cube configuration lives under `formbricks/cube/`). Ensure your
+  generated `formbricks/docker-compose.yml` contains the worker service and a non-empty `HUB_API_KEY`, and that
+  `formbricks/.env` contains `CUBEJS_API_SECRET`, `AUTHZED_TOKEN`, and `AUTHZED_DATABASE_PASSWORD` before
+  treating the stack as ready. The installer generates these values without printing them and restricts `.env`
+  to `0600`. `HUB_API_URL` should normally stay at `http://hub:8080`. Bundled SpiceDB is installed for every new
+  setup and does not require an Enterprise license check.
+</Info>
+
+<Info>
+  The v5 one-click Traefik setup also exposes Hub-backed FeedbackRecords through Formbricks at
+  `/api/v3/feedbackRecords` and `/v1/feedback-records`. Traefik calls the internal Formbricks gateway auth
+  endpoint first, then forwards allowed requests to Hub with the generated `HUB_API_KEY`. Browser callers should
+  request short-lived gateway tokens from `/api/v3/gateway/token` with `{ "service": "feedbackRecords" }`.
+</Info>
+
+### Script Prompts
+
+During installation, the script asks for:
+
+- Permission to remove conflicting legacy packages if Docker is absent. The default keeps them in place.
+- Your app domain and HTTPS choice. For HTTPS, confirm DNS and ports 80/443, then provide a certificate email and choose whether to enable HSTS.
+- Optional SMTP and file-upload configuration.
+
+If Docker is already installed, the script reuses it. Repository setup failures show the apt error and clean up the
+new Docker source. On Debian hosts affected by the old Ubuntu repository entry, the script disables that entry
+before updating apt and prints the path to its backup.
+
+## Update
+
+<span id="add-spicedb-to-an-existing-one-click-installation" />
+
+To upgrade, start with [Upgrade Formbricks](/self-hosting/advanced/upgrade), then follow the
+[one-click runbook](/self-hosting/upgrade/one-click). Don't run `./formbricks.sh update` before you've pinned
+the target version: it pulls whatever the image tag points to, which is `latest` by default. To add SpiceDB to
+an existing installation for 6.0, see the [6.0 setup steps](/self-hosting/upgrade/versions/6.0#first-v6-dependency-setup).
+
+### Limit request bodies on authentication routes
+
+New installations cap request bodies on `/api/auth/*` at 1 MiB in Traefik. An oversized upload to a sign-in or
+OAuth endpoint is refused by Traefik, and a slow one is read in full by Traefik first, so it does not tie up
+Formbricks while it arrives. No legitimate request to these routes comes close to that size. The cap applies to
+requests that go through Traefik, which is every outside request once port `3000` is published on `127.0.0.1` only
+(see [one-click update details](/self-hosting/upgrade/one-click-details)). The update command does not add the cap to an existing installation, so add it yourself
+if you want it.
+
+<Warning>
+  These labels need Traefik v3.6.15 or later. Before that version, the buffering middleware turns the empty
+  redirects that sign-in and SSO callbacks answer with into errors (a `500` or a timeout), so nobody can sign in;
+  Traefik v2.7 also lets paths such as `/x/../api/auth/...` skip the cap. Check the `image: traefik:` line in
+  `formbricks/docker-compose.yml` and upgrade Traefik first (new installations use v3.6.25). From Traefik v2,
+  follow the [v2 to v3 migration guide](https://doc.traefik.io/traefik/migration/v2-to-v3/).
+</Warning>
+
+Since v3.6.7, Traefik accepts encoded characters such as `%2F` in request paths, which would let a request reach
+`/api/auth/*` without passing through these routers. In `formbricks/traefik.yaml`, add this block under `http:` of
+both the `web` and the `websecure` entry point (create `http:` under `web` if it has none). New installations
+already have it.
+
+```yaml
+encodedCharacters:
+  allowEncodedSlash: false
+  allowEncodedBackSlash: false
+  allowEncodedNullCharacter: false
+  allowEncodedSemicolon: false
+  allowEncodedPercent: false
+  allowEncodedQuestionMark: false
+  allowEncodedHash: false
+```
+
+In `formbricks/docker-compose.yml`, add these lines to the `labels` of the `formbricks` service, replacing
+`your-domain.com` with your domain:
+
+```yaml
+- "traefik.http.middlewares.auth-body-limit.buffering.maxRequestBodyBytes=1048576"
+- "traefik.http.middlewares.auth-body-limit.buffering.memRequestBodyBytes=1048576"
+- "traefik.http.routers.formbricks-auth.rule=Host(`your-domain.com`) && PathPrefix(`/api/auth`)"
+- "traefik.http.routers.formbricks-auth.entrypoints=websecure"
+- "traefik.http.routers.formbricks-auth.tls=true"
+- "traefik.http.routers.formbricks-auth.service=formbricks"
+- "traefik.http.routers.formbricks-auth.priority=1000"
+- "traefik.http.routers.formbricks-auth.middlewares=auth-body-limit"
+```
+
+Copy the `tls.certresolver` line from your existing `formbricks` router as well, with the router name changed
+to `formbricks-auth`. If your installation also has a `formbricks_http` router (HSTS disabled), add these lines
+too, or plain-HTTP requests to `/api/auth/*` stay uncapped:
+
+```yaml
+- "traefik.http.routers.formbricks-auth-http.rule=Host(`your-domain.com`) && PathPrefix(`/api/auth`)"
+- "traefik.http.routers.formbricks-auth-http.entrypoints=web"
+- "traefik.http.routers.formbricks-auth-http.service=formbricks"
+- "traefik.http.routers.formbricks-auth-http.priority=1000"
+- "traefik.http.routers.formbricks-auth-http.middlewares=auth-body-limit"
+```
+
+Then apply the changes from the `formbricks` directory. Traefik only reads `traefik.yaml` when it starts, hence the
+restart:
+
+```bash
+docker compose up -d formbricks traefik
+docker compose restart traefik
+```
+
+A request to `/api/auth/*` with a body over 1 MiB now gets `413 Request Entity Too Large` from Traefik.
+
+### IPv6 visitors
+
+If your domain has an AAAA record, visitors who connect over IPv6 keep their own address only when the Compose
+network has IPv6. Without it, Docker hands their connections to Traefik from its bridge gateway (such as
+`172.18.0.1`), so Formbricks sees every IPv6 visitor as that one address. They then share one rate limit, including
+the sign-in limit of 5 attempts per minute, and logs and response metadata record the gateway instead of the
+visitor.
+
+New installations and `./formbricks.sh update` add this to `formbricks/docker-compose.yml` when the server has
+IPv6 and runs Docker Engine 27.0 or later:
+
+```yaml
+networks:
+  default:
+    enable_ipv6: true
+```
+
+The update keeps the previous file as `docker-compose.yml.before-ipv6-network` and recreates the network when it
+restarts the stack. With an older Docker Engine, the script leaves the network as it is and says so: before 27.0,
+Docker cannot create the network without an IPv6 subnet you choose. Upgrade Docker Engine, then run the update
+again. If you have set `networks.default` yourself, the script leaves it alone, so add `enable_ipv6: true` to it
+by hand.
+
+To keep IPv6 off, set `enable_ipv6: false` under `networks.default` in `formbricks/docker-compose.yml`; a later update
+leaves that setting alone. If a container that is not part of Formbricks is attached to the network, the update
+cannot recreate it: it puts the previous file back, says so, and finishes the update without IPv6. Detach that
+container and run the update again.
+
+<Note>
+  This relies on Docker routing IPv6 with `ip6tables`, which is on by default from Docker Engine 27.0. If your
+  daemon runs with `"ip6tables": false` (or `--ip6tables=false`), IPv6 visitors still share one address, the
+  network's IPv6 gateway, even after this change.
+</Note>
+
+## Stop
+
+To stop Formbricks, simply run the following command:
+
+```
+./formbricks.sh stop
+```
+
+The script will automatically stop all the Formbricks related containers and brings the entire stack down.
+
+## Restart
+
+To restart Formbricks, simply run the following command:
+
+```
+./formbricks.sh restart
+```
+
+The script will automatically restart all the Formbricks related containers and brings the entire stack up with the previous configuration.
+
+## Cleanup RustFS init (optional)
+
+During the one-click setup, a temporary `rustfs-init` service configures RustFS (bucket, policy, service
+user). It is idempotent and safe to leave in place; it will do nothing on subsequent starts once the
+configuration exists.
+
+If you prefer to remove the `rustfs-init` service and its references after a successful setup, run:
+
+```
+./formbricks.sh cleanup-rustfs-init
+```
+
+`./formbricks.sh cleanup-minio-init` is still available as a backward-compatible alias.
+
+This only removes the init job and its Compose references; it does not delete any data or affect your RustFS
+configuration.
+
+## Uninstall
+
+To uninstall Formbricks, simply run the following command, but keep in mind that this will delete all your data!
+
+```
+./formbricks.sh uninstall
+```
+
+The script will automatically stop all the Formbricks related containers, remove the Formbricks directory, and delete the Docker network.
+
+## Debug
+
+Run these from the directory that contains your `formbricks/` folder. To see every service, including the
+one-time setup jobs that already exited, run:
+
+```
+./formbricks.sh status
+```
+
+To read the logs of all containers, or of the services you name, run:
+
+```
+./formbricks.sh logs
+./formbricks.sh logs --tail 200 formbricks-migrate
+```
+
+If the first startup stops, the installer names the step that failed and the services that exited with an
+error, along with the `./formbricks.sh logs <service>` command for each. Fix the cause, then run
+`./formbricks.sh install` again. It keeps the PostgreSQL password and AuthZed credentials from the first run.
+
+## Troubleshooting
+
+If you encounter any issues, consider the following steps:
+
+- **Inbound Rules**: Make sure you have added inbound rules for ports 80 and 443 in your VM's Security Group and
+  host firewall: for IPv4 if your domain has an A record, and for IPv6 if it has an AAAA record. Some cloud
+  firewalls, such as AWS Security Groups, need a separate IPv6 rule (source `::/0`).
+
+- **A/AAAA Records**: Verify that your domain's records point to this VM: A records to its IPv4 address, AAAA
+  records to its IPv6 address. Let's Encrypt connects over IPv6 first when an AAAA record exists, so an AAAA
+  record pointing to another server can make certificate issuance fail even when the A record is correct. If
+  your domain has an AAAA record, ports 80 and 443 must also be open for IPv6; with only an AAAA record, there
+  is no IPv4 to fall back to.
+
+- **Check Docker Instances**: Run `./formbricks.sh status` to check the status of every Formbricks container.
+
+- **Check Formbricks Logs**: Run `./formbricks.sh logs <service>` to check the logs of one service, or
+  `./formbricks.sh logs` for the whole stack.
+
+If you have any questions or require help, feel free to reach out to us on [**GitHub Discussions**](https://github.com/formbricks/formbricks/discussions). 😃
+
+## Verify the installation
+
+Run the [deployment check](/self-hosting/setup/deployment-check) in a dedicated workspace before collecting real responses.

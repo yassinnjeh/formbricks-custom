@@ -1,0 +1,84 @@
+---
+title: "Conditional Logic"
+description: "Send different respondents down different paths. Conditional logic reads answers as they come in and decides what happens next."
+icon: "code-branch"
+---
+
+Conditional logic is a set of rules attached to a **block**. Each rule reads *when this is true, then do that* — skip ahead, require an answer, or update a variable.
+
+## Where logic lives
+
+Logic belongs to the block, not to a single question. You add and edit it on the [Flow tab](/surveys/general-features/flow-tab), next to Questions in the survey editor. The Flow tab lists every block with its rules indented under it, so you see the whole survey flow in one place. Click a rule there to open the editor described below.
+
+## Terminology
+
+* **Condition**: a rule that decides whether an action runs.
+
+* **Action**: what happens when the condition is met.
+
+## Building a rule
+
+On the Flow tab, click `Add logic +` under a block, choose **Jump to**, **Set value** or **Mark response as Low quality**, and fill in the sentence: **If** … **Then** …. A Set value step always runs until you give it a condition with **Add a condition**.
+
+Click a rule's row to open it. The row above the editor reads the whole rule as a sentence, with the questions and fields it uses as chips:
+
+![An open rule on the Flow tab: If fee_clarity is 2 or less and fee_surprise equals Yes, then Jump to the Callback block](/images/surveys/general-features/conditional-logic/logic-rule.webp)
+
+<Steps>
+  <Step title="Choose what to test">
+    The **If** row starts with a source. Its list starts with a search box and groups the sources: **Questions** (each with its type icon and question code), **Hidden fields**, **Embedded Data** and **Survey info** such as the page URL or the language.
+  </Step>
+
+  <Step title="Choose an operator">
+    The operators on offer depend on the source. A rating or a number is compared with the symbols `=`, `!=`, `>`, `<`, `>=` and `<=`, or with `Is submitted`. A single-select question can be compared with `Equals`, `Does not equal`, `Equals one of` and `Is submitted`; a free text question adds `Contains`, `Starts with`, `Ends with` and their negations.
+
+    ![The operator list for a rating question, each operator as its symbol: equals, not equal, greater than, less than, greater than or equal, less than or equal, and Is submitted](/images/surveys/general-features/conditional-logic/condition-operators.webp)
+  </Step>
+
+  <Step title="Choose a value">
+    Compare against a fixed value, or against another question's answer, a variable, or a hidden field.
+  </Step>
+
+  <Step title="Choose an action">
+    The **Then** row is what happens when the condition holds.
+
+    ![The Then list of a rule, each action with its icon: Jump to, Set value, Require answer and Mark response as Low quality](/images/surveys/general-features/conditional-logic/action-options.webp)
+  </Step>
+</Steps>
+
+## Actions
+
+* **Set value**: change a variable's value. The result is available to every later question, and to the rules below this one.
+
+* **Require answer**: make an optional question required. Only questions that are optional to begin with can be required this way.
+
+* **Jump to**: send the respondent to a later block or to an ending instead of the next block. Its list offers **Next block** first, then the later **Blocks** by number and the **Endings** by name, each with the icon the Flow tab gives it.
+
+* **Mark response as Low quality**: mark the response Low quality when its answers are implausible, for example *If “hours” is greater than 112 → Mark response as Low quality*. See [Mark as low quality](#mark-as-low-quality).
+
+<Note>
+  A rule can carry several actions. They run in the order they are listed.
+</Note>
+
+## Mark as low quality
+
+Some answers show that a response can't be trusted: someone who streams more than 112 hours a week, or who rates a product they said they never used. A rule with the **Mark response as Low quality** action marks such a response for you, so nobody has to review every response by hand.
+
+* **The respondent sees nothing.** The survey carries on as it would without the rule, and the rule's other actions, such as a jump, still run.
+* **The response is marked like one a reviewer marked.** It shows as Low quality in your responses, it is left out of the [Analysis export](/surveys/analysis/export-responses) by default, and it is removed from Dashboards.
+* **You can restore it.** A response a rule marked is restored like any other Low quality response.
+* **A rule can only mark.** Nothing a respondent does later clears the mark, and a rule never changes a response a reviewer already marked.
+
+The action is available in a block's rules and in the [rules before the first question](/surveys/general-features/flow-tab#rules-before-the-first-question). There it reads URL parameters and hidden fields, for example *If “source” equals “panel-x” → Mark response as Low quality* for a panel source you don't trust: the respondent still answers the whole survey, and the response is marked as soon as it is saved. To keep such respondents out instead, jump to an ending there to screen them out.
+
+## Everyone else
+
+The last line of a block, under its rules and **Add logic**, is **Otherwise go to**. This is the fallback for respondents whom none of the rules sent anywhere, including those who answered nothing, and it is set to the next block unless you change it. It offers the same list as **Jump to**.
+
+## Several conditions in one rule
+
+The trash button beside a condition removes it, and its `⋮` button adds another condition below it, duplicates it, or wraps it in a **group**. Conditions are joined with `and` or `or`: pick one in the small select before the second condition, and the conditions after it repeat your choice. A group is how you mix the two without ambiguity — the same reason brackets exist in arithmetic — and it has its own `⋮` and its own `and`/`or`. Removing the last condition of a rule that jumps or requires an answer removes the rule; a rule that only sets values or marks the response Low quality stays and reads **Always**.
+
+## Several rules in one block
+
+`Add logic +` adds another rule. Rules are evaluated top to bottom, and the first one whose condition holds decides where the respondent goes. Open a rule on the Flow tab and use **Move up** or **Move down** to change the order.

@@ -1,0 +1,97 @@
+import { describe, expect, test } from "vitest";
+import { problemConflict, problemUnprocessableContent, successResponse } from "@/app/api/v3/lib/response";
+import { mcpOutsideGrantResult, responseToMcpToolResult } from "./errors";
+import { ZMcpToolError } from "./tools/output-schemas";
+
+describe("responseToMcpToolResult", () => {
+  test("returns structured success content with the resolved requestId", async () => {
+    const result = await responseToMcpToolResult(successResponse({ id: "s1" }, { requestId: "req_1" }), "fb");
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toEqual({ data: { id: "s1" }, requestId: "req_1" });
+  });
+
+  test("forwards problem details so a 409 tells the agent what to retry with", async () => {
+    // ENG-3069: without this the agent sees "Conflict" and has to re-read the whole survey to
+    // discover the timestamp the error already carried.
+    const response = problemConflict("req_2", "Survey was modified since it was last read", "/api/mcp", {
+      details: {
+        expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+        currentUpdatedAt: "2026-01-02T00:00:00.000Z",
+      },
+    });
+
+    const result = await responseToMcpToolResult(response, "fb");
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      error: {
+        status: 409,
+        code: "conflict",
+        requestId: "req_2",
+        details: {
+          expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+          currentUpdatedAt: "2026-01-02T00:00:00.000Z",
+        },
+      },
+    });
+    // The advertised error schema knows the field too, so a client typing `tools/list` can read it.
+    const error = (result.structuredContent as { error: unknown }).error;
+    expect(ZMcpToolError.safeParse(error).success).toBe(true);
+  });
+
+  test("omits details when the problem has none, and still forwards invalid_params", async () => {
+    const response = problemUnprocessableContent("req_3", "nope", {
+      invalid_params: [{ name: "ops.0.id", reason: "unknown block", code: "dangling_reference" }],
+    });
+
+    const result = await responseToMcpToolResult(response, "fb");
+    const payload = result.structuredContent as { error: Record<string, unknown> };
+
+    expect(payload.error).not.toHaveProperty("details");
+    expect(payload.error.invalid_params).toEqual([
+      { name: "ops.0.id", reason: "unknown block", code: "dangling_reference" },
+    ]);
+  });
+
+  test("omits a details value that is not a plain object", async () => {
+    // The advertised `details` is a record; a body carrying an array or a string must not surface a
+    // value the schema would then reject.
+    for (const details of [[], "not-an-object", null]) {
+      const response = new Response(
+        JSON.stringify({ title: "Conflict", status: 409, detail: "conflict", details }),
+        { status: 409, headers: { "content-type": "application/problem+json" } }
+      );
+
+      const result = await responseToMcpToolResult(response, "fb");
+      const payload = result.structuredContent as { error: Record<string, unknown> };
+
+      expect(payload.error).not.toHaveProperty("details");
+      expect(ZMcpToolError.safeParse(payload.error).success).toBe(true);
+    }
+  });
+
+  test("falls back to the supplied requestId when the body carries none", async () => {
+    const result = await responseToMcpToolResult(new Response("not json", { status: 500 }), "fallback_id");
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: { requestId: "fallback_id", status: 500 } });
+  });
+});
+
+describe("mcpOutsideGrantResult", () => {
+  test("is one not found that names nothing beyond the request id", () => {
+    const NOT_FOUND = {
+      status: 404,
+      title: "Not Found",
+      code: "not_found",
+      detail: "Not found. It doesn't exist, or the user's grant to this MCP client doesn't reach it.",
+      requestId: "req_1",
+    };
+    const hidden = mcpOutsideGrantResult("req_1");
+    expect(hidden.isError).toBe(true);
+    expect(hidden.structuredContent).toEqual({ error: NOT_FOUND });
+    const first = hidden.content?.[0] as { text: string } | undefined;
+    expect(JSON.parse(first?.text ?? "null")).toEqual({ error: NOT_FOUND });
+  });
+});

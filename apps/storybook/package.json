@@ -1,0 +1,28 @@
+{
+  "name": "storybook",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "storybook": "storybook dev -p 6006",
+    "build-storybook": "storybook build",
+    "clean": "rimraf .turbo node_modules dist storybook-static"
+  },
+  "devDependencies": {
+    "@chromatic-com/storybook": "5.0.2",
+    "@formbricks/config-oxlint": "workspace:*",
+    "@formbricks/config-typescript": "workspace:*",
+    "@storybook/addon-a11y": "10.6.2",
+    "@storybook/addon-docs": "10.6.2",
+    "@storybook/addon-links": "10.6.2",
+    "@storybook/addon-onboarding": "10.6.2",
+    "@storybook/react-vite": "catalog:",
+    "@tailwindcss/vite": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "eslint-plugin-storybook": "10.6.2",
+    "storybook": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:"
+  }
+}

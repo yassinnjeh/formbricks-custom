@@ -1,0 +1,287 @@
+import { logger } from "@formbricks/logger";
+import { TResponse, TResponseInput, ZResponseInput } from "@formbricks/types/responses";
+import { parseV1Pagination } from "@/app/api/v1/management/lib/pagination";
+import { resolveBodyIds } from "@/app/api/v1/management/lib/workspace-resolver";
+import { handleApiError } from "@/app/lib/api/handle-api-error";
+import { RequestBodyTooLargeError, parseJsonBodyWithLimit } from "@/app/lib/api/request-body";
+import { responses } from "@/app/lib/api/response";
+import { transformErrorToDetails } from "@/app/lib/api/validator";
+import { withV1ApiWrapper } from "@/app/lib/api/with-api-logging";
+import { sendToPipeline } from "@/app/lib/pipelines";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { RESPONSES_PER_PAGE } from "@/lib/constants";
+import { applyAnonymizePolicy } from "@/lib/response/anonymize";
+import { buildDataByQuestionCode } from "@/lib/response/data-by-question-code";
+import { getSurvey } from "@/lib/survey/service";
+import {
+  SURVEY_ACTION_FOR_METHOD,
+  canApiKeyReachSurveyResource,
+  getApiKeyVisibleSurveyWhere,
+} from "@/lib/survey/visibility/api-key";
+import { getWorkspaceLegacyStoragePrefixes } from "@/lib/workspace/service";
+import { formatValidationErrorsForV1Api, validateResponseData } from "@/modules/api/lib/validation";
+import { resolveStorageUrlsInObject, validateClientFileUploads } from "@/modules/storage/utils";
+import {
+  createResponseWithQuotaEvaluation,
+  getQuestionCodesBySurveyId,
+  getResponses,
+  getResponsesByWorkspaceIds,
+} from "./lib/response";
+
+export const GET = withV1ApiWrapper({
+  handler: async ({ req, authentication }) => {
+    if (!authentication || !("apiKeyId" in authentication)) {
+      return { response: responses.notAuthenticatedResponse() };
+    }
+
+    const searchParams = req.nextUrl.searchParams;
+    const surveyId = searchParams.get("surveyId");
+
+    try {
+      // Inside the try: an over-the-ceiling limit throws a ValidationError that handleApiError turns into a 400.
+      const { limit, offset } = parseV1Pagination(searchParams, { defaultLimit: RESPONSES_PER_PAGE });
+      const allResponses: TResponse[] = [];
+
+      if (surveyId) {
+        const survey = await getSurvey(surveyId);
+        if (!survey) {
+          return {
+            response: responses.notFoundResponse("Survey", surveyId, true),
+          };
+        }
+        if (
+          !(await can(
+            { type: "apiKey", id: authentication.apiKeyId },
+            getWorkspaceAuthorizationActionForMethod("GET"),
+            { type: "workspace", id: survey.workspaceId }
+          )) ||
+          !(await canApiKeyReachSurveyResource(authentication.apiKeyId, "survey.response_read", {
+            type: "survey",
+            id: survey.id,
+          }))
+        ) {
+          return {
+            response: responses.unauthorizedResponse(),
+          };
+        }
+        const surveyResponses = await getResponses(surveyId, limit, offset);
+        allResponses.push(...surveyResponses);
+      } else {
+        const workspaceIds = [
+          ...new Set(authentication.workspacePermissions.map((permission) => permission.workspaceId)),
+        ];
+        const workspaceResponses = await getResponsesByWorkspaceIds(
+          workspaceIds,
+          limit,
+          offset,
+          await getApiKeyVisibleSurveyWhere()
+        );
+        allResponses.push(...workspaceResponses);
+      }
+      const questionCodes = await getQuestionCodesBySurveyId([
+        ...new Set(allResponses.map((r) => r.surveyId)),
+      ]);
+      return {
+        response: responses.successResponse(
+          allResponses.map((r) => {
+            const data = resolveStorageUrlsInObject(r.data);
+            return {
+              ...r,
+              data,
+              // Like the webhook body: the same values keyed by question code.
+              dataByQuestionCode: buildDataByQuestionCode(data, questionCodes.get(r.surveyId) ?? {}),
+            };
+          })
+        ),
+      };
+    } catch (error) {
+      return handleApiError(error);
+    }
+  },
+});
+
+const validateSurvey = async (responseInput: TResponseInput, workspaceId: string) => {
+  const survey = await getSurvey(responseInput.surveyId);
+  if (!survey) {
+    return { error: responses.notFoundResponse("Survey", responseInput.surveyId, true) };
+  }
+  if (survey.workspaceId !== workspaceId) {
+    return {
+      error: responses.badRequestResponse(
+        "Survey is part of another workspace",
+        {
+          workspaceId,
+        },
+        true
+      ),
+    };
+  }
+  return { survey };
+};
+
+/** The request body, or the 413 or 400 response that refuses it. */
+const parseResponseBody = async (
+  req: Request
+): Promise<{ jsonInput: Record<string, unknown> } | { response: Response }> => {
+  try {
+    return { jsonInput: await parseJsonBodyWithLimit<Record<string, unknown>>(req) };
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return {
+        response: responses.payloadTooLargeResponse("Payload Too Large", { error: error.message }),
+      };
+    }
+
+    logger.error({ error, url: req.url }, "Error parsing JSON input");
+    return {
+      response: responses.badRequestResponse("Malformed JSON input, please check your request body"),
+    };
+  }
+};
+
+export const POST = withV1ApiWrapper({
+  handler: async ({ req, auditLog, authentication }) => {
+    if (!authentication || !("apiKeyId" in authentication)) {
+      return { response: responses.notAuthenticatedResponse() };
+    }
+
+    try {
+      const parsedBody = await parseResponseBody(req);
+      if ("response" in parsedBody) return parsedBody;
+      const { jsonInput } = parsedBody;
+
+      // Accept workspaceId as alternative to environmentId — resolve to production environment
+      const resolved = await resolveBodyIds(jsonInput, authentication, "POST");
+      if (!resolved.ok) return { response: resolved.response };
+
+      const inputValidation = ZResponseInput.safeParse(resolved.body);
+      if (!inputValidation.success) {
+        return {
+          response: responses.badRequestResponse(
+            "Fields are missing or incorrectly formatted",
+            transformErrorToDetails(inputValidation.error),
+            true
+          ),
+        };
+      }
+
+      const responseInput = inputValidation.data;
+
+      if (
+        !resolved.alreadyAuthorized &&
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("POST"),
+          { type: "workspace", id: responseInput.workspaceId }
+        ))
+      ) {
+        return { response: responses.unauthorizedResponse() };
+      }
+
+      const surveyResult = await validateSurvey(responseInput, responseInput.workspaceId);
+      if (surveyResult.error) {
+        return {
+          response: surveyResult.error,
+        };
+      }
+
+      // ENG-3282: writing a response writes into its survey, so a restricted survey is out of the key's
+      // reach here as on GET — and with the permission v2's POST requires.
+      if (
+        !(await canApiKeyReachSurveyResource(authentication.apiKeyId, SURVEY_ACTION_FOR_METHOD.POST, {
+          type: "survey",
+          id: surveyResult.survey.id,
+        }))
+      ) {
+        return { response: responses.unauthorizedResponse() };
+      }
+
+      if (
+        !validateClientFileUploads({
+          data: responseInput.data,
+          // Survey-authoritative workspace id (validateSurvey already asserts it equals the
+          // request-body workspaceId); binds the file-upload scope check to the resolved survey.
+          workspaceId: surveyResult.survey.workspaceId,
+          surveyId: surveyResult.survey.id,
+          blocks: surveyResult.survey.blocks,
+          questions: surveyResult.survey.questions,
+          // Management callers replay stored responses whose file URLs may predate the scoped shape;
+          // accept those against a prefix this workspace owns (ENG-1981 review).
+          legacyOwnedStoragePrefixes: await getWorkspaceLegacyStoragePrefixes(
+            surveyResult.survey.workspaceId
+          ),
+        })
+      ) {
+        return {
+          response: responses.badRequestResponse(
+            "Invalid file upload response: each file URL must reference a file uploaded to this survey's file-upload element"
+          ),
+        };
+      }
+
+      // Validate response data against validation rules
+      const validationErrors = validateResponseData(
+        surveyResult.survey.blocks,
+        responseInput.data,
+        responseInput.language ?? "en",
+        surveyResult.survey.questions
+      );
+
+      if (validationErrors) {
+        return {
+          response: responses.badRequestResponse(
+            "Validation failed",
+            formatValidationErrorsForV1Api(validationErrors),
+            true
+          ),
+        };
+      }
+
+      if (responseInput.createdAt && !responseInput.updatedAt) {
+        responseInput.updatedAt = responseInput.createdAt;
+      }
+
+      // "Anonymize responses" is a property of the SURVEY, not of the door a response arrived
+      // through: `ZResponseInput` accepts `meta`, so without this a caller could write ipAddress,
+      // country, userAgent and an unredacted url onto a survey that has the toggle on. The realistic
+      // case is a customer proxying submissions from their own backend, which uses this route rather
+      // than the client one. Applied at the route, matching the client routes, because the survey is
+      // already resolved here and `createResponse` does not load it.
+      responseInput.meta = applyAnonymizePolicy(
+        responseInput.meta,
+        surveyResult.survey.isAnonymizeResponsesEnabled
+      );
+
+      const response = await createResponseWithQuotaEvaluation(responseInput);
+      if (auditLog) {
+        auditLog.targetId = response.id;
+        auditLog.newObject = response;
+      }
+
+      await sendToPipeline({
+        event: "responseCreated",
+        workspaceId: surveyResult.survey.workspaceId,
+        surveyId: response.surveyId,
+        response: response,
+      });
+
+      if (response.finished) {
+        await sendToPipeline({
+          event: "responseFinished",
+          workspaceId: surveyResult.survey.workspaceId,
+          surveyId: response.surveyId,
+          response: response,
+        });
+      }
+
+      return {
+        response: responses.successResponse(response, true),
+      };
+    } catch (error) {
+      return handleApiError(error);
+    }
+  },
+  action: "created",
+  targetType: "response",
+});

@@ -1,0 +1,158 @@
+import "server-only";
+import { Prisma } from "@formbricks/database/prisma";
+import { TJsWorkspaceStateSurvey } from "@formbricks/types/js";
+import { TSegment } from "@formbricks/types/segment";
+import { sanitizeThemeStyling } from "@formbricks/types/styling-values";
+import { TSurvey, TSurveyFilterCriteria } from "@formbricks/types/surveys/types";
+import { withInlinedEmbeddedFields } from "@/lib/embedded-data/survey-fields";
+
+/** The survey row as Prisma returns it, before {@link transformPrismaSurvey} reshapes it. */
+type TPrismaSurveyRead = Record<string, unknown> &
+  Parameters<typeof withInlinedEmbeddedFields>[0] & {
+    segment?: { surveys: { id: string }[] } | null;
+    styling?: Parameters<typeof sanitizeThemeStyling>[0] | null;
+  };
+
+export const transformPrismaSurvey = <T extends TSurvey | TJsWorkspaceStateSurvey>(
+  surveyPrisma: TPrismaSurveyRead
+): T => {
+  let segment: TSegment | null = null;
+
+  if (surveyPrisma.segment) {
+    // The row's segment as Prisma selected it; its relation to surveys is flattened to ids here.
+    segment = {
+      ...surveyPrisma.segment,
+      surveys: surveyPrisma.segment.surveys.map((survey) => survey.id),
+    } as TSegment;
+  }
+
+  const transformedSurvey = {
+    // ENG-1837: swaps the raw `embeddedDataLinks` relation for the inlined `embeddedFields` the read
+    // seam consumes, so the Prisma relation shape never leaks onto TSurvey, and derives the legacy
+    // `variables` / `hiddenFields` from the same rows (ENG-2404). A no-op for surveys read through a
+    // select without the join — those carry no Embedded Data at all.
+    ...withInlinedEmbeddedFields(surveyPrisma),
+    displayPercentage: Number(surveyPrisma.displayPercentage) || null,
+    segment,
+    customHeadScriptsMode: surveyPrisma.customHeadScriptsMode,
+    // Theme values are not validated on write (the API accepts any string, ENG-3723), so a stored value
+    // that could add CSS (ENG-2950) is dropped here, before it reaches the editor, its previews or an API
+    // read. The renderer drops the same values, so nothing a respondent sees changes.
+    ...(surveyPrisma.styling && { styling: sanitizeThemeStyling(surveyPrisma.styling) }),
+  } as T;
+
+  return transformedSurvey;
+};
+
+// Status + archived (soft-delete) handling.
+// Archived surveys (archivedAt not null) are hidden by default. The "Archived" filter sets
+// includeArchived; the server never receives a real "archived" status.
+const buildStatusArchivedClauses = (filterCriteria?: TSurveyFilterCriteria): Prisma.SurveyWhereInput[] => {
+  const hasStatusFilter = Boolean(filterCriteria?.status?.length);
+
+  if (filterCriteria?.includeArchived) {
+    if (hasStatusFilter) {
+      // Selected active statuses OR any archived survey (Archived behaves like an extra status).
+      return [
+        { OR: [{ status: { in: filterCriteria.status }, archivedAt: null }, { archivedAt: { not: null } }] },
+      ];
+    }
+    // Only archived surveys.
+    return [{ archivedAt: { not: null } }];
+  }
+
+  // Default: exclude archived surveys, optionally narrowing to the selected statuses.
+  const clauses: Prisma.SurveyWhereInput[] = [{ archivedAt: null }];
+  if (hasStatusFilter) {
+    clauses.push({ status: { in: filterCriteria!.status } });
+  }
+  return clauses;
+};
+
+const buildCreatedByClause = (
+  createdBy?: TSurveyFilterCriteria["createdBy"]
+): Prisma.SurveyWhereInput | null => {
+  // Only a single-value createdBy filter maps to a clause ("you" or "others").
+  if (createdBy?.value?.length !== 1) {
+    return null;
+  }
+
+  if (createdBy.value[0] === "you") {
+    return { createdBy: createdBy.userId };
+  }
+  if (createdBy.value[0] === "others") {
+    return { OR: [{ createdBy: { not: createdBy.userId } }, { createdBy: null }] };
+  }
+  return null;
+};
+
+/**
+ * `singleUse` is a nullable JSON column, so the "not single-use" side has to say NULL out loud:
+ * `NOT (singleUse->enabled = true)` is NULL, not true, for a NULL column, a JSON `null` or an object
+ * without `enabled`, and would drop exactly the surveys it should keep. The path's `DbNull` covers all
+ * three (`singleUse #> '{enabled}' IS NULL`).
+ */
+const buildSingleUseClause = (singleUse: boolean): Prisma.SurveyWhereInput => {
+  const isSingleUse: Prisma.SurveyWhereInput = { singleUse: { path: ["enabled"], equals: true } };
+  if (singleUse) return isSingleUse;
+  return { OR: [{ singleUse: { path: ["enabled"], equals: Prisma.DbNull } }, { NOT: isSingleUse }] };
+};
+
+/** An empty PIN asks for nothing, so it counts as no PIN, as everywhere a survey's `pin` is read. */
+const buildPinProtectedClause = (pinProtected: boolean): Prisma.SurveyWhereInput =>
+  pinProtected
+    ? { AND: [{ pin: { not: null } }, { pin: { not: "" } }] }
+    : { OR: [{ pin: null }, { pin: "" }] };
+
+export const buildWhereClause = (filterCriteria?: TSurveyFilterCriteria) => {
+  const whereClause: Prisma.SurveyWhereInput["AND"] = [];
+
+  // for name
+  if (filterCriteria?.name) {
+    whereClause.push({ name: { contains: filterCriteria.name, mode: "insensitive" } });
+  }
+
+  whereClause.push(...buildStatusArchivedClauses(filterCriteria));
+
+  // for type
+  if (filterCriteria?.type?.length) {
+    whereClause.push({ type: { in: filterCriteria.type } });
+  }
+
+  // for createdBy
+  const createdByClause = buildCreatedByClause(filterCriteria?.createdBy);
+  if (createdByClause) {
+    whereClause.push(createdByClause);
+  }
+
+  if (filterCriteria?.singleUse !== undefined) {
+    whereClause.push(buildSingleUseClause(filterCriteria.singleUse));
+  }
+
+  if (filterCriteria?.pinProtected !== undefined) {
+    whereClause.push(buildPinProtectedClause(filterCriteria.pinProtected));
+  }
+
+  return { AND: whereClause };
+};
+
+export const buildOrderByClause = (
+  sortBy?: TSurveyFilterCriteria["sortBy"]
+): Prisma.SurveyOrderByWithRelationInput[] | undefined => {
+  const orderMapping: { [key: string]: Prisma.SurveyOrderByWithRelationInput } = {
+    name: { name: "asc" },
+    createdAt: { createdAt: "desc" },
+    updatedAt: { updatedAt: "desc" },
+  };
+
+  return sortBy ? [orderMapping[sortBy] || { updatedAt: "desc" }] : undefined;
+};
+
+export const anySurveyHasFilters = (surveys: TSurvey[]): boolean => {
+  return surveys.some((survey) => {
+    if ("segment" in survey && survey.segment) {
+      return survey.segment.filters && survey.segment.filters.length > 0;
+    }
+    return false;
+  });
+};

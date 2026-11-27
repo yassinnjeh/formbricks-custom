@@ -1,0 +1,41 @@
+---
+title: "Test an API key"
+description: "Verify a key and inspect the workspace it can access."
+icon: "key"
+---
+
+<span id="mandatory-headers" />
+<span id="request" />
+
+Send a server-side request to your instance. For a key scoped to exactly one workspace:
+
+```bash
+curl --fail-with-body 'https://<your-formbricks-domain>/api/v1/management/me'   --header 'x-api-key: <your-api-key>'
+```
+
+<span id="response" />
+
+A successful `200` response has this shape:
+
+```json
+{
+  "id": "legacy-environment-id-or-workspace-id",
+  "type": "production",
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "updatedAt": "2026-01-01T00:00:00.000Z",
+  "appSetupCompleted": true,
+  "workspace": { "id": "workspace-id", "name": "My workspace" },
+  "project": { "id": "workspace-id", "name": "My workspace" }
+}
+```
+
+`project` and the top-level legacy environment ID are retained for v1 compatibility.
+
+- `401`: check the key and instance URL.
+- `400`: this legacy endpoint requires exactly one workspace scope. Use `GET /api/v2/me` for an
+  organization-only or multi-workspace key **with organization read access**. Without that permission,
+  `/api/v2/me` returns `401` even for a valid key. Test an authorized workspace endpoint instead; do not
+  broaden the key just to run this check.
+- `403` on another endpoint: inspect its required scopes and the key's workspace access.
+
+See [key setup](/api-reference/generate-key). Keep keys out of client-side code and shared logs.

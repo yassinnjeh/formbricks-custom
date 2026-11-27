@@ -1,0 +1,73 @@
+---
+title: "Schedule A Meeting"
+description: "The Schedule A Meeting question type allows respondents to book a meeting by selecting a date and time. It includes a title to guide the respondent, along with an optional description to provide additional context for the meeting setup."
+icon: "calendar-check"
+---
+
+<iframe
+  title="Survey Embed"
+  src="https://app.formbricks.com/s/hx08x27c2aghywh57rroe6fi"
+  style={{
+    position: "relative",
+    height: "600px",
+    maxHeight: "100vh",
+    width: "100%",
+    border: 0,
+    borderRadius: "12px",
+    overflow: "auto",
+  }}
+/>
+
+## Elements
+
+![Schedule a call](/images/surveys/question-type/schedule-a-meeting/editor.webp)
+
+### Title
+
+Add a clear title to inform the respondent what information you are asking for.
+
+### Description
+
+Provide an optional description with further instructions.
+
+### Cal.com Username/Event
+
+Add an input box where users can enter their [`cal.com`](https://cal.com/) username and event URL (e.g., `username/event`).
+
+### Custom Hostname (Optional)
+
+Enable an input box for adding a custom hostname, which is necessary if using a self-hosted instance of [`cal.com`](https://cal.com/docs/self-hosting/installation).
+
+## Response data
+
+The answer to a Schedule a meeting question is the string `booked`. It is the same in the response `data`, in webhooks, in exports and in the v1 and v2 APIs, so nothing that reads it needs to change. A respondent who skips the question has no value for it.
+
+When the respondent booked, the details Cal.com reported are kept beside the answer:
+
+- In a webhook, they are under `calBookingsByQuestionId`, keyed by Question ID. See [Cal.com booking details](/platform/features/integrations/webhooks#cal-com-booking-details).
+- In the [v3 responses API](/api-v3-reference/introduction), the `cal` answer carries an optional `booking` object.
+
+```json
+{
+  "status": "booked",
+  "uid": "mWd8k2xYpQ",
+  "title": "Intro call between Alex and Sam",
+  "startTime": "2026-11-05T10:00:00.000Z",
+  "endTime": "2026-11-05T10:30:00.000Z",
+  "eventTypeId": "42",
+  "bookingStatus": "ACCEPTED",
+  "paymentRequired": "false",
+  "isRecurring": "false",
+  "videoCallUrl": "https://app.cal.com/video/mWd8k2xYpQ"
+}
+```
+
+All values are strings. A field is left out when Cal.com did not send it. `status` is always `booked`: Cal.com's own state, such as `PENDING`, is in `bookingStatus`, and `paymentRequired` says whether a payment is still open.
+
+<Note>
+  The booking is reported by the respondent's browser and is not verified. Check the `uid` with Cal.com before you act on it.
+</Note>
+
+<Note>
+  The details show the booking at the moment it was made. A reschedule or cancellation in Cal.com later is not reflected. A recurring booking holds its first occurrence. A self-hosted Cal.com that predates the current embed only reports the start time and duration, so `startTime` and `endTime` are all you get from it. A response recorded before the details were kept, or by an older survey renderer, has the answer `booked` and no details.
+</Note>

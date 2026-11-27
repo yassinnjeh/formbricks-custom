@@ -1,0 +1,59 @@
+---
+title: "Architecture and scaling"
+description: "Operate a multi-replica deployment with shared data and explicit availability limits."
+icon: "circle-nodes"
+---
+
+<span id="architecture" />
+<span id="component-description" />
+<span id="cube-is-part-of-the-baseline" />
+<span id="edge-rate-limiting-must-exist-somewhere" />
+<span id="hub-is-mandatory" />
+<span id="kubernetes-setup" />
+<span id="overview" />
+<span id="requirements" />
+<span id="v5-cluster-notes" />
+
+Run app replicas behind your ingress and share the same databases, queues, permission engine and
+object storage. Start with [Kubernetes installation](/self-hosting/setup/kubernetes) and the
+[component inventory](/self-hosting/operate/components).
+
+```mermaid
+graph TD
+    Edge["Ingress and rate limits"] --> App["Formbricks app replicas"]
+    App --> DB["Application PostgreSQL"]
+    App --> Redis["Redis / Valkey"]
+    App --> Spice["SpiceDB"]
+    Spice --> AuthDB["Dedicated permission database"]
+    App --> Hub["Hub API and workers"]
+    Hub --> DB
+    App --> Cube["Cube"]
+    Cube --> DB
+    App --> Files["S3-compatible storage"]
+```
+
+Hub can use a separate database. App workers use Redis; Hub workers use PostgreSQL.
+SpiceDB is required for permission decisions and has no legacy authorization fallback.
+
+## Availability
+
+- Run multiple app replicas across nodes, with capacity for a failed node and a rolling restart.
+- Configure disruption budgets, readiness and your managed datastores for the availability you need.
+- Monitor dependency health and permission checks as well as `/health`.
+
+Multiple replicas do not guarantee uninterrupted upgrades. Database, permission-schema and queue
+changes may require maintenance. Follow the [Kubernetes upgrade procedure](/self-hosting/upgrade/kubernetes) in a maintenance window.
+
+## Scaling
+
+Watch CPU, memory, database connections and [queue depth](/self-hosting/configuration/job-runner)
+separately. The default app HPA scales on CPU and memory, not backlog. Limit replicas to available
+node and database capacity. Use the [sizing guidance](/self-hosting/overview) as a starting point,
+then measure your workload.
+
+<span id="redis-configuration" />
+<span id="s3-configuration" />
+
+All replicas need the same configuration, secrets and asset storage. Configure
+[Redis](/self-hosting/configuration/environment-variables) and [file uploads](/self-hosting/configuration/file-uploads)
+once for the deployment, not separately per replica.

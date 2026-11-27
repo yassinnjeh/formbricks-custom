@@ -1,0 +1,91 @@
+"use client";
+
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { SubmitHandler, useForm } from "react-hook-form";
+import { toast } from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { z } from "zod";
+import { ZOrganization } from "@formbricks/types/organizations";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { createOrganization } from "@/modules/setup/organization/lib/api-client";
+import { Button } from "@/modules/ui/components/button";
+import { FormControl, FormError, FormField, FormItem, FormProvider } from "@/modules/ui/components/form";
+import { Input } from "@/modules/ui/components/input";
+
+const ZCreateOrganizationFormSchema = ZOrganization.pick({ name: true });
+type TCreateOrganizationForm = z.infer<typeof ZCreateOrganizationFormSchema>;
+
+/**
+ * `skipInviteStep` is true where the user-management floor is `disabled`: nobody may invite, so the
+ * onboarding invite page would only 404 (ENG-6812).
+ */
+export const CreateOrganization = ({ skipInviteStep }: Readonly<{ skipInviteStep: boolean }>) => {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const form = useForm<TCreateOrganizationForm>({
+    defaultValues: {
+      name: "",
+    },
+    mode: "onChange",
+    resolver: zodResolver(ZCreateOrganizationFormSchema),
+  });
+
+  const organizationName = form.watch("name");
+
+  const onSubmit: SubmitHandler<TCreateOrganizationForm> = async () => {
+    setIsSubmitting(true);
+    try {
+      const organization = await createOrganization(organizationName);
+      router.push(skipInviteStep ? "/" : `/setup/organization/${organization.id}/invite`);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong")));
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <FormProvider {...form}>
+      <form
+        className="w-full"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void form.handleSubmit(onSubmit)(e);
+        }}>
+        <div className="flex flex-col items-center gap-y-4">
+          <h2 className="text-2xl font-medium">{t("setup.organization.create.title")}</h2>
+          <p>{t("setup.organization.create.description")}</p>
+          <FormField
+            control={form.control}
+            name="name"
+            render={({ field }) => (
+              <FormItem className="w-full max-w-80">
+                <FormControl>
+                  <Input
+                    {...field}
+                    isInvalid={Boolean(form.formState.errors.name)}
+                    placeholder="e.g., Acme Inc"
+                    className="w-full"
+                    required
+                  />
+                </FormControl>
+
+                <FormError />
+              </FormItem>
+            )}
+          />
+          <Button
+            type="submit"
+            className="flex w-full max-w-80 justify-center"
+            loading={isSubmitting}
+            disabled={isSubmitting || organizationName.trim() === ""}>
+            {t("setup.organization.create.continue")}
+          </Button>
+        </div>
+      </form>
+    </FormProvider>
+  );
+};

@@ -1,0 +1,607 @@
+import { withSentryConfig } from "@sentry/nextjs";
+import createJiti from "jiti";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+// Single source of truth for image-optimizer hosts (ENG-1678); shared with the runtime
+// `isExternalImageSrc` check in lib/image-hosts.ts so remotePatterns and the per-<Image>
+// `unoptimized` decision can never drift apart.
+import { LOOPBACK_HOSTS, OPTIMIZABLE_IMAGE_HOSTS } from "./lib/optimizable-image-hosts.mjs";
+
+const jiti = createJiti(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
+jiti("./lib/env");
+
+// The policy of the paths proxy.ts does not run on (see the first `headers()` rules).
+const ASSET_PATH_CSP =
+  "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
+
+// Shared by every cacheable `/js/*` rule below (the bundles, the locale JSON, the signature font), so a
+// change to how they are cached or shared cross-origin lands on all of them at once.
+const JS_ASSET_CACHE_CONTROL =
+  "public, max-age=3600, s-maxage=2592000, stale-while-revalidate=3600, stale-if-error=86400";
+const JS_ASSET_CORS_HEADERS = [
+  { key: "Access-Control-Allow-Origin", value: "*" },
+  { key: "Vary", value: "Accept-Encoding" },
+];
+
+// NOTE: every `process.env.*` read in this file shapes the build output and MUST be listed in the
+// `build.env` array of apps/web/turbo.json — the web build's own task config since ENG-1682, not the
+// root turbo.json — so Turborepo hashes it into the cache key. Adding a read here without updating
+// that file serves stale cached builds — from the local Turbo cache and the CI build-output cache
+// alike. Enforced by lib/turbo-build-env.test.ts. Read env vars directly (`process.env.<NAME>` or
+// `process.env["<NAME>"]`), not via destructuring, so that guardrail can detect them.
+/** @type {import('next').NextConfig} */
+
+const nextConfig = {
+  deploymentId: process.env.FORMBRICKS_DEPLOYMENT_ID || undefined,
+  assetPrefix: process.env.ASSET_PREFIX_URL || undefined,
+  allowedDevOrigins: process.env.NODE_ENV === "production" ? undefined : LOOPBACK_HOSTS,
+  basePath: process.env.BASE_PATH || undefined,
+  output: "standalone",
+  poweredByHeader: false,
+  // The Webhook Secret URL token is a credential (ADR 0057); keep `next dev`'s request log from
+  // printing it. Production never logs incoming requests.
+  logging: {
+    incomingRequests: { ignore: [/\/api\/v3\/workflows\/[^/]+\/webhook\/[^/]+$/] },
+  },
+  // Enable source maps only when uploading to Sentry (CI/production); skip for faster local builds
+  productionBrowserSourceMaps: !!process.env.SENTRY_AUTH_TOKEN,
+  serverExternalPackages: [
+    "@authzed/authzed-node",
+    "@aws-sdk",
+    "@grpc/grpc-js",
+    "@opentelemetry/api",
+    "@opentelemetry/auto-instrumentations-node",
+    "@opentelemetry/exporter-metrics-otlp-http",
+    "@opentelemetry/exporter-prometheus",
+    "@opentelemetry/exporter-trace-otlp-http",
+    "@opentelemetry/instrumentation",
+    "@opentelemetry/resources",
+    "@opentelemetry/sdk-metrics",
+    "@opentelemetry/sdk-node",
+    "@opentelemetry/sdk-trace-base",
+    "@opentelemetry/semantic-conventions",
+    "@prisma/instrumentation",
+    "bullmq",
+    "ioredis",
+    // Custom CSS processor (modules/custom-css/processor): loads a native binary per platform.
+    "lightningcss",
+    "pino",
+    "pino-pretty",
+    "pino-opentelemetry-transport",
+    "posthog-node",
+    "typeorm",
+  ],
+  // Jackson is configured exclusively with PostgreSQL (modules/ee/auth/saml/lib/jackson.ts).
+  // TypeORM's lazy SQL Server driver traces unused mssql/tedious code and vulnerable sprintf-js.
+  outputFileTracingExcludes: {
+    "/*": ["../../**/node_modules/{mssql,tedious,sprintf-js}/**/*"],
+  },
+  outputFileTracingIncludes: {
+    "/api/auth/**/*": ["../../node_modules/jose/**/*"],
+    // pino loads transport code in worker threads via dynamic require() — the file tracer
+    // only traces static imports and misses these runtime-loaded files.
+    // Include the full pino package (worker.js needs transport-stream.js, etc.)
+    // and its transport targets with their dependencies.
+    "/*": [
+      "../../node_modules/pino/**/*",
+      "../../node_modules/pino-opentelemetry-transport/**/*",
+      "../../node_modules/pino-abstract-transport/**/*",
+      "../../node_modules/otlp-logger/**/*",
+      // lightningcss picks its native package at runtime (require of "lightningcss-<platform>"),
+      // which the tracer cannot follow; only the package matching the build's platform/libc is
+      // installed (glibc in the Debian image), so the wildcard copies exactly that one.
+      "../../node_modules/lightningcss/**/*",
+      "../../node_modules/lightningcss-*/**/*",
+      "../../node_modules/detect-libc/**/*",
+    ],
+  },
+  turbopack: {},
+  experimental: {
+    // With patches/next@16.4.5.patch applied, Next clones no request body for proxy.ts or for an external
+    // rewrite such as the PostHog /ingest proxy (ENG-3972), so this only bounds the body Next hands an
+    // edge-runtime function, and this app has none. Kept as the fallback for a Next without the patch, which
+    // would clone again and cut bodies off at this size, so the import routes keep their limits below it.
+    proxyClientMaxBodySize: "16mb",
+  },
+  transpilePackages: ["@formbricks/database", "@formbricks/workflows"],
+  images: {
+    // Optimize image processing to reduce CPU time and prevent timeouts
+    deviceSizes: [640, 750, 828, 1080, 1200, 1920], // Removed 3840 to avoid processing huge images
+    imageSizes: [16, 32, 48, 64, 96, 128, 256, 384], // Standard sizes for smaller images
+    formats: ["image/webp"], // WebP is faster to process and smaller than JPEG/PNG
+    minimumCacheTTL: 60, // Cache optimized images for at least 60 seconds
+    dangerouslyAllowSVG: true, // Allow SVG images
+    // Only universal provider/CDN hosts are optimized (ENG-1678). Same-origin `/storage/...` uploads
+    // are relative paths (local images, always optimized) and need no entry; the deployment's own
+    // domain is intentionally NOT listed since the same build serves every domain. Arbitrary
+    // user-provided external URLs are rendered `unoptimized` (see lib/image-hosts.ts) instead of
+    // being allowlisted, so the optimizer never acts as an open proxy.
+    remotePatterns: OPTIMIZABLE_IMAGE_HOSTS.map((hostname) => ({
+      protocol: LOOPBACK_HOSTS.includes(hostname) ? "http" : "https",
+      hostname,
+    })),
+  },
+  async redirects() {
+    return [
+      {
+        source: "/i/:path*",
+        destination: "/:path*",
+        permanent: false,
+      },
+      {
+        source: "/api/v1/surveys",
+        destination: "/api/v1/management/surveys",
+        permanent: true,
+      },
+      {
+        source: "/api/v1/responses",
+        destination: "/api/v1/management/responses",
+        permanent: true,
+      },
+      {
+        source: "/api/v1/me",
+        destination: "/api/v1/management/me",
+        permanent: true,
+      },
+      // Redirect old project URLs to new workspace URLs
+      {
+        source: "/environments/:environmentId/project/:path*",
+        destination: "/environments/:environmentId/workspace/:path*",
+        permanent: true,
+      },
+      {
+        source: "/organizations/:organizationId/projects/new/:path*",
+        destination: "/organizations/:organizationId/workspaces/new/:path*",
+        permanent: true,
+      },
+      {
+        source: "/projects/:projectId",
+        destination: "/workspaces/:projectId",
+        permanent: true,
+      },
+      // Redirect old workspace-scoped account settings to the account-scoped routes.
+      {
+        source: "/workspaces/:workspaceId/settings/account",
+        destination: "/account/settings/profile",
+        permanent: true,
+      },
+      {
+        source: "/workspaces/:workspaceId/settings/account/:path*",
+        destination: "/account/settings/:path*",
+        permanent: true,
+      },
+      // Old workspace-scoped org settings need workspaceId -> organizationId resolution, so they go
+      // through a server route shim (not a static redirect). Non-permanent: the target is resolved
+      // at request time.
+      {
+        source: "/workspaces/:workspaceId/settings/organization",
+        destination: "/legacy-organization-settings/:workspaceId",
+        permanent: false,
+      },
+      {
+        source: "/workspaces/:workspaceId/settings/organization/:path*",
+        destination: "/legacy-organization-settings/:workspaceId/:path*",
+        permanent: false,
+      },
+    ];
+  },
+  async headers() {
+    // Upload extensions whose browser viewer needs `sandbox` off (see the `/storage` rules below). The
+    // media list must match the audio/video types in `mimeTypes` (packages/types/storage.ts), which
+    // lib/next-config-csp.test.ts checks. Header matching ignores case unless
+    // `experimental.caseSensitiveRoutes` is on; each letter matches either case so the rules hold both
+    // ways.
+    const anyCase = (extension) =>
+      extension.replace(/[a-z]/g, (letter) => `[${letter}${letter.toUpperCase()}]`);
+    const UPLOADED_MEDIA_EXTENSIONS = ["mp4", "mov", "avi", "mkv", "webm", "mp3"].map(anyCase).join("|");
+    const UPLOADED_PDF_EXTENSION = anyCase("pdf");
+    const UPLOADED_FILE_UNSANDBOXED_EXTENSIONS = `${UPLOADED_PDF_EXTENSION}|${UPLOADED_MEDIA_EXTENSIONS}`;
+
+    return [
+      // Pages get their Content-Security-Policy from proxy.ts, built per request around a nonce
+      // (lib/csp/content-security-policy.ts), including `frame-ancestors`. X-Frame-Options mirrors it for
+      // browsers without CSP framing support.
+      {
+        // The paths proxy.ts's matcher skips (static assets) get no nonce policy, yet a missing one still
+        // renders the app's 404 page. This policy runs none of its inline code (the page stays readable,
+        // unhydrated) and loads only from this origin. Asset responses (scripts, styles, fonts, images)
+        // ignore a CSP. Mirrors the matcher, so no path gets two policies.
+        source: "/:prefix(js|css|images|fonts|icons|public|animated-bgs)/:path*",
+        headers: [{ key: "Content-Security-Policy", value: ASSET_PATH_CSP }],
+      },
+      {
+        source: "/_next/:kind(static|image)/:path*",
+        headers: [{ key: "Content-Security-Policy", value: ASSET_PATH_CSP }],
+      },
+      {
+        source: String.raw`/:file(favicon\.ico|sitemap\.xml|robots\.txt)`,
+        headers: [{ key: "Content-Security-Policy", value: ASSET_PATH_CSP }],
+      },
+      {
+        // Surveys (/s/*) and contact survey links (/c/*) are embedded in iframes on any domain.
+        source: "/((?!s/|c/).*)",
+        headers: [
+          {
+            key: "X-Frame-Options",
+            value: "SAMEORIGIN",
+          },
+        ],
+      },
+      {
+        // The SSO recovery confirmation (ENG-7395) is a one-click account change, so it may not be framed
+        // at all, same origin included: a page on this origin that framed it could steer the click.
+        // After the catch-all above, so this value replaces its SAMEORIGIN.
+        source: "/sso-recovery/:path*",
+        headers: [
+          {
+            key: "X-Frame-Options",
+            value: "DENY",
+          },
+        ],
+      },
+      {
+        // Uploaded files (ENG-7108). A stored file must never act as a page of the app: should one be
+        // rendered as a document anyway, `sandbox` gives it an opaque origin and no scripts. These rules
+        // have to come after the one above, because a route handler cannot set this header itself: the
+        // config's CSP replaces it. Two kinds are left out of `sandbox`, as it can stop the browser's own
+        // viewer for them; both are served with their real type and `nosniff`, so never parsed as HTML:
+        // audio/video (Chromium's media viewer runs script) and PDFs (`sandbox` without `allow-plugins`
+        // may block a plugin-based viewer such as Safari's). Both still get `default-src 'none'`, which
+        // blocks every script.
+        source: String.raw`/storage/:path((?!.*\.(?:${UPLOADED_FILE_UNSANDBOXED_EXTENSIONS})$).*)`,
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; frame-ancestors 'self'; sandbox",
+          },
+        ],
+      },
+      {
+        source: String.raw`/storage/:path(.*\.(?:${UPLOADED_MEDIA_EXTENSIONS})$)`,
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; media-src 'self'; frame-ancestors 'self'",
+          },
+        ],
+      },
+      {
+        source: String.raw`/storage/:path(.*\.(?:${UPLOADED_PDF_EXTENSION})$)`,
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value: "default-src 'none'; object-src 'self'; frame-ancestors 'self'",
+          },
+        ],
+      },
+      {
+        // Public client API (JS SDK, surveys): any origin, deliberately without
+        // Access-Control-Allow-Credentials — these routes read no session, and browsers
+        // reject credentials paired with a wildcard origin anyway (ENG-2784).
+        source: "/api/(v1|v2)/client/:path*",
+        headers: [
+          { key: "Access-Control-Allow-Origin", value: "*" },
+          { key: "Access-Control-Allow-Methods", value: "GET,OPTIONS,PATCH,DELETE,POST,PUT" },
+          {
+            key: "Access-Control-Allow-Headers",
+            value:
+              "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Cache-Control",
+          },
+        ],
+      },
+      {
+        source: "/(.*)",
+        headers: [
+          {
+            key: "X-Content-Type-Options",
+            value: "nosniff",
+          },
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=63072000; includeSubDomains; preload",
+          },
+          {
+            key: "Referrer-Policy",
+            value: "strict-origin-when-cross-origin",
+          },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), microphone=(), geolocation=()",
+          },
+        ],
+      },
+      {
+        // Everything under /js EXCEPT the survey locale bundles and the typed-signature font, which are
+        // JSON and a font and get their own rules below. One rule has to win outright: they would
+        // otherwise set Content-Type on the same path.
+        source: "/js/((?!locales/|fonts/).*)",
+        headers: [
+          { key: "Cache-Control", value: JS_ASSET_CACHE_CONTROL },
+          { key: "Content-Type", value: "application/javascript; charset=UTF-8" },
+          ...JS_ASSET_CORS_HEADERS,
+        ],
+      },
+      {
+        // Survey locale bundles, fetched on demand by the survey runtime instead of being compiled into
+        // the widget. Cached as long as the bundle itself: each request carries a `?v=` content hash of
+        // the locale sources, so a translation change lands on a new URL rather than waiting out the CDN.
+        source: "/js/locales/(.*)",
+        headers: [
+          { key: "Cache-Control", value: JS_ASSET_CACHE_CONTROL },
+          { key: "Content-Type", value: "application/json; charset=UTF-8" },
+          ...JS_ASSET_CORS_HEADERS,
+        ],
+      },
+      {
+        // The typed-signature font (Signature element), fetched on demand by the survey runtime the first
+        // time a respondent opens the Type tab. Cached like the bundle: each request carries a `?v=`
+        // content hash of the font files. CORS is open because the font is requested from the host page's
+        // origin when the survey is embedded through the SDK, and font loads are always cross-origin checked.
+        source: String.raw`/js/fonts/(.*\.woff2)`,
+        headers: [
+          { key: "Cache-Control", value: JS_ASSET_CACHE_CONTROL },
+          { key: "Content-Type", value: "font/woff2" },
+          ...JS_ASSET_CORS_HEADERS,
+        ],
+      },
+      {
+        // The font's license text, which ships beside it as the OFL requires.
+        source: String.raw`/js/fonts/(.*\.txt)`,
+        headers: [
+          {
+            key: "Content-Type",
+            value: "text/plain; charset=UTF-8",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+        ],
+      },
+      // Favicon files - long cache since they rarely change. No CORS header: browsers load icons
+      // through <link rel="icon"> and <img>, which never need one, and a wildcard origin is flagged
+      // by scanners as a cross-domain misconfiguration (OWASP ZAP 10098).
+      {
+        source: "/favicon/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=2592000, s-maxage=31536000, immutable",
+          },
+        ],
+      },
+      // Root favicon.ico - long cache
+      {
+        source: "/favicon.ico",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=2592000, s-maxage=31536000, immutable",
+          },
+        ],
+      },
+      // SVG files (icons, logos) - long cache since they're usually static. Skips /favicon/, whose
+      // rule above deliberately sends no CORS header; this later rule would otherwise add it back.
+      {
+        source: String.raw`/((?!favicon/).*)\.svg`,
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=2592000, s-maxage=31536000, immutable",
+          },
+          {
+            key: "Content-Type",
+            value: "image/svg+xml",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+        ],
+      },
+      // Image backgrounds - medium cache (might update more frequently)
+      {
+        source: "/image-backgrounds/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=86400, s-maxage=2592000, stale-while-revalidate=86400",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+          {
+            key: "Vary",
+            value: "Accept-Encoding",
+          },
+        ],
+      },
+      // Video files - long cache since they're large and expensive to transfer
+      {
+        source: "/video/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=604800, s-maxage=31536000, stale-while-revalidate=604800",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+          {
+            key: "Accept-Ranges",
+            value: "bytes",
+          },
+        ],
+      },
+      // Animated backgrounds (4K videos) - very long cache since they're large and immutable
+      {
+        source: "/animated-bgs/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=604800, s-maxage=31536000, immutable",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+          {
+            key: "Accept-Ranges",
+            value: "bytes",
+          },
+        ],
+      },
+      // CSV templates - shorter cache since they might update with feature changes
+      {
+        source: "/sample-csv/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=3600, s-maxage=86400, stale-while-revalidate=3600",
+          },
+          {
+            key: "Content-Type",
+            value: "text/csv",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+        ],
+      },
+      // Web manifest and browser config files - medium cache
+      {
+        source: String.raw`/(site\.webmanifest|browserconfig\.xml)`,
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=86400, s-maxage=604800, stale-while-revalidate=86400",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+        ],
+      },
+      // Optimize caching for other static assets in public folder (fallback)
+      {
+        source: "/(images|fonts|icons)/(.*)",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=31536000, s-maxage=31536000, immutable",
+          },
+          {
+            key: "Access-Control-Allow-Origin",
+            value: "*",
+          },
+        ],
+      },
+    ];
+  },
+  async rewrites() {
+    const posthogRewrites = process.env.POSTHOG_KEY
+      ? [
+          {
+            source: "/ingest/static/:path*",
+            destination: "https://eu-assets.i.posthog.com/static/:path*",
+          },
+          {
+            source: "/ingest/:path*",
+            destination: "https://eu.i.posthog.com/:path*",
+          },
+        ]
+      : [];
+    return [
+      ...posthogRewrites,
+      {
+        source: "/api/v2/organizations/:organizationId/project-teams",
+        destination: "/api/v2/organizations/:organizationId/workspace-teams",
+      },
+    ];
+  },
+  env: {
+    NEXTAUTH_URL: process.env.NEXTAUTH_URL, // TODO: Remove this once we have a proper solution for the base path
+    // `assetPrefix` above is fixed at build time, so the page CSP (lib/csp) reads the same build value
+    // rather than whatever the runtime environment holds.
+    ASSET_PREFIX_URL: process.env.ASSET_PREFIX_URL,
+  },
+};
+
+// set actions allowed origins
+if (process.env.WEBAPP_URL) {
+  nextConfig.experimental.serverActions = {
+    allowedOrigins: [process.env.WEBAPP_URL.replace(/https?:\/\//, "")],
+    bodySizeLimit: "2mb",
+  };
+}
+
+// Build-time release identifier, derived exactly the way the runtime `SENTRY_RELEASE` is
+// derived in lib/constants.ts. CI bumps apps/web/package.json to the release version before
+// the image build (.github/workflows/build-docker-candidate.yml), so the release the
+// artifacts are uploaded under and the release the events are tagged with always agree.
+// It doubles as the "is this an official release build?" signal below: only CI bumps this
+// file, so an unbumped 0.0.0 means a local or self-hosted build.
+const sentryRelease = (() => {
+  try {
+    const { version } = require("./package.json");
+    return version && version !== "0.0.0" ? `${version}` : undefined;
+  } catch {
+    return undefined;
+  }
+})();
+
+const sentryOptions = {
+  // For all available options, see:
+  // https://www.npmjs.com/package/@sentry/webpack-plugin#options
+  // Production ingests into formbricks/formbricks (EU). "formbricks-cloud" lives in a
+  // different org (formbricks-us), so uploads were rejected with "projects are invalid".
+  project: "formbricks",
+  org: "formbricks",
+
+  // Enable logging to debug sourcemap generation issues
+  silent: false,
+
+  // Upload a larger set of source maps for prettier stack traces (increases build time)
+  widenClientFileUpload: true,
+
+  // Automatically tree-shake Sentry logger statements to reduce bundle size
+  disableLogger: false,
+
+  sourcemaps: {
+    // The SDK documents this as defaulting to true, but it only applies that default on the
+    // same path that turns `productionBrowserSourceMaps` on for you — and line 57 already
+    // sets that explicitly, so the SDK bails out first. Without this the generated .map
+    // files stay in the image and are served publicly.
+    deleteSourcemapsAfterUpload: true,
+
+    // Only an official release build uploads. A local or self-hosted build carries 0.0.0, and
+    // its token either has no access to this org (so the upload fails) or does (so a laptop
+    // would create a git-SHA release in our production project). "disable-upload" skips the
+    // upload while still injecting Debug IDs — `true` would skip those too, which would leave
+    // the image unsymbolicatable and defeat the point of the read-secrets.sh change. The
+    // string is honoured by the underlying bundler plugin; @sentry/nextjs types the field as
+    // boolean, so re-verify this if the SDK is upgraded.
+    disable: sentryRelease ? false : "disable-upload",
+  },
+
+  release: { name: sentryRelease },
+
+  // The plugin's default is to log an upload failure and leave the build green, which is why
+  // a wrong project slug went unnoticed for two years. On a release build, fail instead: an
+  // image whose source maps never uploaded produces unreadable production stack traces.
+  errorHandler: sentryRelease
+    ? (err) => {
+        throw err;
+      }
+    : undefined,
+};
+
+// Always enable Sentry plugin to inject Debug IDs
+// Runtime Sentry reporting still depends on DSN being set via environment variables
+const exportConfig = process.env.SENTRY_AUTH_TOKEN ? withSentryConfig(nextConfig, sentryOptions) : nextConfig;
+
+export default exportConfig;

@@ -1,0 +1,113 @@
+import "server-only";
+import { validateBlockResponses } from "@formbricks/surveys/validation";
+import { TResponseData } from "@formbricks/types/responses";
+import { TSurveyBlock } from "@formbricks/types/surveys/blocks";
+import { TResponseNotShown } from "@formbricks/types/surveys/not-shown";
+import { TValidationErrorMap } from "@formbricks/types/surveys/validation-rules";
+import { transformQuestionsToBlocks } from "@/app/lib/api/survey-transformation";
+import { getElementsFromBlocks } from "@/lib/survey/utils";
+import { createLinearPatternMatcher } from "@/modules/api/lib/linear-pattern-matcher";
+import { ApiErrorDetails } from "@/modules/api/v2/types/api-error";
+
+/**
+ * Validates response data against survey validation rules.
+ * Only validates elements that have data in responseData - never validates
+ * all survey elements regardless of completion status.
+ *
+ * @param blocks - Survey blocks containing elements with validation rules (preferred)
+ * @param responseData - Response data to validate (keyed by element ID); absent on partial updates
+ * @param languageCode - Language code for error messages (defaults to "en")
+ * @param questions - Survey questions (legacy format, used as fallback if blocks are empty)
+ * @param notShown - The response's not-shown record, when the request sends one: rules then skip the
+ *   options, rows and columns show-if kept from the respondent, as the survey does (ENG-7332). Hidden
+ *   ones are skipped either way.
+ * @returns Validation error map keyed by element ID, or null if validation passes
+ */
+export const validateResponseData = (
+  blocks: unknown[] | undefined | null,
+  responseData: TResponseData | undefined | null,
+  languageCode: string = "en",
+  // The legacy questions `transformQuestionsToBlocks` takes, typed off it rather than the deprecated name.
+  questions?: Parameters<typeof transformQuestionsToBlocks>[0] | null,
+  notShown?: TResponseNotShown | null
+): TValidationErrorMap | null => {
+  // Partial updates omit `data` entirely (e.g. `{ "finished": true }`), so there is nothing to
+  // validate. Matches the sibling validators on this path (validateClientFileUploads,
+  // validateOtherOptionLengthForMultipleChoice), which both early-return on absent data.
+  if (!responseData) return null;
+
+  // Use blocks if available, otherwise transform questions to blocks
+  let blocksToUse: TSurveyBlock[] = [];
+
+  if (Array.isArray(blocks) && blocks.length > 0) {
+    blocksToUse = blocks as TSurveyBlock[];
+  } else if (questions && questions.length > 0) {
+    // Transform legacy questions format to blocks for validation
+    blocksToUse = transformQuestionsToBlocks(questions, []);
+  } else {
+    // No blocks or questions to validate against
+    return null;
+  }
+
+  // Extract elements from blocks
+  const allElements = getElementsFromBlocks(blocksToUse);
+
+  // Always validate only elements that are present in responseData
+  const elementsToValidate = allElements.filter((element) => Object.keys(responseData).includes(element.id));
+
+  // Validate selected elements
+  // Patterns come from survey authors and values from anonymous respondents: never backtrack here,
+  // and bound what one response can cost (a fresh budget per response).
+  const errorMap = validateBlockResponses(elementsToValidate, responseData, languageCode, {
+    matchPattern: createLinearPatternMatcher(),
+    notShown,
+  });
+
+  // Return null if no errors (validation passed), otherwise return error map
+  return Object.keys(errorMap).length === 0 ? null : errorMap;
+};
+
+/**
+ * Converts validation error map to V2 API error response format
+ *
+ * @param errorMap - Validation error map from validateResponseData
+ * @returns V2 API error response details
+ */
+export const formatValidationErrorsForV2Api = (errorMap: TValidationErrorMap) => {
+  const details: ApiErrorDetails = [];
+
+  for (const [elementId, errors] of Object.entries(errorMap)) {
+    // Include all error messages for each element
+    for (const error of errors) {
+      details.push({
+        field: `response.data.${elementId}`,
+        issue: error.message,
+        meta: {
+          elementId,
+          ruleId: error.ruleId,
+          ruleType: error.ruleType,
+        },
+      });
+    }
+  }
+
+  return details;
+};
+
+/**
+ * Converts validation error map to V1 API error response format
+ *
+ * @param errorMap - Validation error map from validateResponseData
+ * @returns V1 API error details as Record<string, string>
+ */
+export const formatValidationErrorsForV1Api = (errorMap: TValidationErrorMap): Record<string, string> => {
+  const details: Record<string, string> = {};
+
+  for (const [elementId, errors] of Object.entries(errorMap)) {
+    // Combine all error messages for each element
+    const errorMessages = errors.map((error) => error.message).join("; ");
+    details[`response.data.${elementId}`] = errorMessages;
+  }
+
+  return details;
+};

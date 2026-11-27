@@ -1,0 +1,60 @@
+import { TOrganizationRole } from "@formbricks/types/memberships";
+import { TOrganization } from "@formbricks/types/organizations";
+import { IS_FORMBRICKS_CLOUD } from "@/lib/constants";
+import { getAccessFlags } from "@/lib/membership/utils";
+import { MembersInfo } from "@/modules/organization/settings/teams/components/edit-memberships/members-info";
+import { getInvitesByOrganizationId } from "@/modules/organization/settings/teams/lib/invite";
+import { getMembershipByOrganizationId } from "@/modules/organization/settings/teams/lib/membership";
+
+interface EditMembershipsProps {
+  readonly organization: TOrganization;
+  readonly currentUserId: string;
+  readonly role: TOrganizationRole;
+  readonly isAccessControlAllowed: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly isUserManagementDisabledFromUi: boolean;
+  readonly canManageUsers: boolean;
+}
+
+/**
+ * The column headers used to live here, hand-rolled as a `grid-cols-12` of divs, while the rows lived in
+ * `MembersInfo` — two files repeating the same `col-span-*` sequence and the same two feature flags. They
+ * are now one column array in `MembersInfo`, which is where the flags already were.
+ */
+export const EditMemberships = async ({
+  organization,
+  currentUserId,
+  role,
+  isAccessControlAllowed,
+  isDashboardViewerRoleEnabled,
+  isUserManagementDisabledFromUi,
+  canManageUsers,
+}: EditMembershipsProps) => {
+  const [members, invites] = await Promise.all([
+    getMembershipByOrganizationId(organization.id),
+    getInvitesByOrganizationId(organization.id),
+  ]);
+
+  if (!role) return null;
+
+  // Last sign-in is for Owners and Managers only (ENG-3317). Strip it here rather than hiding a column, so
+  // it never reaches anyone else's page payload.
+  const { isOwner, isManager } = getAccessFlags(role);
+  const visibleMembers =
+    isOwner || isManager ? members : members.map((member) => ({ ...member, lastLoginAt: undefined }));
+
+  return (
+    <MembersInfo
+      organization={organization}
+      currentUserId={currentUserId}
+      invites={invites ?? []}
+      members={visibleMembers}
+      currentUserRole={role}
+      isAccessControlAllowed={isAccessControlAllowed}
+      isFormbricksCloud={IS_FORMBRICKS_CLOUD}
+      isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
+      isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+      canManageUsers={canManageUsers}
+    />
+  );
+};

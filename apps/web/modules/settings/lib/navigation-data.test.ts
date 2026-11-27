@@ -1,0 +1,302 @@
+import { afterEach, describe, expect, test, vi } from "vitest";
+
+vi.mock("server-only", () => ({}));
+
+const mocks = {
+  getSession: vi.fn(),
+  getOrganizationsByUserId: vi.fn(),
+  getWorkspacesByUserId: vi.fn(),
+  getMembershipByUserIdOrganizationId: vi.fn(),
+  getOrganization: vi.fn(),
+  getMonthlyOrganizationResponseCount: vi.fn(),
+  getUser: vi.fn(),
+  getWorkspace: vi.fn(),
+  getEnterpriseLicense: vi.fn(),
+  getAccessControlPermission: vi.fn(),
+  getOrganizationWorkspacesLimit: vi.fn(),
+  getPublicDomain: vi.fn(),
+  cookieGet: vi.fn(),
+  listDashboardViewerOrganizations: vi.fn(),
+  listDashboardViewerWorkspaces: vi.fn(),
+};
+
+vi.mock("next/headers", () => ({
+  cookies: () => Promise.resolve({ get: (name: string) => mocks.cookieGet(name) }),
+}));
+
+vi.mock("@/modules/auth/lib/session", () => ({
+  getSession: (...args: unknown[]) => mocks.getSession(...args),
+}));
+vi.mock("@/lib/constants", () => ({ IS_FORMBRICKS_CLOUD: true, IS_DEVELOPMENT: false }));
+vi.mock("@/lib/getPublicUrl", () => ({ getPublicDomain: () => mocks.getPublicDomain() }));
+vi.mock("@/app/(app)/workspaces/[workspaceId]/lib/organization", () => ({
+  getOrganizationsByUserId: (...a: unknown[]) => mocks.getOrganizationsByUserId(...a),
+}));
+vi.mock("@/app/(app)/workspaces/[workspaceId]/lib/workspace", () => ({
+  getWorkspacesByUserId: (...a: unknown[]) => mocks.getWorkspacesByUserId(...a),
+}));
+vi.mock("@/lib/membership/service", () => ({
+  getMembershipByUserIdOrganizationId: (...a: unknown[]) => mocks.getMembershipByUserIdOrganizationId(...a),
+}));
+vi.mock("@/lib/organization/service", () => ({
+  getOrganization: (...a: unknown[]) => mocks.getOrganization(...a),
+  getMonthlyOrganizationResponseCount: (...a: unknown[]) => mocks.getMonthlyOrganizationResponseCount(...a),
+}));
+vi.mock("@/lib/user/service", () => ({ getUser: (...a: unknown[]) => mocks.getUser(...a) }));
+vi.mock("@/lib/workspace/service", () => ({ getWorkspace: (...a: unknown[]) => mocks.getWorkspace(...a) }));
+vi.mock("@/modules/ee/analysis/lib/dashboard-viewer-access", () => ({
+  listDashboardViewerOrganizations: (...a: unknown[]) =>
+    mocks.listDashboardViewerOrganizations(...a) ?? Promise.resolve([]),
+  listDashboardViewerWorkspaces: (...a: unknown[]) => mocks.listDashboardViewerWorkspaces(...a),
+  getDashboardViewerUnavailablePath: (organizationId: string) =>
+    `/organizations/${organizationId}/dashboards-unavailable`,
+}));
+vi.mock("@/modules/ee/license-check/lib/license", () => ({
+  getEnterpriseLicense: (...a: unknown[]) => mocks.getEnterpriseLicense(...a),
+}));
+vi.mock("@/modules/ee/license-check/lib/utils", () => ({
+  getAccessControlPermission: (...a: unknown[]) => mocks.getAccessControlPermission(...a),
+  getOrganizationWorkspacesLimit: (...a: unknown[]) => mocks.getOrganizationWorkspacesLimit(...a),
+}));
+
+const { getSettingsLayoutData } = await import("./navigation-data");
+
+const seedSuccess = () => {
+  mocks.getSession.mockResolvedValue({ user: { id: "user-1" } });
+  mocks.getUser.mockResolvedValue({ id: "user-1", name: "Test" });
+  mocks.getOrganization.mockResolvedValue({
+    id: "org-1",
+    name: "Org",
+    billing: { limits: { monthly: { responses: 250 } } },
+  });
+  mocks.getMembershipByUserIdOrganizationId.mockResolvedValue({ role: "owner" });
+  mocks.getAccessControlPermission.mockResolvedValue(true);
+  mocks.getEnterpriseLicense.mockResolvedValue({ features: { isMultiOrgEnabled: true } });
+  mocks.getOrganizationWorkspacesLimit.mockResolvedValue(3);
+  mocks.getMonthlyOrganizationResponseCount.mockResolvedValue(42);
+  mocks.getPublicDomain.mockReturnValue("https://app.formbricks.com");
+  // No active-workspace cookie by default.
+  mocks.cookieGet.mockReturnValue(undefined);
+};
+
+describe("getSettingsLayoutData", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+    mocks.listDashboardViewerOrganizations.mockResolvedValue([]);
+  });
+
+  test("returns null when there is no session", async () => {
+    mocks.getSession.mockResolvedValue(null);
+    expect(await getSettingsLayoutData("user-1")).toBeNull();
+  });
+
+  test("returns null when no organization can be resolved", async () => {
+    mocks.getSession.mockResolvedValue({ user: { id: "user-1" } });
+    mocks.getOrganizationsByUserId.mockResolvedValue([]);
+    expect(await getSettingsLayoutData("user-1")).toBeNull();
+  });
+
+  test("resolves layout data with the first workspace as current", async () => {
+    seedSuccess();
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }]);
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-1", name: "Workspace" });
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data).not.toBeNull();
+    expect(data?.organization.id).toBe("org-1");
+    expect(data?.currentWorkspace?.id).toBe("ws-1");
+    expect(data?.backUrl).toBe("/workspaces/ws-1/surveys");
+    expect(data?.isOwnerOrManager).toBe(true);
+    expect(data?.responseCount).toBe(42);
+  });
+
+  // The count scans the whole cycle's responses; on a plan with no response limit nothing reads it (ENG-3789).
+  test("skips the Cloud response count when the plan has no response limit", async () => {
+    seedSuccess();
+    mocks.getOrganization.mockResolvedValue({
+      id: "org-1",
+      name: "Org",
+      billing: { limits: { monthly: { responses: null } } },
+    });
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }]);
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-1", name: "Workspace" });
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.responseCount).toBe(0);
+    expect(mocks.getMonthlyOrganizationResponseCount).not.toHaveBeenCalled();
+  });
+
+  test("resolves layout data with no workspace (org/account-only)", async () => {
+    seedSuccess();
+    mocks.getWorkspacesByUserId.mockResolvedValue([]);
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.currentWorkspace).toBeNull();
+    expect(data?.backUrl).toBe("/organizations/org-1/landing");
+  });
+
+  test("resolves a Dashboard viewer's organization from its membership, with its granted workspaces", async () => {
+    seedSuccess();
+    mocks.getOrganizationsByUserId.mockResolvedValue([]);
+    mocks.listDashboardViewerOrganizations.mockResolvedValue([{ id: "org-1", name: "Org" }]);
+    mocks.getMembershipByUserIdOrganizationId.mockResolvedValue({ role: "dashboard_viewer" });
+    mocks.listDashboardViewerWorkspaces.mockResolvedValue([{ id: "ws-granted", name: "Granted" }]);
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-granted", name: "Granted" });
+
+    const data = await getSettingsLayoutData("user-1");
+
+    expect(data?.organization.id).toBe("org-1");
+    expect(mocks.getWorkspacesByUserId).not.toHaveBeenCalled();
+    expect(data?.backUrl).toBe("/workspaces/ws-granted/dashboards");
+    expect(data?.isOwnerOrManager).toBe(false);
+  });
+
+  test("sends a Dashboard viewer no Stripe or plan detail and no Cloud response count", async () => {
+    seedSuccess();
+    mocks.getOrganization.mockResolvedValue({
+      id: "org-1",
+      name: "Org",
+      billing: {
+        stripeCustomerId: "cus_secret",
+        limits: { workspaces: 9, monthly: { responses: 90_000, workflowRuns: null } },
+        usageCycleAnchor: new Date("2026-01-01"),
+        stripe: { subscriptionId: "sub_secret" },
+      },
+    });
+    mocks.getMembershipByUserIdOrganizationId.mockResolvedValue({ role: "dashboard_viewer" });
+    mocks.listDashboardViewerWorkspaces.mockResolvedValue([]);
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(JSON.stringify(data?.organization)).not.toMatch(/cus_secret|sub_secret|90000/);
+    expect(data?.organization.billing.stripeCustomerId).toBeNull();
+    expect(data?.responseCount).toBe(0);
+    expect(mocks.getMonthlyOrganizationResponseCount).not.toHaveBeenCalled();
+  });
+
+  test("sends a Dashboard viewer with no granted workspace back to the unavailable page", async () => {
+    seedSuccess();
+    mocks.getMembershipByUserIdOrganizationId.mockResolvedValue({ role: "dashboard_viewer" });
+    mocks.listDashboardViewerWorkspaces.mockResolvedValue([]);
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.backUrl).toBe("/organizations/org-1/dashboards-unavailable");
+  });
+
+  test("uses the active-workspace cookie when it is in the accessible list", async () => {
+    seedSuccess();
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }, { id: "ws-2" }]);
+    mocks.getWorkspace.mockImplementation((id: string) => Promise.resolve({ id, name: "WS" }));
+    mocks.cookieGet.mockReturnValue({ value: "ws-2" });
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.currentWorkspace?.id).toBe("ws-2");
+    expect(data?.backUrl).toBe("/workspaces/ws-2/surveys");
+  });
+
+  test("resolves the organization of the active workspace when no organization is given", async () => {
+    seedSuccess();
+    mocks.getOrganization.mockImplementation((id: string) =>
+      Promise.resolve({ id, name: `Org ${id}`, billing: {} })
+    );
+    mocks.getOrganizationsByUserId.mockResolvedValue([{ id: "org-1" }, { id: "org-2" }]);
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-2" }]);
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-2", name: "WS", organizationId: "org-2" });
+    mocks.cookieGet.mockReturnValue({ value: "ws-2" });
+
+    const data = await getSettingsLayoutData("user-1");
+
+    // Not org-1: account settings must stay in the organization the user is currently working in.
+    expect(data?.organization.id).toBe("org-2");
+    expect(data?.currentWorkspace?.id).toBe("ws-2");
+  });
+
+  test("falls back to the first organization when the active workspace is no longer accessible", async () => {
+    seedSuccess();
+    mocks.getOrganizationsByUserId.mockResolvedValue([{ id: "org-1" }, { id: "org-2" }]);
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }]);
+    // Workspace of an organization the user is no longer a member of.
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-left", name: "WS", organizationId: "org-left" });
+    mocks.cookieGet.mockReturnValue({ value: "ws-left" });
+
+    const data = await getSettingsLayoutData("user-1");
+
+    expect(data?.organization.id).toBe("org-1");
+  });
+
+  test("falls back to the first organization when the active workspace no longer exists", async () => {
+    seedSuccess();
+    mocks.getOrganizationsByUserId.mockResolvedValue([{ id: "org-1" }, { id: "org-2" }]);
+    mocks.getWorkspacesByUserId.mockResolvedValue([]);
+    mocks.getWorkspace.mockResolvedValue(null);
+    mocks.cookieGet.mockReturnValue({ value: "ws-deleted" });
+
+    const data = await getSettingsLayoutData("user-1");
+
+    expect(data?.organization.id).toBe("org-1");
+    expect(data?.currentWorkspace).toBeNull();
+  });
+
+  test("ignores the cookie and falls back to the first workspace when it is not accessible", async () => {
+    seedSuccess();
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-1" }, { id: "ws-2" }]);
+    mocks.getWorkspace.mockImplementation((id: string) => Promise.resolve({ id, name: "WS" }));
+    mocks.cookieGet.mockReturnValue({ value: "ws-not-mine" });
+
+    const data = await getSettingsLayoutData("user-1", "org-1");
+
+    expect(data?.currentWorkspace?.id).toBe("ws-1");
+    expect(data?.backUrl).toBe("/workspaces/ws-1/surveys");
+  });
+
+  test("keeps the organization the user opened last when it has no workspace yet", async () => {
+    seedSuccess();
+    mocks.getOrganization.mockImplementation((id: string) =>
+      Promise.resolve({ id, name: `Org ${id}`, billing: {} })
+    );
+    mocks.getOrganizationsByUserId.mockResolvedValue([{ id: "org-1" }, { id: "org-2" }, { id: "org-3" }]);
+    mocks.getWorkspacesByUserId.mockResolvedValue([]);
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-2", name: "WS", organizationId: "org-2" });
+    // The workspace cookie still names the previous organization's workspace; the organization cookie
+    // records the workspace-less organization the user switched to afterwards.
+    const cookies: Record<string, string> = {
+      "formbricks-workspace-id": "ws-2",
+      "formbricks-organization-id": "org-3",
+    };
+    mocks.cookieGet.mockImplementation((name: string) =>
+      cookies[name] ? { value: cookies[name] } : undefined
+    );
+
+    const data = await getSettingsLayoutData("user-1");
+
+    expect(data?.organization.id).toBe("org-3");
+    expect(data?.currentWorkspace).toBeNull();
+    expect(data?.backUrl).toBe("/organizations/org-3/landing");
+  });
+
+  test("ignores an organization cookie for an organization the user is no longer a member of", async () => {
+    seedSuccess();
+    mocks.getOrganization.mockImplementation((id: string) =>
+      Promise.resolve({ id, name: `Org ${id}`, billing: {} })
+    );
+    mocks.getOrganizationsByUserId.mockResolvedValue([{ id: "org-1" }, { id: "org-2" }]);
+    mocks.getWorkspacesByUserId.mockResolvedValue([{ id: "ws-2" }]);
+    mocks.getWorkspace.mockResolvedValue({ id: "ws-2", name: "WS", organizationId: "org-2" });
+    const cookies: Record<string, string> = {
+      "formbricks-workspace-id": "ws-2",
+      "formbricks-organization-id": "org-left",
+    };
+    mocks.cookieGet.mockImplementation((name: string) =>
+      cookies[name] ? { value: cookies[name] } : undefined
+    );
+
+    const data = await getSettingsLayoutData("user-1");
+
+    expect(data?.organization.id).toBe("org-2");
+  });
+});

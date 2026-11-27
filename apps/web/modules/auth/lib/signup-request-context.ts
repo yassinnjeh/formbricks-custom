@@ -1,0 +1,54 @@
+import "server-only";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+interface SignupRequestStore {
+  /**
+   * Set by the sign-up route (`POST /api/internal/signups`) once its personal-email domain policy (Cloud gate + invite exemption)
+   * has passed, immediately before it calls `auth.api.signUpEmail`. `user.create.before` reads it to
+   * know the credential sign-up already went through the action; its ABSENCE means some other caller
+   * reached Better Auth's native `/sign-up/email`, so the hook re-enforces the block there. Since
+   * ENG-3988 that endpoint is closed over HTTP, so such a caller can only be in-process.
+   */
+  domainAllowed?: boolean;
+  /**
+   * Set by the sign-up route (`POST /api/internal/signups`) when the instance policy admitted this sign-up *because the instance was
+   * empty* — the initial administrator, who has no invite to present (ENG-2247). `user.create.before`
+   * reads it to stamp the bootstrap marker on the row it is about to insert.
+   *
+   * Carried rather than re-derived, because the hook cannot re-derive it correctly: the action admits
+   * an invited sign-up without consulting instance policy at all, so a hook that re-ran the check
+   * would read "instance is empty" and mark an invite holder as the bootstrap administrator.
+   */
+  bootstrapAdmin?: boolean;
+}
+
+const signupRequestContext = new AsyncLocalStorage<SignupRequestStore>();
+
+/** Run `fn` in a fresh signup request scope so the credential sign-up hook can read the action's decision. */
+export const runWithSignupRequestContext = <T>(fn: () => T): T => signupRequestContext.run({}, fn);
+
+/** Mark, within the current signup scope, that the action's domain policy has already been enforced. */
+export const markSignupDomainAllowed = (): void => {
+  const store = signupRequestContext.getStore();
+  if (store) store.domainAllowed = true;
+};
+
+/** True only when the current user creation runs inside an action scope that already enforced the policy. */
+export const isSignupDomainAllowed = (): boolean => signupRequestContext.getStore()?.domainAllowed === true;
+
+/** Mark, within the current signup scope, that the fresh-instance exception is what admitted this sign-up. */
+export const markBootstrapAdminSignup = (): void => {
+  const store = signupRequestContext.getStore();
+  if (store) store.bootstrapAdmin = true;
+};
+
+/** True only when the action admitted the current user creation via the fresh-instance exception. */
+export const isBootstrapAdminSignup = (): boolean => signupRequestContext.getStore()?.bootstrapAdmin === true;
+
+/**
+ * True while the current code runs inside the sign-up route's scope (`POST /api/internal/signups`). The verification-email
+ * callback reads it to send after the response instead of during it (ENG-7094): Better Auth only sends
+ * for an address it actually created, so a send on the response path makes the response slower for a
+ * free address than for a registered one.
+ */
+export const isInSignupRequest = (): boolean => signupRequestContext.getStore() !== undefined;

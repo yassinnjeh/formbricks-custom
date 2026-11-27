@@ -1,0 +1,143 @@
+"use client";
+
+import { ArchiveIcon } from "lucide-react";
+import { useRouter } from "next/navigation";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { useSurvey } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/context/survey-context";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { SurveyStatusChangeDialog } from "@/modules/ee/creatives/components/survey-side/survey-status-change-dialog";
+import { useSurveyStatusChangeWithCreatives } from "@/modules/ee/creatives/hooks/use-survey-linked-creatives";
+import { saveSurvey } from "@/modules/survey/editor/lib/api-client";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/modules/ui/components/select";
+import { SurveyStatusIndicator } from "@/modules/ui/components/survey-status-indicator";
+
+export const SurveyStatusDropdown = () => {
+  const { survey, replaceSurvey } = useSurvey();
+  const { t } = useTranslation();
+  const router = useRouter();
+  const isScheduled = survey.status === "paused" && survey.publishOn !== null;
+
+  const handleStatusChange = async (status: TSurvey["status"]) => {
+    let saved: TSurvey;
+    try {
+      // `isSecondPublish` is the save's answer, not part of the survey: kept out of the shared survey, so
+      // the next save from another tab does not send it back.
+      const { isSecondPublish: _isSecondPublish, ...savedSurvey } = await saveSurvey({ ...survey, status });
+      saved = savedSurvey;
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+      return;
+    }
+    replaceSurvey(saved);
+
+    const { publishOn, status: resultingStatus } = saved;
+    const isResultScheduled = resultingStatus === "paused" && publishOn !== null;
+    const statusToToastMessage: Partial<Record<TSurvey["status"], string>> = {
+      inProgress: t("common.survey_live"),
+      paused: isResultScheduled ? t("common.survey_scheduled") : t("common.survey_paused"),
+      completed: t("common.survey_completed"),
+    };
+
+    const toastMessage = statusToToastMessage[resultingStatus];
+    if (toastMessage) {
+      toast.success(toastMessage);
+    }
+
+    router.refresh();
+  };
+
+  // Pausing, closing or resuming names the creatives that open the survey first.
+  const statusChange = useSurveyStatusChangeWithCreatives({
+    workspaceId: survey.workspaceId,
+    surveyId: survey.id,
+    currentStatus: survey.status,
+    applyStatus: handleStatusChange,
+  });
+
+  // Archived surveys are read-only. Render the same status-select control (so it reads as a natural
+  // status) with "Archived" as the value, but disabled — the status can't change while archived.
+  if (survey.archivedAt) {
+    return (
+      <Select value="archived" disabled>
+        <SelectTrigger className="w-[170px] bg-white md:w-[200px]">
+          <SelectValue>
+            <div className="flex items-center">
+              <div className="rounded-full bg-slate-300 p-1">
+                <ArchiveIcon className="size-3 text-slate-600" />
+              </div>
+              <span className="ml-2 text-sm text-slate-700">{t("common.archived")}</span>
+            </div>
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent className="bg-white">
+          <SelectItem value="archived">
+            <div className="flex w-full items-center justify-center gap-2">
+              <div className="rounded-full bg-slate-300 p-1">
+                <ArchiveIcon className="size-3 text-slate-600" />
+              </div>
+              {t("common.archived")}
+            </div>
+          </SelectItem>
+        </SelectContent>
+      </Select>
+    );
+  }
+
+  return (
+    <>
+      {survey.status === "draft" ? (
+        <div className="flex items-center">
+          <p className="text-sm text-slate-600 italic">{t("common.draft")}</p>
+        </div>
+      ) : (
+        <Select
+          value={survey.status}
+          onValueChange={(value: TSurvey["status"]) => {
+            void statusChange.requestStatusChange(value);
+          }}>
+          <SelectTrigger className="w-[170px] bg-white md:w-[200px]">
+            <SelectValue>
+              <div className="flex items-center">
+                <SurveyStatusIndicator status={survey.status} isScheduled={isScheduled} />
+                <span className="ml-2 text-sm text-slate-700">
+                  {survey.status === "inProgress" && t("common.in_progress")}
+                  {survey.status === "paused" && (isScheduled ? t("common.scheduled") : t("common.paused"))}
+                  {survey.status === "completed" && t("common.closed")}
+                </span>
+              </div>
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent className="bg-white">
+            <SelectItem className="group font-normal hover:text-slate-900" value="inProgress">
+              <div className="flex w-full items-center justify-center gap-4">
+                <SurveyStatusIndicator status={"inProgress"} />
+                {t("common.in_progress")}
+              </div>
+            </SelectItem>
+            <SelectItem className="group font-normal hover:text-slate-900" value="paused">
+              <div className="flex w-full items-center justify-center gap-2">
+                <SurveyStatusIndicator status={"paused"} isScheduled={isScheduled} />
+                {isScheduled ? t("common.scheduled") : t("common.paused")}
+              </div>
+            </SelectItem>
+            <SelectItem className="group font-normal hover:text-slate-900" value="completed">
+              <div className="flex w-full items-center justify-center gap-2">
+                <SurveyStatusIndicator status={"completed"} />
+                {t("common.closed")}
+              </div>
+            </SelectItem>
+          </SelectContent>
+        </Select>
+      )}
+      <SurveyStatusChangeDialog {...statusChange.dialog} />
+    </>
+  );
+};

@@ -1,0 +1,137 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { FORMBRICKS_ENVIRONMENT_ID_LS, FORMBRICKS_WORKSPACE_ID_LS } from "@/lib/localStorage";
+import { useSignOut } from "@/modules/auth/hooks/use-sign-out";
+
+// vitestSetup.ts mocks this hook globally (so component tests don't hit Better Auth); unmock here so we
+// exercise the REAL implementation.
+vi.unmock("@/modules/auth/hooks/use-sign-out");
+
+// Hoisted so the (hoisted) vi.mock factories below can reference them.
+const { baSignOut, loggerError } = vi.hoisted(() => ({ baSignOut: vi.fn(), loggerError: vi.fn() }));
+vi.mock("@/modules/auth/lib/auth-client", () => ({
+  authClient: { signOut: (...args: unknown[]) => baSignOut(...args) },
+}));
+vi.mock("@formbricks/logger", () => ({ logger: { error: loggerError } }));
+const { logoutPlainBeforeNavigation } = vi.hoisted(() => ({
+  logoutPlainBeforeNavigation: vi.fn(),
+}));
+vi.mock("@/app/plain/lib/plain-sdk", () => ({ logoutPlainBeforeNavigation }));
+
+// The hook reads a bare `localStorage` global, which vitest's jsdom doesn't expose on globalThis.
+const localStorageMock = { getItem: vi.fn(), setItem: vi.fn(), removeItem: vi.fn() };
+
+let originalLocation: Location;
+
+beforeEach(() => {
+  originalLocation = window.location;
+  // jsdom throws on real navigation, so swap in a plain object we can read href off of.
+  Object.defineProperty(window, "location", { configurable: true, writable: true, value: { href: "" } });
+  vi.stubGlobal("localStorage", localStorageMock);
+  vi.clearAllMocks();
+  baSignOut.mockResolvedValue({ error: null });
+});
+
+afterEach(() => {
+  Object.defineProperty(window, "location", {
+    configurable: true,
+    writable: true,
+    value: originalLocation,
+  });
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("useSignOut", () => {
+  // The audit is the server's now (`auditSignOutOnSessionDelete`): the client reports nothing.
+  test("calls Better Auth signOut and redirects to /auth/login by default", async () => {
+    const { signOut } = useSignOut();
+
+    await signOut();
+
+    expect(baSignOut).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe("/auth/login");
+  });
+
+  test("logs the Plain support chat out before signing out and redirecting", async () => {
+    let finishPlainLogout: () => void = () => undefined;
+    logoutPlainBeforeNavigation.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishPlainLogout = resolve;
+      })
+    );
+    const { signOut } = useSignOut();
+
+    const pending = signOut();
+    await vi.waitFor(() => expect(logoutPlainBeforeNavigation).toHaveBeenCalledTimes(1));
+
+    // While Plain's logout is still pending, neither Better Auth nor the redirect has run.
+    expect(baSignOut).not.toHaveBeenCalled();
+    expect(window.location.href).toBe("");
+
+    finishPlainLogout();
+    await pending;
+
+    expect(baSignOut).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe("/auth/login");
+  });
+
+  test("navigates to callbackUrl", async () => {
+    const { signOut } = useSignOut();
+
+    await signOut({ callbackUrl: "/dashboard" });
+
+    expect(window.location.href).toBe("/dashboard");
+  });
+
+  test("returns { url } and does not navigate when redirect is false", async () => {
+    const { signOut } = useSignOut();
+
+    const result = await signOut({ redirect: false, callbackUrl: "/next" });
+
+    expect(result).toEqual({ url: "/next" });
+    expect(window.location.href).toBe(""); // no navigation occurred
+  });
+
+  test("clears the workspace + environment localStorage keys when clearWorkspaceId is set", async () => {
+    const { signOut } = useSignOut();
+
+    await signOut({ clearWorkspaceId: true });
+
+    expect(localStorageMock.removeItem).toHaveBeenCalledWith(FORMBRICKS_WORKSPACE_ID_LS);
+    expect(localStorageMock.removeItem).toHaveBeenCalledWith(FORMBRICKS_ENVIRONMENT_ID_LS);
+  });
+
+  test("still signs out and redirects when the browser denies localStorage", async () => {
+    vi.stubGlobal("localStorage", {
+      removeItem: vi.fn(() => {
+        throw new DOMException("The operation is insecure.", "SecurityError");
+      }),
+    });
+    const { signOut } = useSignOut();
+
+    await signOut({ clearWorkspaceId: true });
+
+    expect(logoutPlainBeforeNavigation).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe("/auth/login");
+  });
+
+  test("logs and proceeds when Better Auth signOut resolves with an error", async () => {
+    baSignOut.mockResolvedValueOnce({ error: { message: "ba boom" } });
+    const { signOut } = useSignOut();
+
+    await signOut();
+
+    expect(loggerError).toHaveBeenCalled();
+    expect(window.location.href).toBe("/auth/login");
+  });
+
+  test("logs and still redirects when Better Auth signOut throws", async () => {
+    baSignOut.mockRejectedValueOnce(new Error("network"));
+    const { signOut } = useSignOut();
+
+    await signOut();
+
+    expect(loggerError).toHaveBeenCalled();
+    expect(window.location.href).toBe("/auth/login");
+  });
+});

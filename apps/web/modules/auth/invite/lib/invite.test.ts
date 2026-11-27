@@ -1,0 +1,79 @@
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
+import { DatabaseError } from "@formbricks/types/errors";
+import { type InviteWithCreator } from "@/modules/auth/invite/types/invites";
+import { getInvite } from "./invite";
+
+vi.mock("@formbricks/database", () => ({
+  prisma: {
+    invite: {
+      findUnique: vi.fn(),
+    },
+  },
+}));
+
+describe("invite", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("getInvite", () => {
+    test("should return invite with creator details", async () => {
+      const mockInvite: InviteWithCreator = {
+        id: "test-id",
+        expiresAt: new Date(),
+        organizationId: "org-id",
+        role: "member",
+        teamIds: ["team-1"],
+        creator: {
+          name: "Test User",
+          email: "test@example.com",
+          locale: "en-US",
+        },
+      };
+
+      vi.mocked(prisma.invite.findUnique, { partial: true }).mockResolvedValue(mockInvite);
+
+      const result = await getInvite("test-id");
+
+      expect(result).toEqual(mockInvite);
+      expect(prisma.invite.findUnique).toHaveBeenCalledWith({
+        where: { id: "test-id" },
+        select: {
+          id: true,
+          expiresAt: true,
+          organizationId: true,
+          role: true,
+          teamIds: true,
+          creator: {
+            select: {
+              name: true,
+              email: true,
+              locale: true,
+            },
+          },
+        },
+      });
+    });
+
+    test("should return null when invite is not found", async () => {
+      vi.mocked(prisma.invite.findUnique).mockResolvedValue(null);
+
+      const result = await getInvite("test-id");
+
+      expect(result).toBeNull();
+    });
+
+    test("should throw DatabaseError when Prisma throws an error", async () => {
+      const prismaError = new Prisma.PrismaClientKnownRequestError("Test error", {
+        code: "P2002",
+        clientVersion: "1.0.0",
+      });
+
+      vi.mocked(prisma.invite.findUnique).mockRejectedValue(prismaError);
+
+      await expect(getInvite("test-id")).rejects.toThrow(DatabaseError);
+    });
+  });
+});

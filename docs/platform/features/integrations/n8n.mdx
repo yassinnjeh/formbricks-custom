@@ -1,0 +1,68 @@
+---
+title: "n8n"
+description: "Send Formbricks survey events to an n8n workflow using a webhook."
+icon: "diagram-project"
+---
+
+Use n8n's built-in **Webhook** trigger with Formbricks Cloud or your self-hosted instance.
+You need permission to manage webhooks in the survey's workspace and an HTTPS endpoint reachable from Formbricks.
+
+<Warning>
+  The published `@formbricks/n8n-nodes-formbricks` 1.0.2 community node omits the workspace ID when
+  registering its webhook. Registration fails against current Formbricks releases. Use the workflow
+  below until a compatible node release is available; changing the API key does not fix that request.
+</Warning>
+
+<span id="step-1-setup-your-survey-incl-questionid-for-every-question" />
+<span id="step-2-setup-your-n8n-workflow" />
+<span id="step-3-connect-formbricks-with-n8n" />
+<span id="step-4-select-event" />
+<span id="step-5-select-survey" />
+<span id="step-6-test-your-trigger" />
+<span id="step-7-add-discord-to-your-workflow" />
+<span id="step-1-check-your-question-codes" />
+
+## Connect a workflow
+
+<Steps>
+  <Step title="Create the trigger">
+    Create an n8n workflow with a **Webhook** trigger. Set the method to **POST**, choose a unique path,
+    and copy its **Test URL**. Start **Listen for test event** in n8n.
+  </Step>
+  <Step title="Connect Formbricks">
+    In Formbricks, open **Configuration → Integrations → Manage Webhooks → Add Webhook**.
+    Paste the Test URL and select **Response Finished** and your test survey.
+  </Step>
+  <Step title="Test with an isolated survey">
+    Submit a response to that survey. Confirm n8n receives it, then map the response fields into your next
+    node. Keep test recipients and downstream actions isolated from production.
+  </Step>
+  <Step title="Verify signatures">
+    Before handling real data, [verify the webhook signature](/platform/features/integrations/webhooks#signature-verification)
+    using the webhook's signing secret. Reject invalid requests before running downstream actions.
+    If your n8n setup cannot verify the raw request body, put a signature-verifying receiver in front of it.
+  </Step>
+  <Step title="Switch to the production URL">
+    Publish or activate the workflow in your n8n version. Replace the Test URL in Formbricks with n8n's
+    **Production URL** and submit one controlled response. Verify exactly one execution and the expected result.
+  </Step>
+</Steps>
+
+You do not need a Formbricks API key to create this webhook through the UI. Additional API calls from
+n8n need their own [scoped key](/api-reference/generate-key).
+
+## Self-hosted Formbricks
+
+Create the webhook on your own instance. Its background worker must reach the n8n endpoint over HTTPS.
+If delivery fails, check the endpoint, selected survey and event, and [worker configuration](/self-hosting/configuration/job-runner).
+
+## Map answers by question code
+
+Every question has a **question code**, such as `q1` or `nps`. The webhook payload's `dataByQuestionCode`
+group lists the answers under these codes, so map those fields in n8n. You can change a code in the question's
+**Settings** tab, under **Recode**, **before** you activate the survey. Once the survey is active, codes are
+locked, so a workflow built on them keeps working.
+
+Question codes start with a lowercase letter and use lowercase letters, digits and `_`. Learn more in
+[Question codes and answer codes](/surveys/analysis/question-codes) and
+[reading answers by question code](/platform/features/integrations/webhooks#reading-answers-by-question-code).

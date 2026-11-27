@@ -1,0 +1,161 @@
+"use client";
+
+import { CheckCircle2Icon } from "lucide-react";
+import { useTranslation } from "react-i18next";
+import {
+  getComputedEmbeddedFields,
+  getIngestedEmbeddedFields,
+} from "@formbricks/types/embedded-data-resolver";
+import { TResponseWithQuotas } from "@formbricks/types/responses";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { getTextContent } from "@formbricks/types/surveys/validation";
+import { TUserLocale } from "@formbricks/types/user";
+import { getLocalizedValue } from "@/lib/i18n/utils";
+import { buildServerEmbeddedValues } from "@/lib/surveyLogic/utils";
+import { getSurveyDateFormatMap } from "@/lib/utils/date-display";
+import { parseRecallInfo } from "@/lib/utils/recall";
+import { ResponseCardQuotas } from "@/modules/ee/quotas/components/single-response-card-quotas";
+import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import { IdBadge } from "@/modules/ui/components/id-badge";
+import { type TResponseCardRow } from "../lib/card-rows";
+import { splitRecallHighlights } from "../util";
+import { ElementSkip } from "./ElementSkip";
+import { HiddenFields } from "./HiddenFields";
+import { RenderResponse } from "./RenderResponse";
+import { ResponseVariables } from "./ResponseVariables";
+import { VerifiedEmail } from "./VerifiedEmail";
+
+interface SingleResponseCardBodyProps {
+  survey: TSurvey;
+  response: TResponseWithQuotas;
+  /** One per element of the survey, from `getResponseCardRows`. */
+  rows: TResponseCardRow[];
+  /** From `hasEndedBeforeFirstQuestion`: the respondent never saw the welcome card (ENG-7030). */
+  endedBeforeFirstQuestion: boolean;
+  locale: TUserLocale;
+}
+
+export const SingleResponseCardBody = ({
+  survey,
+  response,
+  rows,
+  endedBeforeFirstQuestion,
+  locale,
+}: Readonly<SingleResponseCardBodyProps>) => {
+  const elements = getElementsFromBlocks(survey.blocks);
+  // ENG-1837: both blocks below render the survey's Embedded Data definitions, resolved through the
+  // tables — the only place they are stored since ENG-2404.
+  const computedFields = getComputedEmbeddedFields(survey);
+  const ingestedFields = getIngestedEmbeddedFields(survey);
+  const dateFormats = getSurveyDateFormatMap(elements);
+  // ENG-2538: recall's lookup map, not `response.data` — a reserved token such as `#recall:country#`
+  // rendered its fallback on this card while resolving correctly in the live survey. Shared with
+  // `ElementSkip`, which recalls the same headlines for skipped elements.
+  const recallValues = buildServerEmbeddedValues(response, survey);
+  const isFirstElementAnswered = elements[0] ? !!response.data[elements[0].id] : false;
+  const { t } = useTranslation();
+  const formatTextWithSlashes = (text: string) => {
+    const parts = splitRecallHighlights(text);
+
+    return parts.map((part, index) => {
+      // Check if the part was inside #/ and \#
+      if (index % 2 === 1) {
+        return (
+          <span
+            key={index}
+            className="mr-0.5 ml-0.5 rounded-md border border-slate-200 bg-slate-50 px-1 py-0.5 text-sm first:ml-0">
+            @{part}
+          </span>
+        );
+      } else {
+        return part;
+      }
+    });
+  };
+
+  return (
+    <div className="p-6">
+      {survey.welcomeCard.enabled && !endedBeforeFirstQuestion && (
+        <ElementSkip
+          skippedElements={[]}
+          elements={elements}
+          status={"welcomeCard"}
+          isFirstElementAnswered={isFirstElementAnswered}
+          recallValues={recallValues}
+          variables={response.variables}
+          locale={locale}
+        />
+      )}
+      <div className="space-y-6">
+        {survey.isVerifyEmailEnabled && response.data["verifiedEmail"] && (
+          <VerifiedEmail responseData={response.data} />
+        )}
+        {elements.map((question, index) => {
+          const row = rows[index];
+          if (!row || row.type === "none") return null;
+
+          return (
+            <div key={`${question.id}`}>
+              {row.type === "answer" ? (
+                <div>
+                  <p className="mb-1 flex items-center gap-2 text-sm font-semibold text-slate-600">
+                    {formatTextWithSlashes(
+                      getTextContent(
+                        parseRecallInfo(
+                          getLocalizedValue(question.headline, "default"),
+                          recallValues,
+                          response.variables,
+                          true,
+                          locale,
+                          dateFormats
+                        )
+                      )
+                    )}
+                    {question.type !== "cta" && question.code && <IdBadge id={question.code} />}
+                  </p>
+                  <div dir="auto">
+                    <RenderResponse
+                      element={question}
+                      survey={survey}
+                      responseData={response.data[question.id]}
+                      language={response.language}
+                      locale={locale}
+                      showId={true}
+                      signatureVariant="full"
+                      responseId={response.id}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <ElementSkip
+                  skippedElements={row.elementIds}
+                  elements={elements}
+                  recallValues={recallValues}
+                  variables={response.variables}
+                  locale={locale}
+                  status={row.type}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {computedFields.length > 0 && (
+        <ResponseVariables variables={computedFields} variablesData={response.variables} />
+      )}
+      {ingestedFields.length > 0 && (
+        <HiddenFields hiddenFields={ingestedFields} responseData={response.data} />
+      )}
+      <ResponseCardQuotas quotas={response.quotas} />
+
+      {response.finished && (
+        <div className="mt-4 flex items-center">
+          <CheckCircle2Icon className="size-6 text-slate-400" />
+          <p className="mx-2 rounded-lg bg-slate-100 px-2 text-sm font-medium text-slate-700">
+            {t("workspace.surveys.responses.response_complete")}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+};

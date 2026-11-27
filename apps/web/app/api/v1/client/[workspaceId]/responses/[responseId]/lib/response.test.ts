@@ -1,0 +1,288 @@
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@formbricks/database";
+import { DatabaseError, ResourceNotFoundError, ResponseAlreadyFinishedError } from "@formbricks/types/errors";
+import { TSurveyQuota } from "@formbricks/types/quota";
+import { TResponse } from "@formbricks/types/responses";
+import { lockResponseForUpdate, updateResponse } from "@/lib/response/service";
+import {
+  evaluateResponseQuotas,
+  loadQuotaEvaluationContext,
+} from "@/modules/ee/quotas/lib/evaluation-service";
+import { getStoredResponseNotShown, updateResponseWithQuotaEvaluation } from "./response";
+
+vi.mock("@formbricks/database", () => ({ prisma: { response: { findUnique: vi.fn() } } }));
+vi.mock("@/lib/response/service");
+vi.mock("@/modules/ee/quotas/lib/evaluation-service");
+
+const mockUpdateResponse = vi.mocked(updateResponse);
+const mockLockResponseForUpdate = vi.mocked(lockResponseForUpdate);
+const mockEvaluateResponseQuotas = vi.mocked(evaluateResponseQuotas);
+const mockLoadQuotaEvaluationContext = vi.mocked(loadQuotaEvaluationContext);
+const mockQuotaContext = { quotas: [], survey: { id: "survey123" } } as unknown as Awaited<
+  ReturnType<typeof loadQuotaEvaluationContext>
+>;
+
+type MockTx = {
+  response: {
+    update: ReturnType<typeof vi.fn>;
+    findUnique: ReturnType<typeof vi.fn>;
+  };
+};
+let mockTx: MockTx;
+
+describe("updateResponseWithQuotaEvaluation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+
+    mockTx = {
+      response: {
+        update: vi.fn(),
+        // No stored not-shown record unless a test sets one.
+        findUnique: vi.fn().mockResolvedValue({ notShown: null }),
+      },
+    };
+    prisma.$transaction = vi.fn(async (cb) => cb(mockTx));
+    mockLoadQuotaEvaluationContext.mockResolvedValue(mockQuotaContext);
+    mockLockResponseForUpdate.mockResolvedValue({ finished: false });
+  });
+
+  const mockResponseId = "response123";
+  const mockResponseInput = {
+    data: { question1: "answer1" },
+    finished: true,
+  };
+  const updateArgs = {
+    responseId: mockResponseId,
+    workspaceId: "workspace123",
+    surveyId: "survey123",
+    responseInput: mockResponseInput,
+  };
+
+  const mockResponse: TResponse = {
+    id: "response123",
+    surveyId: "survey123",
+    finished: true,
+    data: { question1: "answer1" },
+    meta: {},
+    ttc: {},
+    variables: { var1: "value1" },
+    contactAttributes: {},
+    singleUseId: null,
+    language: "en",
+    displayId: null,
+    endingId: null,
+    createdAt: new Date("2024-01-01"),
+    updatedAt: new Date("2024-01-01"),
+    contact: null,
+    tags: [],
+  };
+
+  const mockQuotaFull: TSurveyQuota = {
+    id: "quota123",
+    surveyId: "survey123",
+    name: "Test Quota",
+    action: "endSurvey",
+    createdAt: new Date("2024-01-01"),
+    updatedAt: new Date("2024-01-01"),
+    countPartialSubmissions: false,
+    endingCardId: null,
+    limit: 100,
+    logic: {
+      connector: "and",
+      conditions: [],
+    },
+  };
+
+  test("should return response with quotaFull when quota evaluation returns quotaFull", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({
+      quotaFull: mockQuotaFull,
+      shouldEndSurvey: true,
+    });
+
+    const result = await updateResponseWithQuotaEvaluation(updateArgs);
+
+    // No ingest flags: this caller did not run the Embedded Data contract, so the stored column is
+    // left alone rather than cleared (ENG-1845).
+    expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx, undefined);
+    expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
+      surveyId: mockResponse.surveyId,
+      responseId: mockResponse.id,
+      data: mockResponse.data,
+      variables: mockResponse.variables,
+      language: mockResponse.language,
+      responseFinished: mockResponse.finished,
+      // The row just written, so `reserved` quota operands resolve (ENG-1840).
+      response: expect.objectContaining({ id: expect.any(String) }),
+      tx: mockTx,
+      quotaContext: mockQuotaContext,
+    });
+
+    expect(result).toEqual({
+      ...mockResponse,
+      quotaFull: mockQuotaFull,
+    });
+  });
+
+  test("should return response without quotaFull when quota evaluation returns no quotaFull", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({
+      shouldEndSurvey: false,
+    });
+
+    const result = await updateResponseWithQuotaEvaluation(updateArgs);
+
+    // No ingest flags: this caller did not run the Embedded Data contract, so the stored column is
+    // left alone rather than cleared (ENG-1845).
+    expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx, undefined);
+    expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
+      surveyId: mockResponse.surveyId,
+      responseId: mockResponse.id,
+      data: mockResponse.data,
+      variables: mockResponse.variables,
+      language: mockResponse.language,
+      responseFinished: mockResponse.finished,
+      // The row just written, so `reserved` quota operands resolve (ENG-1840).
+      response: expect.objectContaining({ id: expect.any(String) }),
+      tx: mockTx,
+      quotaContext: mockQuotaContext,
+    });
+
+    expect(result).toEqual(mockResponse);
+    expect(result).not.toHaveProperty("quotaFull");
+  });
+
+  test("should use default language when response language is null", async () => {
+    const responseWithNullLanguage = { ...mockResponse, language: null };
+    mockUpdateResponse.mockResolvedValue(responseWithNullLanguage);
+    mockEvaluateResponseQuotas.mockResolvedValue({
+      shouldEndSurvey: false,
+    });
+
+    const result = await updateResponseWithQuotaEvaluation(updateArgs);
+
+    expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith({
+      surveyId: responseWithNullLanguage.surveyId,
+      responseId: responseWithNullLanguage.id,
+      data: responseWithNullLanguage.data,
+      variables: responseWithNullLanguage.variables,
+      language: "default",
+      responseFinished: responseWithNullLanguage.finished,
+      // The row just written, so `reserved` quota operands resolve (ENG-1840).
+      response: expect.objectContaining({ id: expect.any(String) }),
+      tx: mockTx,
+      quotaContext: mockQuotaContext,
+    });
+
+    expect(result).toEqual(responseWithNullLanguage);
+  });
+  test("forwards the ingest flags the caller computed", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({ shouldEndSurvey: false });
+    const ingestFlags = [{ key: "seats", reason: "coercion_failed" as const }];
+
+    await updateResponseWithQuotaEvaluation({ ...updateArgs, ingestFlags });
+
+    expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, mockResponseInput, mockTx, ingestFlags);
+  });
+
+  test("writes an update without a not-shown record with the stored one, read under the lock (ENG-7332)", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({ shouldEndSurvey: false });
+    const stored = { elements: ["q2"], rows: { trip: ["visa"] } };
+    mockTx.response.findUnique.mockResolvedValue({ notShown: stored });
+
+    await updateResponseWithQuotaEvaluation(updateArgs);
+
+    expect(mockTx.response.findUnique).toHaveBeenCalledWith({
+      where: { id: mockResponseId },
+      select: { notShown: true },
+    });
+    expect(mockUpdateResponse).toHaveBeenCalledWith(
+      mockResponseId,
+      { ...mockResponseInput, notShown: stored },
+      mockTx,
+      undefined
+    );
+  });
+
+  test("writes a not-shown record the update sends as sent, without reading the stored one (ENG-7332)", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({ shouldEndSurvey: false });
+    const responseInput = { ...mockResponseInput, notShown: {} };
+
+    await updateResponseWithQuotaEvaluation({ ...updateArgs, responseInput });
+
+    expect(mockTx.response.findUnique).not.toHaveBeenCalled();
+    expect(mockUpdateResponse).toHaveBeenCalledWith(mockResponseId, responseInput, mockTx, undefined);
+  });
+
+  test("reads the quota definitions before opening the transaction, not inside it (ENG-3285)", async () => {
+    mockUpdateResponse.mockResolvedValue(mockResponse);
+    mockEvaluateResponseQuotas.mockResolvedValue({ shouldEndSurvey: false });
+
+    await updateResponseWithQuotaEvaluation(updateArgs);
+
+    expect(mockLoadQuotaEvaluationContext).toHaveBeenCalledWith("survey123");
+    expect(mockLoadQuotaEvaluationContext.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(prisma.$transaction).mock.invocationCallOrder[0]
+    );
+    expect(mockEvaluateResponseQuotas).toHaveBeenCalledWith(
+      expect.objectContaining({ quotaContext: mockQuotaContext })
+    );
+  });
+
+  test("refuses a response that is finished under the row lock, without writing it (ENG-6869)", async () => {
+    mockLockResponseForUpdate.mockResolvedValue({ finished: true });
+
+    await expect(updateResponseWithQuotaEvaluation(updateArgs)).rejects.toThrow(ResponseAlreadyFinishedError);
+
+    expect(mockLockResponseForUpdate).toHaveBeenCalledWith(mockTx, {
+      responseId: mockResponseId,
+      workspaceId: "workspace123",
+    });
+    expect(mockUpdateResponse).not.toHaveBeenCalled();
+    expect(mockEvaluateResponseQuotas).not.toHaveBeenCalled();
+  });
+
+  test("reports a response that no longer exists as not found", async () => {
+    mockLockResponseForUpdate.mockResolvedValue(null);
+
+    await expect(updateResponseWithQuotaEvaluation(updateArgs)).rejects.toThrow(ResourceNotFoundError);
+
+    expect(mockUpdateResponse).not.toHaveBeenCalled();
+  });
+});
+
+describe("getStoredResponseNotShown", () => {
+  const findStored = (notShown: unknown) => {
+    vi.mocked(prisma.response.findUnique).mockResolvedValue(
+      (notShown === undefined ? null : { notShown }) as never
+    );
+  };
+
+  test("returns the record stored on the response", async () => {
+    findStored({ rows: { trip: ["visa"] } });
+
+    await expect(getStoredResponseNotShown("response123")).resolves.toEqual({ rows: { trip: ["visa"] } });
+    expect(prisma.response.findUnique).toHaveBeenCalledWith({
+      where: { id: "response123" },
+      select: { notShown: true },
+    });
+  });
+
+  test.each([
+    ["no record (a response from before 6.2)", null],
+    ["no response", undefined],
+  ])("returns null for %s", async (_case, notShown) => {
+    findStored(notShown);
+
+    await expect(getStoredResponseNotShown("response123")).resolves.toBeNull();
+  });
+
+  test("throws a server fault for a stored record that does not parse", async () => {
+    findStored({ rows: "visa" });
+
+    await expect(getStoredResponseNotShown("response123")).rejects.toThrow(DatabaseError);
+  });
+});

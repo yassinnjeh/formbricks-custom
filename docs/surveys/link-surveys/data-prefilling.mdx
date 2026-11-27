@@ -1,0 +1,225 @@
+---
+title: "Data Prefilling"
+description:
+  "URL Data Prefilling for Link Surveys in Formbricks"
+icon: "fill"
+---
+
+Data prefilling via the URL allows you to increase completion rate by prefilling data you already have in a different system. Formbricks allows you to prefill multiple questions in a survey and skip prefilled questions.
+
+<iframe
+  className="w-full aspect-video rounded-xl"
+  src="https://www.youtube-nocookie.com/embed/BD0fKo0Q3_0?rel=0"
+  title="How to Prefill Survey Answers With URL Parameters"
+  frameBorder="0"
+  allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+  allowFullScreen
+></iframe>
+
+## Purpose
+
+Data prefilling via URL comes in handy when you:
+
+- Have data for some of the respondents, but not all
+- Have data you want the respondent to confirm or update
+- Have data in a different system (e.g. your database) and want to add it to the user profile in Formbricks
+- Want to embed a survey in an email and increase completion by prefilling the choice selected in the email
+
+## Quick Example
+
+```sh Example URL
+https://app.formbricks.com/s/clin3dxja02k8l80hpwmx4bjy?age=34&nps=9&skipPrefilled=true
+```
+
+## How it works
+
+1. To prefill survey questions, add query parameters to the survey URL using the format `questionCode=answer`, for example `age=34`. The parameter name can also be the Question ID (`questionId=answer`).
+2. The answer must match the question’s expected type to pass [validation](/surveys/link-surveys/data-prefilling#validation). For Single Select and Multi Select questions, `answer` can be the option ID, the option label text or the option's answer code.
+3. The answer needs to be [URL encoded](https://www.urlencoder.org/) (if it contains spaces or special characters)
+
+
+### Skip prefilled questions
+
+You can skip prefilled questions by adding the `skipPrefilled` parameter in the URL. To skip prefilled questions and show the next available question, add `skipPrefilled=true` to the URL. By default, `skipPrefilled` is set to `false`.
+
+```sh Skipping prefilled questions
+app.formbricks.com/s/clin3dxj?age=34&skipPrefilled=true
+```
+
+### Prefilling multiple values
+
+Formbricks lets you prefill as many values as you want. Combine multiple values in the URL using `&`, for example: `name=Bernadette&age=18`. The order of query parameters doesn’t matter, so you can move questions around or add new ones without worrying about the parameter order.
+
+### Where do I find my question code?
+
+Open a question in the Survey Editor and go to its **Settings** tab. The **question code** is in the **Recode** section, for example `age` or `nps`. Formbricks sets a code for every question (`q1`, `q2` and so on), and you can change it **before you activate the survey**. After activation it is locked, so the links you have shared keep working. Learn more in [Question codes and answer codes](/surveys/analysis/question-codes).
+
+The parameter name is matched with the **Question ID** first and with the **question code** second. If you need the Question ID, choose **Copy question ID** in the question's **⋯** menu. Links that already use a Question ID keep working.
+
+<Note>
+  A question code never replaces a reserved link parameter such as `lang`, `startAt` or `skipPrefilled`. Those keep their own meaning.
+</Note>
+
+<Note>
+  A question code names the **question** in the link. For a Single Select or Multi Select question, the value can be an option ID, the option label or the **answer code** you set in **Recode**. See [Using answer codes](#using-answer-codes-for-single-select-and-multi-select-questions).
+</Note>
+
+## Examples
+
+Here are a few examples to get you started:
+
+<Note>
+  The examples below use question codes such as `rating_question`. Replace them with the code of your own question, or with its Question ID.
+</Note>
+
+### Rating Question
+
+Translates to 5 stars / points / emojis:
+
+```sh Rating Question
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?rating_question=5
+```
+
+### NPS Question
+
+Translates to an NPS rating of 10:
+
+```sh NPS Questions
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?nps_question=10
+```
+
+### Single Select Question (Radio)
+
+Chooses the option 'Very disappointed' in the single select question. The string has to be identical to the option in your question:
+
+```sh Single-select Question
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?single_select_question=Very%20disappointed
+```
+
+### Multi Select Question (Checkbox)
+
+Selects three options 'Sun, Palms and Beach' in the multi select question. The strings have to be identical to the options in your question:
+
+```sh Multi-select Question
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?multi_select_question=Sun%2CPalms%2CBeach
+```
+
+### Open Text Question
+
+Adds 'I love Formbricks' as the answer to the open text question:
+
+```sh Open Text Question
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?open_text_question=I%20love%20Formbricks
+```
+
+### Consent Question
+
+Adds 'accepted' as the answer to the Consent question. Alternatively, you can set it to 'dismissed' to skip the question.
+
+```txt Consent Question
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?consent_question=accepted
+```
+
+### Picture Selection Question
+
+Adds index of the selected image(s) as the answer to the Picture Selection question. The index starts from 1
+
+```txt Picture Selection Question
+https://app.formbricks.com/s/clin3yxja52k8l80hpwmx4bjy?picture_selection_question=1%2C2%2C3
+```
+
+
+## Using Option IDs for Single Select and Multi Select Questions
+
+Single Select and Multi Select questions support prefilling with **option IDs** in addition to option labels. This is the most robust approach and the recommended default, especially for multilingual surveys.
+
+### Why Option IDs are recommended
+
+- **Stable:** Option IDs don't change when you edit option labels.
+- **Language-independent:** The same URL works across all survey languages.
+- **Reliable:** No brittle string matching and fewer URL-encoding issues.
+
+### One link per option
+
+When you create one CTA link per answer option (for example in emails), use the option ID as the parameter value:
+
+```sh Option-ID prefill
+https://app.formbricks.com/s/cmoh0584taxoxu501jyvk8tzn?tuk2i9ktui1lee0mfos82czb=e2r697fou23n7ba4vmt7you6
+```
+
+In this example:
+
+- `tuk2i9ktui1lee0mfos82czb` is the Question ID. A question code such as `plan` works in the same place.
+- `e2r697fou23n7ba4vmt7you6` is the selected option ID.
+
+### How to Find Option IDs
+
+1. Open your survey in the Survey Editor
+2. Click on the question you want to prefill
+3. Next to each option, choose **Copy option ID**. The ID of every option is read-only and can be copied from there
+
+### Examples with Option IDs
+
+**Single Select:**
+
+```sh Single Select with Option ID
+https://app.formbricks.com/s/surveyId?plan=option-abc123
+```
+
+**Multi Select:**
+
+```sh Multi Select with Option IDs
+https://app.formbricks.com/s/surveyId?interests=option-1,option-2,option-3
+```
+
+**Mixed IDs and Labels:**
+
+You can even mix option IDs and labels in the same URL (though using IDs consistently is recommended):
+
+```sh Mixed Approach
+https://app.formbricks.com/s/surveyId?interests=option-abc,Some%20Label,option-xyz
+```
+
+### Backward Compatibility
+
+All existing URLs using option IDs or option labels continue to work. A value is only read as an answer code when it matches neither an option ID nor a label.
+
+## Using Answer Codes For Single Select and Multi Select Questions
+
+Every answer option has an **answer code** (`1`, `2`, `98` and so on) in the **Recode** section of the question. Use it as the value, for example on a question with the code `hello` and two options coded `1` and `2`:
+
+```sh Single Select with an answer code
+https://app.formbricks.com/s/surveyId?hello=2
+```
+
+```sh Multi Select with answer codes
+https://app.formbricks.com/s/surveyId?interests=1,2
+```
+
+The value is matched in this order, and the first match wins:
+
+1. The **option ID**
+2. The **option label** in the survey language of the respondent
+3. The **answer code**, exactly as written (codes are lowercase, so `YES_1` does not match `yes_1`)
+
+<Note>
+  If a label looks like another option's code, the label wins. With the options "1" (code `2`) and "2" (code `1`), `?question=1` selects the option labelled "1". Avoid labels that are numbers if you link by answer code.
+</Note>
+
+If the question has an **Other** option, a value that matches an option by ID, label or code selects that option. Only a value that matches none of them is used as the free-text Other answer.
+
+## Validation
+
+Make sure that the answer in the URL matches the expected type for the questions.
+
+The URL validation works as follows:
+
+- **Rating or NPS questions:** The response is parsed as a number and verified to be within the valid range.
+- **Consent type questions:** Valid values are "accepted" (consent given) and "dismissed" (consent not given).
+- **Picture Selection questions:** The response is parsed as comma-separated numbers (1-based indices) and verified against available choices.
+- **Single/Multi Select questions:** Values can be option IDs, exact label text or answer codes. The system tries the option ID first, then the label, then the answer code.
+- **Open Text questions:** Any string value is accepted.
+
+<Note>
+  If an answer is invalid or doesn't match any option, the prefilling will be ignored and the question is presented as if not prefilled.
+</Note>

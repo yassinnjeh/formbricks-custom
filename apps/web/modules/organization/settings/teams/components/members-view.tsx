@@ -1,0 +1,121 @@
+import { Suspense } from "react";
+import { TOrganizationRole } from "@formbricks/types/memberships";
+import { TOrganization } from "@formbricks/types/organizations";
+import { SettingsCard } from "@/app/(app)/workspaces/[workspaceId]/settings/components/SettingsCard";
+import { ENTERPRISE_LICENSE_REQUEST_FORM_URL, INVITE_DISABLED, IS_FORMBRICKS_CLOUD } from "@/lib/constants";
+import { canInviteMembers } from "@/lib/membership/user-management-floor";
+import { getAccessFlags } from "@/lib/membership/utils";
+import { getTranslate } from "@/lingodotdev/server";
+import {
+  getBulkInvitePermission,
+  getIsDashboardViewerRoleEnabled,
+  getIsMultiOrgEnabled,
+} from "@/modules/ee/license-check/lib/utils";
+import { getTeamsWhereUserIsAdmin } from "@/modules/ee/teams/lib/roles";
+import { getTeamsByOrganizationId } from "@/modules/ee/teams/team-list/lib/team";
+import { TOrganizationTeam } from "@/modules/ee/teams/team-list/types/team";
+import { EditMemberships } from "@/modules/organization/settings/teams/components/edit-memberships";
+import { OrganizationActions } from "@/modules/organization/settings/teams/components/edit-memberships/organization-actions";
+import { getMembershipsByUserId } from "@/modules/organization/settings/teams/lib/membership";
+
+interface MembersViewProps {
+  readonly membershipRole?: TOrganizationRole;
+  readonly organization: TOrganization;
+  readonly currentUserId: string;
+  readonly isAccessControlAllowed: boolean;
+  readonly isUserManagementDisabledFromUi: boolean;
+  /** `organization.manage_access`: the role floor the member and invite actions enforce (ENG-6812). */
+  readonly canManageUsers: boolean;
+}
+
+// Carries its own gutter for the same reason the controls above do: the card body is flush.
+export const MembersLoading = () => (
+  <div className="px-4">
+    {Array.from(Array(2)).map((_, index) => (
+      <div key={index} className="mt-4">
+        <div className={`h-8 w-80 animate-pulse rounded-full bg-slate-200`} />
+      </div>
+    ))}
+  </div>
+);
+
+export const MembersView = async ({
+  membershipRole,
+  organization,
+  currentUserId,
+  isAccessControlAllowed,
+  isUserManagementDisabledFromUi,
+  canManageUsers,
+}: MembersViewProps) => {
+  const t = await getTranslate();
+
+  const userMemberships = await getMembershipsByUserId(currentUserId);
+  const isLeaveOrganizationDisabled = userMemberships.length <= 1;
+
+  const isMultiOrgEnabled = await getIsMultiOrgEnabled();
+  const isBulkInviteAllowed = await getBulkInvitePermission(organization.id);
+  const isDashboardViewerRoleEnabled = await getIsDashboardViewerRoleEnabled(organization.id);
+
+  // Fetch admin teams if they're a team admin
+  const userAdminTeamIds = await getTeamsWhereUserIsAdmin(currentUserId, organization.id);
+  const isTeamAdminUser = userAdminTeamIds.length > 0;
+
+  const { isOwner, isManager } = getAccessFlags(membershipRole);
+  const canInvite = canInviteMembers({
+    isOwnerOrManager: isOwner || isManager,
+    canManageUsers,
+    isAccessControlAllowed,
+    isTeamAdmin: isTeamAdminUser,
+  });
+
+  let teams: TOrganizationTeam[] = [];
+
+  if (isAccessControlAllowed) {
+    teams = (await getTeamsByOrganizationId(organization.id)) ?? [];
+  }
+
+  return (
+    <SettingsCard
+      title={t("workspace.settings.general.manage_members")}
+      description={t("workspace.settings.general.manage_members_description")}
+      bodyVariant="flush">
+      {/* The table is edge-to-edge, so the controls above it carry the card's gutter themselves. */}
+      {membershipRole && (
+        <div className="px-4 pt-4">
+          <OrganizationActions
+            organization={organization}
+            membershipRole={membershipRole}
+            role={membershipRole}
+            isLeaveOrganizationDisabled={isLeaveOrganizationDisabled}
+            isInviteDisabled={INVITE_DISABLED}
+            isAccessControlAllowed={isAccessControlAllowed}
+            isFormbricksCloud={IS_FORMBRICKS_CLOUD}
+            isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
+            enterpriseLicenseRequestFormUrl={ENTERPRISE_LICENSE_REQUEST_FORM_URL}
+            isMultiOrgEnabled={isMultiOrgEnabled}
+            teams={teams}
+            isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+            isTeamAdmin={isTeamAdminUser}
+            canInvite={canInvite}
+            userAdminTeamIds={userAdminTeamIds}
+            isBulkInviteAllowed={isBulkInviteAllowed}
+          />
+        </div>
+      )}
+
+      {membershipRole && (
+        <Suspense fallback={<MembersLoading />}>
+          <EditMemberships
+            isAccessControlAllowed={isAccessControlAllowed}
+            isDashboardViewerRoleEnabled={isDashboardViewerRoleEnabled}
+            organization={organization}
+            currentUserId={currentUserId}
+            role={membershipRole}
+            isUserManagementDisabledFromUi={isUserManagementDisabledFromUi}
+            canManageUsers={canManageUsers}
+          />
+        </Suspense>
+      )}
+    </SettingsCard>
+  );
+};

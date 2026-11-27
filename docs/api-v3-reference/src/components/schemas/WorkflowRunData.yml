@@ -1,0 +1,37 @@
+type: object
+description: >
+  Run execution data persisted with the run, mirroring `ZWorkflowRunData`. Scope
+  1 exposes
+
+  this as a debug-oriented JSON dump. Additional runner keys may be present.
+required:
+  - steps
+properties:
+  trigger:
+    allOf:
+      - $ref: ./WorkflowTriggerPayload.yml
+    description: >-
+      Optional duplicate of the trigger payload snapshot kept inside the run
+      data document.
+  steps:
+    type: array
+    items:
+      $ref: ./WorkflowRunStepResult.yml
+  notTaken:
+    type: array
+    description: >-
+      The steps on If/else branches the run did not take, in graph order. Absent on runs without an
+      If/else.
+    items:
+      type: object
+      required:
+        - stepId
+        - stepType
+      properties:
+        stepId:
+          type: string
+          minLength: 1
+        stepType:
+          type: string
+          minLength: 1
+additionalProperties: true

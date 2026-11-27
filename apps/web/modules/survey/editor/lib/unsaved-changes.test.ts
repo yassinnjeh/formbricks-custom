@@ -1,0 +1,225 @@
+import { buildSavedSurvey } from "./__mocks__/saved-survey.mock";
+import { describe, expect, test } from "vitest";
+import { withMatrixConditionIdsInBlocks } from "@formbricks/types/surveys/matrix-conditions";
+import { surveyFlowFixture } from "@formbricks/types/surveys/test-fixtures/survey-flow-fixture";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { reviveSurveyDates } from "./survey-json";
+import { hasUnsavedSurveyChanges, isJustSavedBypassValid } from "./unsaved-changes";
+
+const baseSurvey = {
+  id: "survey_1",
+  name: "My survey",
+  status: "draft",
+  publishOn: null,
+  closeOn: null,
+  displayPercentage: null,
+  segment: null,
+  updatedAt: new Date("2026-01-01T00:00:00.000Z"),
+} as unknown as TSurvey;
+
+const surveyWith = (overrides: Record<string, unknown>): TSurvey => ({ ...baseSurvey, ...overrides });
+
+/** As the Hidden Fields card builds one: no `id`, because the database assigns that on the write. */
+const ingestedRow = (storageKey: string) => ({
+  field: {
+    name: storageKey,
+    source: "ingested" as const,
+    dataType: "string" as const,
+    defaultValue: null,
+    locked: false,
+    key: null,
+  },
+  link: { storageKey },
+});
+
+describe("hasUnsavedSurveyChanges", () => {
+  test("reads clean when the editor matches the survey prop", () => {
+    expect(hasUnsavedSurveyChanges(surveyWith({}), [baseSurvey])).toBe(false);
+  });
+
+  test("ignores updatedAt, which every write moves", () => {
+    const local = surveyWith({ updatedAt: new Date("2026-03-01T00:00:00.000Z") });
+
+    expect(hasUnsavedSurveyChanges(local, [baseSurvey])).toBe(false);
+  });
+
+  // ENG-3395: after Collaborate or Activate changes visibility the editor refreshes the route, so the
+  // `survey` prop comes back with new visibility columns while `localSurvey` keeps the old ones. The
+  // save never writes them, so that difference is not unsaved work.
+  test("ignores the visibility columns, which only the visibility endpoint changes", () => {
+    const local = surveyWith({
+      visibility: "restricted",
+      visibilityVersion: 1,
+      visibilityProjectedVersion: 1,
+    });
+    const refreshedProp = surveyWith({
+      visibility: "workspace",
+      visibilityVersion: 2,
+      visibilityProjectedVersion: 1,
+      visibilityChangedAt: new Date("2026-03-01T00:00:00.000Z"),
+      visibilityChangedById: "user_1",
+    });
+
+    expect(hasUnsavedSurveyChanges(local, [refreshedProp])).toBe(false);
+    // A real edit still reads dirty against the same refreshed prop.
+    expect(hasUnsavedSurveyChanges({ ...local, name: "Renamed" }, [refreshedProp])).toBe(true);
+  });
+
+  // The reported bug. A draft save sets `localSurvey` from the action's response and then
+  // `router.refresh()` re-reads the same survey into the `survey` prop; the two disagree with zero
+  // user edits, so comparing against the prop alone warned about work that was already saved.
+  test("reads clean against the saved response even when the refreshed prop disagrees", () => {
+    const savedResponse = surveyWith({ publishOn: null });
+    const refreshedProp = surveyWith({ publishOn: new Date("2026-02-01T00:00:00.000Z") });
+    const local = surveyWith({ publishOn: null });
+
+    expect(hasUnsavedSurveyChanges(local, [refreshedProp, savedResponse])).toBe(false);
+    // Drop the saved response and the same state reads dirty again — that is the old behaviour.
+    expect(hasUnsavedSurveyChanges(local, [refreshedProp])).toBe(true);
+  });
+
+  test("still warns on an edit made after the save", () => {
+    const savedResponse = surveyWith({ name: "My survey" });
+    const local = surveyWith({ name: "My survey (edited)" });
+
+    expect(hasUnsavedSurveyChanges(local, [baseSurvey, savedResponse])).toBe(true);
+  });
+
+  // ENG-2628. The cards build a row with no `id` — the database assigns it — and they no longer
+  // touch `variables` / `hiddenFields`, which the server derives from the rows. `isDeepEqual` fails
+  // on a differing key count alone, so without normalizing both the draft auto-save would re-save
+  // every tick and the discard dialog would fire on a fully saved survey.
+  test("a field the cards just added reads clean once the save returns it", () => {
+    const local = surveyWith({
+      embeddedFields: [ingestedRow("plan")],
+      variables: [],
+      hiddenFields: { enabled: false, fieldIds: [] },
+    });
+    const savedResponse = surveyWith({
+      embeddedFields: [{ ...ingestedRow("plan"), field: { ...ingestedRow("plan").field, id: "clx_row_1" } }],
+      variables: [],
+      hiddenFields: { enabled: true, fieldIds: ["plan"] },
+    });
+
+    expect(hasUnsavedSurveyChanges(local, [savedResponse])).toBe(false);
+  });
+
+  test("an edit to the rows themselves still reads dirty", () => {
+    const savedResponse = surveyWith({
+      embeddedFields: [{ ...ingestedRow("plan"), field: { ...ingestedRow("plan").field, id: "clx_row_1" } }],
+    });
+    const renamed = surveyWith({
+      embeddedFields: [
+        { ...ingestedRow("plan"), field: { ...ingestedRow("plan").field, name: "Plan tier" } },
+      ],
+    });
+
+    expect(hasUnsavedSurveyChanges(renamed, [savedResponse])).toBe(true);
+  });
+
+  // ENG-3553: the editor sends an edited CSS field with empty compiled output; the save compiles it.
+  test("custom CSS reads clean once saved, whatever compiled output the server returned", () => {
+    const local = surveyWith({
+      customCss: {
+        light: { source: "#fbjs { color: red; }", compiled: "" },
+        dark: null,
+        processorVersion: 0,
+      },
+    });
+    const saved = surveyWith({
+      customCss: {
+        light: { source: "#fbjs { color: red; }", compiled: "@layer fb-survey{…}" },
+        dark: null,
+        processorVersion: 2,
+      },
+    });
+
+    expect(hasUnsavedSurveyChanges(local, [saved])).toBe(false);
+  });
+
+  test("an edit to the custom CSS source still reads dirty", () => {
+    const saved = surveyWith({
+      customCss: {
+        light: { source: "#fbjs { color: red; }", compiled: "x" },
+        dark: null,
+        processorVersion: 2,
+      },
+    });
+    const local = surveyWith({
+      customCss: {
+        light: { source: "#fbjs { color: blue; }", compiled: "" },
+        dark: null,
+        processorVersion: 2,
+      },
+    });
+
+    expect(hasUnsavedSurveyChanges(local, [saved])).toBe(true);
+    expect(hasUnsavedSurveyChanges(surveyWith({ customCss: null }), [saved])).toBe(true);
+  });
+
+  test("whitespace-only custom CSS is the same as none", () => {
+    const local = surveyWith({
+      customCss: { light: { source: "  \n", compiled: "" }, dark: null, processorVersion: 0 },
+    });
+
+    expect(hasUnsavedSurveyChanges(local, [baseSurvey])).toBe(false);
+  });
+
+  // ENG-6934: the save rewrites matrix condition positions from their ids; the auto-save keeps the
+  // result in refs, so a reorder must not leave the editor dirty forever.
+  test("a matrix reorder reads clean once saved, though the save rewrote the condition positions", () => {
+    const local = structuredClone(surveyFlowFixture);
+    const grid = local.blocks.flatMap((block) => block.elements).find((e) => e.id === "brand_grid") as {
+      rows: unknown[];
+    };
+    grid.rows.reverse();
+    const saved = { ...local, blocks: withMatrixConditionIdsInBlocks(local.blocks) };
+
+    expect(saved.blocks).not.toEqual(local.blocks);
+    expect(hasUnsavedSurveyChanges(local, [saved])).toBe(false);
+    expect(hasUnsavedSurveyChanges(local, [surveyFlowFixture])).toBe(true);
+  });
+
+  // The save routes answer in JSON, which drops keys that hold `undefined` and turns dates into strings.
+  // Read back as not dirty, or the autosave saves the same survey every 10 seconds forever.
+  test("a survey saved and read back over JSON reads clean", () => {
+    const local = buildSavedSurvey();
+    expect(Object.hasOwn(local, "keepEndingCardOpen")).toBe(true);
+    const saved = reviveSurveyDates(JSON.parse(JSON.stringify(local)));
+    expect(Object.hasOwn(saved, "keepEndingCardOpen")).toBe(false);
+
+    expect(hasUnsavedSurveyChanges(local, [null, saved])).toBe(false);
+    expect(hasUnsavedSurveyChanges({ ...local, name: "Renamed" }, [null, saved])).toBe(true);
+  });
+
+  test("skips persisted states that are not there yet", () => {
+    expect(hasUnsavedSurveyChanges(baseSurvey, [null, undefined, baseSurvey])).toBe(false);
+    expect(hasUnsavedSurveyChanges(baseSurvey, [null, undefined])).toBe(true);
+  });
+});
+
+describe("isJustSavedBypassValid", () => {
+  test("holds while the save it was set by is still what the editor holds", () => {
+    expect(isJustSavedBypassValid(true, false)).toBe(true);
+  });
+
+  test("is not set at all before a save", () => {
+    expect(isJustSavedBypassValid(false, false)).toBe(false);
+    expect(isJustSavedBypassValid(false, true)).toBe(false);
+  });
+
+  /**
+   * The reported sequence: an autosave succeeds and sets the bypass, the user types again, the tab
+   * hits a stale action and they click Reload. Without this the bypass is still set, the unload guard
+   * returns early, and the edit made after the autosave is discarded with no warning (ENG-2330).
+   */
+  test("retires once the editor is dirty again after the save", () => {
+    const savedByAutosave = surveyWith({ name: "My survey" });
+    const editedAfterwards = surveyWith({ name: "My survey (edited)" });
+
+    const isDirtyAgain = hasUnsavedSurveyChanges(editedAfterwards, [baseSurvey, savedByAutosave]);
+
+    expect(isDirtyAgain).toBe(true);
+    expect(isJustSavedBypassValid(true, isDirtyAgain)).toBe(false);
+  });
+});

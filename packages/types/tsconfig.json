@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "outDir": "./dist",
+    "rootDir": "./"
+  },
+  "exclude": ["dist", "build", "node_modules"],
+  "extends": "@formbricks/config-typescript/node16.json",
+  "include": ["."]
+}

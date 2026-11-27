@@ -1,0 +1,144 @@
+import "server-only";
+import { cookies } from "next/headers";
+import type { Session } from "@formbricks/types/auth";
+import type { TOrganizationRole } from "@formbricks/types/memberships";
+import type { TWorkspace } from "@formbricks/types/workspace";
+import { getWorkspacesByUserId } from "@/app/(app)/workspaces/[workspaceId]/lib/workspace";
+import { IS_DEVELOPMENT, IS_FORMBRICKS_CLOUD } from "@/lib/constants";
+import { FORMBRICKS_ORGANIZATION_ID_COOKIE, FORMBRICKS_WORKSPACE_ID_COOKIE } from "@/lib/localStorage";
+import { getMembershipByUserIdOrganizationId } from "@/lib/membership/service";
+import { getMonthlyOrganizationResponseCount, getOrganization } from "@/lib/organization/service";
+import { getUser } from "@/lib/user/service";
+import { needsMonthlyResponseCount } from "@/lib/utils/billing";
+import { getWorkspace } from "@/lib/workspace/service";
+import { getSession } from "@/modules/auth/lib/session";
+import {
+  getDashboardViewerUnavailablePath,
+  listDashboardViewerWorkspaces,
+} from "@/modules/ee/analysis/lib/dashboard-viewer-access";
+import { getEnterpriseLicense } from "@/modules/ee/license-check/lib/license";
+import {
+  getAccessControlPermission,
+  getOrganizationWorkspacesLimit,
+} from "@/modules/ee/license-check/lib/utils";
+import { withPlanDetailsFor } from "@/modules/organization/lib/plan-details";
+import {
+  pickActiveWorkspaceId,
+  resolveActiveOrganizationId,
+} from "@/modules/settings/lib/active-organization";
+
+type TOrganizationWithBilling = ReturnType<
+  typeof withPlanDetailsFor<NonNullable<Awaited<ReturnType<typeof getOrganization>>>>
+>;
+type TLicense = Awaited<ReturnType<typeof getEnterpriseLicense>>;
+type TUser = NonNullable<Awaited<ReturnType<typeof getUser>>>;
+
+export interface TSettingsLayoutData {
+  session: Session;
+  user: TUser;
+  organization: TOrganizationWithBilling;
+  membershipRole?: TOrganizationRole;
+  isAccessControlAllowed: boolean;
+  isOwnerOrManager: boolean;
+  isMultiOrgEnabled: boolean;
+  organizationWorkspacesLimit: number;
+  license: TLicense;
+  responseCount: number;
+  isFormbricksCloud: boolean;
+  isDevelopment: boolean;
+  // The "current" workspace used to render the sidebar's Workspace section, back link, and the
+  // WorkspaceContext that reused settings components depend on. Null when the user has no workspace
+  // (the org/account settings still render — Phase 2 handles that empty state).
+  currentWorkspace: TWorkspace | null;
+  backUrl: string;
+}
+
+/** Where the settings' back arrow returns to: a Dashboard viewer goes back to its dashboards. */
+const getBackUrl = (organizationId: string, workspaceId: string | undefined, isDashboardViewer: boolean) => {
+  if (isDashboardViewer) {
+    return workspaceId
+      ? `/workspaces/${workspaceId}/dashboards`
+      : getDashboardViewerUnavailablePath(organizationId);
+  }
+  return workspaceId ? `/workspaces/${workspaceId}/surveys` : `/organizations/${organizationId}/landing`;
+};
+
+/**
+ * Assembles everything the shared settings shell (banners + sidebar + top bar) needs for the
+ * org-scoped and account-scoped settings routes, where there is no `workspaceId` in the URL. All of
+ * it is organization-level data, so no workspace is required to resolve it; we additionally surface
+ * the user's first accessible workspace so the sidebar's Workspace section renders identically.
+ *
+ * `organizationId` is optional — account settings don't carry one, so it is resolved from the last
+ * active organization or workspace (see `resolveActiveOrganizationId` in `./active-organization`).
+ *
+ * The "current" workspace is resolved from the same `formbricks-workspace-id` cookie (set by the
+ * proxy from the last visited `/workspaces/[workspaceId]` path), so navigating into the
+ * workspace-agnostic org-settings routes keeps the workspace you came from. If the cookie is missing
+ * or points at a workspace the user can't access, it falls back to the first accessible workspace.
+ */
+export const getSettingsLayoutData = async (
+  userId: string,
+  organizationId?: string
+): Promise<TSettingsLayoutData | null> => {
+  const session = await getSession();
+  if (!session?.user) return null;
+
+  const cookieStore = await cookies();
+  const activeWorkspaceId = cookieStore.get(FORMBRICKS_WORKSPACE_ID_COOKIE)?.value;
+  const activeOrganizationId = cookieStore.get(FORMBRICKS_ORGANIZATION_ID_COOKIE)?.value;
+
+  const orgId =
+    organizationId ?? (await resolveActiveOrganizationId(userId, activeWorkspaceId, activeOrganizationId));
+  if (!orgId) return null;
+
+  const [user, organization, membership] = await Promise.all([
+    getUser(userId),
+    getOrganization(orgId),
+    getMembershipByUserIdOrganizationId(userId, orgId),
+  ]);
+  if (!user || !organization || !membership) return null;
+
+  const isDashboardViewer = membership.role === "dashboard_viewer";
+  // A Dashboard viewer sees nothing of the organization's plan: no Cloud response count, and the
+  // organization below goes out without its billing.
+  const needsResponseCount =
+    IS_FORMBRICKS_CLOUD && !isDashboardViewer && needsMonthlyResponseCount(organization.billing);
+  const [isAccessControlAllowed, license, organizationWorkspacesLimit, workspaces, responseCount] =
+    await Promise.all([
+      getAccessControlPermission(organization.id),
+      getEnterpriseLicense(),
+      getOrganizationWorkspacesLimit(organization.id),
+      isDashboardViewer
+        ? listDashboardViewerWorkspaces(userId, organization.id)
+        : getWorkspacesByUserId(userId, organization.id),
+      needsResponseCount ? getMonthlyOrganizationResponseCount(organization.id) : 0,
+    ]);
+
+  // Resolve the workspace to display in the shell. Prefer the last active workspace when it belongs
+  // to the accessible list; otherwise fall back to the first accessible workspace so the shell
+  // always has something to show.
+  const resolvedWorkspaceId = pickActiveWorkspaceId(workspaces, activeWorkspaceId);
+  // Full workspace object (not just id/name) so the shell can supply the WorkspaceContext.
+  const currentWorkspace = resolvedWorkspaceId ? await getWorkspace(resolvedWorkspaceId) : null;
+  const isOwnerOrManager = membership.role === "owner" || membership.role === "manager";
+
+  return {
+    session,
+    user,
+    organization: withPlanDetailsFor(membership.role, organization),
+    membershipRole: membership.role,
+    isAccessControlAllowed,
+    isOwnerOrManager,
+    isMultiOrgEnabled: license.features?.isMultiOrgEnabled ?? false,
+    organizationWorkspacesLimit,
+    license,
+    responseCount,
+    isFormbricksCloud: IS_FORMBRICKS_CLOUD,
+    isDevelopment: IS_DEVELOPMENT,
+    currentWorkspace,
+    // Without a workspace, "/" would root-redirect into the user's first organization; the landing
+    // page keeps the user in the organization these settings were resolved for.
+    backUrl: getBackUrl(organization.id, currentWorkspace?.id, isDashboardViewer),
+  };
+};

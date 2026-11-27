@@ -1,0 +1,206 @@
+"use client";
+
+import { createId } from "@paralleldrive/cuid2";
+import { type JSX, useMemo, useState } from "react";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { getLanguageLabel } from "@formbricks/i18n-utils/utils";
+import { TI18nString } from "@formbricks/types/i18n";
+import { TSurveyMultipleChoiceElement } from "@formbricks/types/surveys/elements";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { TUserLocale } from "@formbricks/types/user";
+import { createI18nString } from "@/lib/i18n/utils";
+import { findElementLocation } from "@/modules/survey/editor/lib/blocks";
+import { findOptionUse } from "@/modules/survey/editor/lib/utils";
+import { getElementsFromBlocks } from "@/modules/survey/lib/client-utils";
+import { Button } from "@/modules/ui/components/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
+
+interface BulkEditOptionsModalProps {
+  readonly isOpen: boolean;
+  readonly onClose: () => void;
+  readonly regularChoices: TSurveyMultipleChoiceElement["choices"];
+  readonly onSave: (updatedChoices: TSurveyMultipleChoiceElement["choices"]) => void;
+  readonly element: TSurveyMultipleChoiceElement;
+  readonly localSurvey: TSurvey;
+  readonly surveyLanguageCodes: string[];
+  readonly locale: TUserLocale;
+}
+
+const parseUniqueLines = (content: string): string[] => {
+  return [
+    ...new Set(
+      content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+    ),
+  ];
+};
+
+const updateChoiceLabel = (
+  choice: TSurveyMultipleChoiceElement["choices"][number],
+  newLabel: string,
+  selectedLangCode: string,
+  allLangCodes: string[]
+): TSurveyMultipleChoiceElement["choices"][number] => {
+  const label = Object.fromEntries([
+    ...allLangCodes.map((code) => [code, choice.label[code] ?? ""]),
+    [selectedLangCode, newLabel],
+  ]) as TI18nString;
+
+  return { ...choice, label };
+};
+
+export const BulkEditOptionsModal = ({
+  isOpen,
+  onClose,
+  regularChoices,
+  onSave,
+  element,
+  localSurvey,
+  surveyLanguageCodes,
+  locale,
+}: BulkEditOptionsModalProps): JSX.Element => {
+  const selectedLanguageCode = "default";
+  const { t } = useTranslation();
+  const [textareaValue, setTextareaValue] = useState("");
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  const selectedLanguageName = useMemo(() => {
+    if (localSurvey.languages.length <= 1) return null;
+    const code =
+      selectedLanguageCode === "default"
+        ? localSurvey.languages.find((lang) => lang.default)?.language.code
+        : selectedLanguageCode;
+    return code ? getLanguageLabel(code, locale) : null;
+  }, [localSurvey.languages, selectedLanguageCode, locale]);
+
+  // Opening (or new choices or language while open) seeds the textarea. Adjusted during render.
+  const [seededFrom, setSeededFrom] = useState<{
+    regularChoices: typeof regularChoices;
+    selectedLanguageCode: string;
+  } | null>(null);
+  if (!isOpen && seededFrom !== null) {
+    setSeededFrom(null);
+  } else if (
+    isOpen &&
+    (seededFrom?.regularChoices !== regularChoices ||
+      seededFrom.selectedLanguageCode !== selectedLanguageCode)
+  ) {
+    setSeededFrom({ regularChoices, selectedLanguageCode });
+    setTextareaValue(regularChoices.map((c) => c.label[selectedLanguageCode] || "").join("\n"));
+    setValidationError(null);
+  }
+
+  const validateRemovedOptions = (newLabels: string[]): string | null => {
+    const originalLabels = regularChoices.map((c) => c.label[selectedLanguageCode] || "");
+    const missingLabels = originalLabels.filter((label) => label && !newLabels.includes(label));
+
+    if (missingLabels.length === 0) return null;
+
+    // Find which choices have missing labels and check if they're used in logic
+    const choicesWithMissingLabels = missingLabels
+      .map((label) => regularChoices.find((c) => c.label[selectedLanguageCode] === label))
+      .filter((c): c is TSurveyMultipleChoiceElement["choices"][number] => c !== undefined);
+
+    // Get all elements to find which block has the logic
+    const allElements = getElementsFromBlocks(localSurvey.blocks);
+
+    // Build detailed error info: option label -> block name where it's used
+    const problematicOptions: { optionLabel: string; blockName: string }[] = [];
+    let usedInShowIf = false;
+
+    for (const choice of choicesWithMissingLabels) {
+      const use = findOptionUse(localSurvey, element.id, choice.id);
+      if (use) {
+        if (use.kind === "showIf") usedInShowIf = true;
+        const elementWithLogic = allElements[use.elementIndex];
+        // Find which block contains this element
+        const { block } = findElementLocation(localSurvey, elementWithLogic.id);
+        if (block) {
+          const optionLabel = choice.label[selectedLanguageCode] || "";
+          problematicOptions.push({ optionLabel, blockName: block.name });
+        }
+      }
+    }
+
+    if (problematicOptions.length === 0) return null;
+
+    // Format: "Option '3' is used in logic at 'Block Name'"
+    const details = problematicOptions.map((opt) => `"${opt.optionLabel}" → ${opt.blockName}`).join(", ");
+
+    return usedInShowIf
+      ? t("workspace.surveys.edit.options_used_in_logic_or_show_if_bulk_error", { questionIndexes: details })
+      : t("workspace.surveys.edit.options_used_in_logic_bulk_error", { questionIndexes: details });
+  };
+
+  const handleSave = () => {
+    const newLabels = parseUniqueLines(textareaValue);
+    const error = validateRemovedOptions(newLabels);
+
+    if (error) {
+      setValidationError(error);
+      return;
+    }
+
+    const updatedChoices = newLabels.map((label, idx) =>
+      idx < regularChoices.length
+        ? updateChoiceLabel(regularChoices[idx], label, selectedLanguageCode, surveyLanguageCodes)
+        : { id: createId(), label: createI18nString(label, surveyLanguageCodes) }
+    );
+
+    onSave(updatedChoices);
+    onClose();
+    toast.success(t("workspace.surveys.edit.changes_saved"));
+  };
+
+  return (
+    <Dialog open={isOpen} onOpenChange={onClose}>
+      <DialogContent className="max-w-2xl space-y-4">
+        <DialogHeader>
+          <DialogTitle>
+            {selectedLanguageName
+              ? t("workspace.surveys.edit.bulk_edit_options_for", { language: selectedLanguageName })
+              : t("workspace.surveys.edit.bulk_edit_options")}
+          </DialogTitle>
+          <DialogDescription>{t("workspace.surveys.edit.bulk_edit_description")}</DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-2">
+          <textarea
+            value={textareaValue}
+            onChange={(e) => {
+              setTextareaValue(e.target.value);
+              setValidationError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.shiftKey && e.key === "Enter") {
+                e.preventDefault();
+                handleSave();
+              }
+            }}
+            rows={15}
+            className="w-full rounded-md border border-slate-300 bg-white p-3 font-mono text-sm focus:border-brand focus:outline-hidden"
+            placeholder={t("workspace.surveys.edit.bulk_edit_description")}
+          />
+          {validationError && <div className="text-sm text-red-600">{validationError}</div>}
+        </div>
+
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>
+            {t("common.cancel")}
+          </Button>
+          <Button onClick={handleSave}>{t("workspace.surveys.edit.update_options")}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+};

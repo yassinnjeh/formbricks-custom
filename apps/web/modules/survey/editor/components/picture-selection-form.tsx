@@ -1,0 +1,274 @@
+"use client";
+
+import { useAutoAnimate } from "@formkit/auto-animate/react";
+import { createId } from "@paralleldrive/cuid2";
+import { CopyIcon, PlusIcon } from "lucide-react";
+import { type JSX } from "react";
+import { useTranslation } from "react-i18next";
+import { IMAGE_FILE_EXTENSIONS } from "@formbricks/types/storage";
+import type { TSurveyElement, TSurveyPictureSelectionElement } from "@formbricks/types/surveys/elements";
+import { TSurvey } from "@formbricks/types/surveys/types";
+import { TUserLocale } from "@formbricks/types/user";
+import { cn } from "@/lib/cn";
+import { createI18nString, extractLanguageCodes } from "@/lib/i18n/utils";
+import { ElementFormInput } from "@/modules/survey/components/element-form-input";
+import { ImageAltTextButton } from "@/modules/survey/components/element-form-input/components/image-alt-text-button";
+import { isValueIncomplete } from "@/modules/survey/components/element-form-input/utils";
+import { useCopyId } from "@/modules/survey/editor/components/copy-id-button";
+import {
+  HiddenOptionBadge,
+  OptionHideButton,
+  type TSetOptionHidden,
+} from "@/modules/survey/editor/components/option-hide-button";
+import { PublishedLockNotice } from "@/modules/survey/editor/components/published-lock-notice";
+import { NO_ELEMENT_LOCK, TElementLock } from "@/modules/survey/editor/lib/published-lock";
+import { Button } from "@/modules/ui/components/button";
+import { FileInput } from "@/modules/ui/components/file-input";
+import { Label } from "@/modules/ui/components/label";
+import { Switch } from "@/modules/ui/components/switch";
+
+interface PictureSelectionFormProps {
+  readonly localSurvey: TSurvey;
+  readonly element: TSurveyPictureSelectionElement;
+  readonly elementIdx: number;
+  readonly updateElement: (elementIdx: number, updatedAttributes: Partial<TSurveyElement>) => void;
+  readonly isInvalid: boolean;
+  readonly locale: TUserLocale;
+  readonly isStorageConfigured: boolean;
+  readonly isExternalUrlsAllowed?: boolean;
+  readonly lock?: TElementLock;
+  /** The Hide quick action on each picture (ENG-6949). */
+  readonly onSetOptionHidden?: TSetOptionHidden;
+}
+
+export const PictureSelectionForm = ({
+  localSurvey,
+  element,
+  elementIdx,
+  updateElement,
+  isInvalid,
+  locale,
+  isStorageConfigured = true,
+  isExternalUrlsAllowed,
+  lock = NO_ELEMENT_LOCK,
+  onSetOptionHidden,
+}: PictureSelectionFormProps): JSX.Element => {
+  const workspaceId = localSurvey.workspaceId;
+  const surveyLanguageCodes = extractLanguageCodes(localSurvey.languages);
+  const { t } = useTranslation();
+  const copyId = useCopyId();
+  const handleChoiceDeletion = (choiceValue: string) => {
+    // Filter out the deleted choice from the choices array
+    const newChoices = element.choices?.filter((choice) => choice.id !== choiceValue) || [];
+
+    // Update the element with new choices and logic
+    updateElement(elementIdx, {
+      choices: newChoices,
+    });
+  };
+
+  const handleFileInputChanges = (urls: string[] | undefined, _fileType: "image" | "video") => {
+    if (!urls) return;
+    // Handle choice deletion
+    if (urls.length < element.choices.length) {
+      const deletedChoice = element.choices.find((choice) => !urls.includes(choice.imageUrl));
+      if (deletedChoice) {
+        handleChoiceDeletion(deletedChoice.id);
+      }
+    }
+
+    // Handle choice addition
+    const updatedChoices = urls.map((url) => {
+      const existingChoice = element.choices.find((choice) => choice.imageUrl === url);
+      return existingChoice ? { ...existingChoice } : { imageUrl: url, id: createId() };
+    });
+
+    updateElement(elementIdx, {
+      choices: updatedChoices,
+    });
+  };
+
+  // ElementFormInput writes `{ imageAltText }` through `updateElement`; route it onto the one choice instead.
+  const updateChoiceAltText = (choiceId: string) => (_elementIdx: number, data: Partial<TSurveyElement>) => {
+    updateElement(elementIdx, {
+      choices: element.choices.map((choice) =>
+        choice.id === choiceId ? { ...choice, imageAltText: data.imageAltText } : choice
+      ),
+    });
+  };
+
+  const renderChoiceAltTextButton = (url: string) => {
+    const choiceIdx = element.choices.findIndex((choice) => choice.imageUrl === url);
+    if (choiceIdx === -1) return null;
+    const choice = element.choices[choiceIdx];
+    const label = t("workspace.surveys.edit.image_alt_text_choice_n", { n: choiceIdx + 1 });
+    const isHidden = choice.hidden === true;
+    return (
+      <>
+        {/* A Hidden picture reads as hidden (ENG-6949): washed out, with the Flow tab's Hidden badge. */}
+        {isHidden && <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-white/50" />}
+        {onSetOptionHidden && (
+          <OptionHideButton
+            item={choice}
+            listKey="choices"
+            onSetHidden={onSetOptionHidden}
+            triggerClassName="absolute top-2 left-2"
+            className="size-7"
+          />
+        )}
+        {isHidden && <HiddenOptionBadge className="absolute top-3 left-11 bg-white" />}
+        <button
+          type="button"
+          aria-label={t("workspace.surveys.edit.copy_option_id")}
+          title={`${t("workspace.surveys.edit.copy_option_id")}: ${choice.id}`}
+          data-testid="copy-option-id"
+          data-option-id={choice.id}
+          className="absolute right-2 bottom-2 flex cursor-pointer items-center rounded-md bg-slate-100 p-1 text-slate-700 opacity-60 transition-opacity hover:opacity-100 focus-visible:opacity-100"
+          onClick={(e) => {
+            e.preventDefault();
+            void copyId(choice.id);
+          }}>
+          <CopyIcon className="size-3.5" />
+        </button>
+        <ImageAltTextButton
+          label={label}
+          hasAltText={Boolean(choice.imageAltText?.default?.trim())}
+          isInvalid={isValueIncomplete("imageAltText", isInvalid, surveyLanguageCodes, choice.imageAltText)}>
+          <ElementFormInput
+            id="imageAltText"
+            value={choice.imageAltText ?? createI18nString("", surveyLanguageCodes)}
+            label={label}
+            placeholder={t("workspace.surveys.edit.image_alt_text_placeholder")}
+            localSurvey={localSurvey}
+            elementIdx={elementIdx}
+            isInvalid={isInvalid}
+            updateElement={updateChoiceAltText(choice.id)}
+            locale={locale}
+            isStorageConfigured={isStorageConfigured}
+          />
+        </ImageAltTextButton>
+      </>
+    );
+  };
+
+  const [parent] = useAutoAnimate();
+  return (
+    <form>
+      <ElementFormInput
+        id="headline"
+        value={element.headline}
+        label={t("workspace.surveys.edit.question") + "*"}
+        localSurvey={localSurvey}
+        elementIdx={elementIdx}
+        isInvalid={isInvalid}
+        updateElement={updateElement}
+        locale={locale}
+        isStorageConfigured={isStorageConfigured}
+        isExternalUrlsAllowed={isExternalUrlsAllowed}
+        focusOnMount={!element.headline?.default || element.headline.default.trim() === ""}
+      />
+      <div ref={parent}>
+        {element.subheader !== undefined && (
+          <div className="inline-flex w-full items-center">
+            <div className="w-full">
+              <ElementFormInput
+                id="subheader"
+                value={element.subheader}
+                label={t("common.description")}
+                localSurvey={localSurvey}
+                elementIdx={elementIdx}
+                isInvalid={isInvalid}
+                updateElement={updateElement}
+                locale={locale}
+                isStorageConfigured={isStorageConfigured}
+                isExternalUrlsAllowed={isExternalUrlsAllowed}
+                focusOnMount={!element.subheader?.default || element.subheader.default.trim() === ""}
+              />
+            </div>
+          </div>
+        )}
+        {element.subheader === undefined && (
+          <Button
+            size="sm"
+            variant="secondary"
+            className="mt-3"
+            type="button"
+            onClick={() => {
+              updateElement(elementIdx, {
+                subheader: createI18nString("", surveyLanguageCodes),
+              });
+            }}>
+            <PlusIcon className="mr-1 size-4" />
+            {t("workspace.surveys.edit.add_description")}
+          </Button>
+        )}
+      </div>
+      <div className="mt-2">
+        <Label htmlFor="Images">
+          {t("common.images")}{" "}
+          <span
+            className={cn("text-slate-400", {
+              "text-red-600": isInvalid && element.choices?.length < 2,
+            })}>
+            ({t("workspace.surveys.edit.upload_at_least_2_images")})
+          </span>
+        </Label>
+        <div className="mt-3 flex w-full items-center justify-center">
+          <FileInput
+            id="choices-file-input"
+            allowedFileExtensions={[...IMAGE_FILE_EXTENSIONS]}
+            workspaceId={workspaceId}
+            onFileUpload={handleFileInputChanges}
+            fileUrl={element?.choices?.map((choice) => choice.imageUrl)}
+            multiple={true}
+            maxSizeInMB={5}
+            isStorageConfigured={isStorageConfigured}
+            renderImageAction={renderChoiceAltTextButton}
+            getRemoveLockReason={(url) => {
+              const choice = element.choices.find((c) => c.imageUrl === url);
+              return choice && lock.isOptionLocked("choices", choice.id)
+                ? t("workspace.surveys.edit.lock_explanation_option_delete")
+                : undefined;
+            }}
+          />
+        </div>
+      </div>
+
+      <div className="my-4 flex items-center gap-x-2">
+        <Switch
+          id="multi-select-toggle"
+          checked={element.allowMulti}
+          // Single and multiple selection store different answers: a published question keeps its mode.
+          disabled={lock.isTypeLocked}
+          onClick={(e) => {
+            e.stopPropagation();
+            const newAllowMulti = !element.allowMulti;
+            // If switching to single-select (allowMulti = false), remove validation rules
+            // since they're only applicable for multi-select
+            const updatedAttributes: Partial<TSurveyPictureSelectionElement> = {
+              allowMulti: newAllowMulti,
+            };
+            if (!newAllowMulti && element.validation?.rules && element.validation.rules.length > 0) {
+              updatedAttributes.validation = {
+                ...element.validation,
+                rules: [],
+              };
+            }
+            updateElement(elementIdx, updatedAttributes);
+          }}
+        />
+        <Label htmlFor="multi-select-toggle" className="cursor-pointer">
+          <div className="ml-2">
+            <h3 className="flex items-center gap-1 text-sm font-semibold text-slate-700">
+              {t("workspace.surveys.edit.allow_multi_select")}
+              {lock.isTypeLocked && <PublishedLockNotice kind="type" />}
+            </h3>
+            <p className="text-xs font-normal text-slate-500">
+              {t("workspace.surveys.edit.allow_users_to_select_more_than_one_image")}
+            </p>
+          </div>
+        </Label>
+      </div>
+    </form>
+  );
+};

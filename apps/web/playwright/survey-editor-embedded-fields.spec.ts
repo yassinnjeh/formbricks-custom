@@ -1,0 +1,440 @@
+import { type Locator, type Page, expect } from "@playwright/test";
+import { prisma } from "@formbricks/database";
+import { test } from "./lib/fixtures";
+import { clickUntilVisible } from "./utils/click-until";
+import {
+  type EmbeddedFieldSource,
+  addEmbeddedField,
+  addFlowRule,
+  createSurveyFromScratch,
+  editEmbeddedField,
+  editorPanel,
+  embeddedFieldRow,
+  fillEmbeddedFieldDialog,
+  fillRichTextEditor,
+  openCreateEmbeddedFieldTab,
+  openEmbeddedDataCard,
+  setExpressionMode,
+} from "./utils/helper";
+
+/**
+ * Embedded Data definitions in the survey editor (ENG-1837, ENG-2628, ENG-1851).
+ *
+ * The `EmbeddedData` / `SurveyEmbeddedData` tables are the read source of truth for Embedded Data
+ * definitions: readers resolve through the `embeddedFields` list inlined onto the survey at load
+ * instead of reading `survey.variables` / `survey.hiddenFields`. ENG-1837 made the editor the one
+ * exception — its cards owned the legacy columns, so every editor surface had to derive from them or
+ * show pre-edit definitions until the next save.
+ *
+ * ENG-2628 removed that exception by removing the second description: the cards edited
+ * `embeddedFields` itself, and every editor surface read it like every runtime reader does. ENG-1851
+ * then replaced the two cards with **one Embedded Data card** over that same list, so the rows win
+ * here too and a card edit still reaches the pickers on the next render.
+ *
+ * Neither half is observable on a survey with no rows (an empty inlined list falls back to the legacy
+ * columns anyway), so this spec deliberately saves first and reloads: from there on, `localSurvey`
+ * carries real rows and every assertion below can tell "reads the rows" apart from "derives from the
+ * legacy columns".
+ */
+
+const QUESTION_HEADLINE = "Which plan are you on?";
+
+/**
+ * Safe-identifier names (lowercase letters, digits and underscores, leading letter) with a random
+ * suffix, so an assertion can never match a name another run left behind.
+ */
+const uniqueName = (prefix: string): string => `${prefix}_${Math.random().toString(36).slice(2, 8)}`;
+
+/** Same label -> container walk as `fillRichTextEditor` (utils/helper.ts). */
+const headlineEditor = (page: Page): Locator =>
+  editorPanel(page).locator('label:has-text("Question*")').locator("..").locator("..");
+
+/** Opens the Add field dialog's create tab with the source already picked. */
+const openNewFieldDialog = async (page: Page, source: EmbeddedFieldSource): Promise<Locator> => {
+  const dialog = await openCreateEmbeddedFieldTab(page);
+  await fillEmbeddedFieldDialog(page, { source });
+  return dialog;
+};
+
+/**
+ * Submits the open dialog under `name` and expects the reserved-name refusal.
+ *
+ * Refusal is asserted as behaviour — the dialog stays open and no row reaches the card — rather than
+ * by matching the inline message, whose exact copy is translated and belongs to the dialog rather
+ * than to this journey.
+ */
+const expectReservedNameRefused = async (page: Page, name: string): Promise<void> => {
+  const dialog = page.getByRole("dialog");
+
+  await fillEmbeddedFieldDialog(page, { name });
+  await dialog.getByRole("button", { name: "Add", exact: true }).click();
+
+  await expect(dialog, "a refused name must leave the dialog open").toBeVisible();
+  await expect(
+    editorPanel(page).getByTestId("embedded-field-row"),
+    "a refused name must not reach the card"
+  ).toHaveCount(0);
+};
+
+/** Adds the field the open dialog is filled for, and waits for its row. */
+const addFieldFromOpenDialog = async (page: Page, name: string): Promise<void> => {
+  await fillEmbeddedFieldDialog(page, { name });
+  await page.getByRole("dialog").getByRole("button", { name: "Add", exact: true }).click();
+  await expect(embeddedFieldRow(page, name)).toBeVisible();
+};
+
+/** Shows the editor's Questions tab, where the question cards and the Embedded Data card live. */
+const showQuestionsTab = async (page: Page): Promise<void> => {
+  await page.getByRole("button", { name: "Questions", exact: true }).click();
+  await expect(editorPanel(page).getByTestId("embedded-data-card-trigger")).toBeVisible();
+};
+
+/** Opens the element card if it is collapsed — same click-until-open shape as `openEmbeddedDataCard`. */
+const openQuestionCard = async (page: Page, heading = QUESTION_HEADLINE): Promise<void> => {
+  await showQuestionsTab(page);
+  const questionLabel = editorPanel(page).locator('label:has-text("Question*")');
+
+  await clickUntilVisible(editorPanel(page).getByRole("heading", { name: heading }), questionLabel);
+};
+
+/**
+ * Opens the recall picker on the question headline. Both entry points are covered: the `@` key the
+ * ticket names, and the editor toolbar's "Recall data" button.
+ */
+const openRecallPicker = async (page: Page, via: "at-key" | "toolbar"): Promise<Locator> => {
+  await openQuestionCard(page);
+
+  if (via === "at-key") {
+    const input = headlineEditor(page).locator(".editor-input").first();
+    await input.click();
+    await input.press("End");
+    await input.press("@");
+  } else {
+    await headlineEditor(page).getByRole("button", { name: "Recall data", exact: true }).click();
+  }
+
+  const picker = page.locator("[data-recall-dropdown]");
+  await expect(picker).toBeVisible();
+  return picker;
+};
+
+const closeRecallPicker = async (page: Page): Promise<void> => {
+  await page.keyboard.press("Escape");
+  await expect(page.locator("[data-recall-dropdown]")).toBeHidden();
+};
+
+const recallItem = (picker: Locator, name: string): Locator =>
+  picker.getByRole("menuitem", { name, exact: true });
+
+/**
+ * Opens the block's rule on the Flow tab, where logic lives since ENG-6929, adding it when the block
+ * has none yet. The Flow tab opens one rule at a time, so its editor's ids are `condition-0-0-…`.
+ */
+const openBlockLogic = async (page: Page): Promise<void> => {
+  await page.getByRole("button", { name: "Flow", exact: true }).click();
+
+  const firstConditionOperand = page.locator("#condition-0-0-conditionValue");
+  if (await firstConditionOperand.isVisible().catch(() => false)) return;
+  // The Flow tab opens with every block collapsed, which hides their rules.
+  const expand = page.getByRole("button", { name: "Expand", exact: true });
+  if (await expand.isVisible()) await expand.click();
+
+  // A rule's row reads "If …"; it opens its editor.
+  const ruleRow = editorPanel(page).getByRole("button", { expanded: false }).filter({ hasText: /^If / });
+  if ((await ruleRow.count()) > 0) {
+    await ruleRow.first().click();
+  } else {
+    await addFlowRule(page, 1);
+  }
+  await expect(firstConditionOperand).toBeVisible();
+};
+
+const openCombobox = async (page: Page, id: string): Promise<Locator> => {
+  await page.locator(`#${id}`).click();
+  const menu = page.getByTestId("dropdown-menu-content");
+  await expect(menu).toBeVisible();
+  return menu;
+};
+
+const closeCombobox = async (page: Page): Promise<void> => {
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("dropdown-menu-content")).toBeHidden();
+};
+
+const saveDraft = async (page: Page): Promise<void> => {
+  await page.getByRole("button", { name: "Save as draft", exact: true }).click({ noWaitAfter: true });
+  await expect(page.getByText("Changes saved.", { exact: true })).toBeVisible();
+};
+
+test.describe("Survey editor Embedded Data definitions @slow", () => {
+  test.setTimeout(1000 * 60 * 3);
+
+  test("card edits reach the recall, logic and calculate pickers without a reload", async ({
+    page,
+    users,
+  }) => {
+    const variableName = uniqueName("var_alpha");
+    const renamedVariableName = uniqueName("var_beta");
+    const rowEditedName = uniqueName("var_row");
+    const firstHiddenField = uniqueName("hidden_one");
+    const secondHiddenField = uniqueName("hidden_two");
+
+    const user = await users.create();
+    await user.login();
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const surveyId = await createSurveyFromScratch(page);
+
+    await openQuestionCard(page, "What would you like to know?");
+    await fillRichTextEditor(page, "Question*", QUESTION_HEADLINE);
+
+    // A calculated field and a passed-in one, both declared on the one card.
+    await addEmbeddedField(page, { name: variableName, source: "Calculated", type: "Text" });
+    await addEmbeddedField(page, { name: firstHiddenField, source: "Passed in", type: "Text" });
+
+    // Persist them, which is what writes the EmbeddedData rows, then reload so the editor mounts
+    // with those rows inlined on the survey. Everything below is asserted against that state — the
+    // only one in which "reads the rows" and "derives from the cards" can disagree.
+    await saveDraft(page);
+    expect(await prisma.surveyEmbeddedData.count({ where: { surveyId } })).toBe(2);
+
+    // Pull the two descriptions apart rather than waiting for them to drift: the saved row is edited
+    // behind the editor's back so it claims a different name and a different type than the legacy
+    // column derived from it does. Whichever one the editor reads, the other is now wrong about
+    // something — which is what every assertion below reads off.
+    const rowUpdate = await prisma.embeddedData.updateMany({
+      where: { surveyId, source: "computed" },
+      data: { name: rowEditedName, dataType: "number" },
+    });
+    expect(rowUpdate.count).toBe(1);
+
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await expect(editorPanel(page).getByRole("heading", { name: QUESTION_HEADLINE })).toBeVisible();
+
+    // Baseline: the rows' definitions are offered, and the legacy column's name is nowhere. Before
+    // ENG-2628 this pair was the other way round.
+    const pickerBeforeEdit = await openRecallPicker(page, "at-key");
+    await expect(recallItem(pickerBeforeEdit, rowEditedName)).toHaveAttribute("data-recall-type", "variable");
+    await expect(recallItem(pickerBeforeEdit, firstHiddenField)).toHaveAttribute(
+      "data-recall-type",
+      "hiddenField"
+    );
+    await expect(recallItem(pickerBeforeEdit, variableName)).toHaveCount(0);
+    await closeRecallPicker(page);
+
+    // The card edits the same list it reads, so it names the row too.
+    await openEmbeddedDataCard(page);
+    await expect(embeddedFieldRow(page, rowEditedName)).toBeVisible();
+
+    await openBlockLogic(page);
+    const operandsBeforeEdit = await openCombobox(page, "condition-0-0-conditionValue");
+    await expect(operandsBeforeEdit.getByRole("option", { name: rowEditedName, exact: true })).toBeVisible();
+    await expect(operandsBeforeEdit.getByRole("option", { name: variableName, exact: true })).toHaveCount(0);
+    await operandsBeforeEdit.getByRole("option", { name: firstHiddenField, exact: true }).click();
+
+    await openCombobox(page, "action-0-objective");
+    await page.getByRole("option", { name: "Set value", exact: true }).click();
+    // One step shows the typed value input checked below.
+    await setExpressionMode(page, 0, false);
+    const variablesBeforeEdit = await openCombobox(page, "action-0-variableId");
+    await variablesBeforeEdit.getByRole("option", { name: rowEditedName, exact: true }).click();
+    // The row says number while the legacy column still says text, so this is the row's answer.
+    await expect(page.locator("#action-0-value-input")).toHaveAttribute("type", "number");
+
+    // Now edit through the card: rename the calculated field, retype it back to text, and declare a
+    // second passed-in field. The card writes `embeddedFields`, which is what every reader below is
+    // reading — so this must land with no save and no reload.
+    await showQuestionsTab(page);
+    await editEmbeddedField(page, rowEditedName, { name: renamedVariableName, type: "Text" });
+    await addEmbeddedField(page, { name: secondHiddenField, source: "Passed in" });
+
+    // Recall picker: the new name and the new passed-in field, and no trace of the name it replaced.
+    const pickerAfterEdit = await openRecallPicker(page, "toolbar");
+    await expect(recallItem(pickerAfterEdit, renamedVariableName)).toHaveAttribute(
+      "data-recall-type",
+      "variable"
+    );
+    await expect(recallItem(pickerAfterEdit, secondHiddenField)).toHaveAttribute(
+      "data-recall-type",
+      "hiddenField"
+    );
+    await expect(recallItem(pickerAfterEdit, rowEditedName)).toHaveCount(0);
+    await closeRecallPicker(page);
+
+    // Logic operand picker: same, live.
+    await openBlockLogic(page);
+    const operandsAfterEdit = await openCombobox(page, "condition-0-0-conditionValue");
+    await expect(
+      operandsAfterEdit.getByRole("option", { name: renamedVariableName, exact: true })
+    ).toBeVisible();
+    await expect(
+      operandsAfterEdit.getByRole("option", { name: secondHiddenField, exact: true })
+    ).toBeVisible();
+    await expect(operandsAfterEdit.getByRole("option", { name: rowEditedName, exact: true })).toHaveCount(0);
+    await closeCombobox(page);
+
+    // Calculate action: still bound to the same field (renaming keeps its address), now labelled with
+    // the new name, and its value widget follows the field's new type.
+    await expect(page.locator("#action-0-variableId")).toContainText(renamedVariableName);
+    await expect(page.locator("#action-0-value-input")).toHaveAttribute("type", "text");
+
+    // The edits survive a save and a reload, and the save is what writes the card's answer back onto
+    // the row — including over the type the behind-the-back edit put there.
+    await saveDraft(page);
+    expect(await prisma.surveyEmbeddedData.count({ where: { surveyId } })).toBe(3);
+    expect(await prisma.embeddedData.findFirst({ where: { surveyId, source: "computed" } })).toMatchObject({
+      name: renamedVariableName,
+      dataType: "string",
+    });
+    await page.reload({ waitUntil: "domcontentloaded" });
+
+    await showQuestionsTab(page);
+    await openEmbeddedDataCard(page);
+    await expect(embeddedFieldRow(page, renamedVariableName)).toBeVisible();
+    await expect(embeddedFieldRow(page, firstHiddenField)).toBeVisible();
+    await expect(embeddedFieldRow(page, secondHiddenField)).toBeVisible();
+
+    await openBlockLogic(page);
+    await expect(page.locator("#action-0-variableId")).toContainText(renamedVariableName);
+    await expect(page.locator("#action-0-value-input")).toHaveAttribute("type", "text");
+  });
+
+  /**
+   * ENG-1839. `country` is a Tier-1 reserved field, read off every response. A newly declared
+   * passed-in field may not take that name — the two would collide in the recall/logic namespace, and
+   * `getHiddenFieldsFromSearchParams` would refuse to fill it, leaving it silently empty forever.
+   *
+   * Surveys that ALREADY declare `country` are grandfathered and keep working; that half is covered
+   * below the browser boundary (service, v3 patch and reconcile suites), because reaching it here
+   * would mean authoring a state the editor now refuses to create.
+   */
+  test("refuses a hidden field named after a reserved field", async ({ page, users }) => {
+    const allowedName = uniqueName("plan_tier");
+
+    const user = await users.create();
+    await user.login();
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const surveyId = await createSurveyFromScratch(page);
+
+    await openNewFieldDialog(page, "Passed in");
+    await expectReservedNameRefused(page, "country");
+    // Uppercase is refused too: the reserved match is case-insensitive, and a survey declaring
+    // `Country` would collide with the same reserved read.
+    await expectReservedNameRefused(page, "Country");
+
+    // An ordinary name still works, so the guard rejects the reserved name rather than the dialog.
+    await addFieldFromOpenDialog(page, allowedName);
+
+    // And the refusal really did not reach the database: the save writes one field, not three.
+    await saveDraft(page);
+    const stored = await prisma.surveyEmbeddedData.findMany({
+      where: { surveyId },
+      select: { storageKey: true },
+    });
+    expect(stored.map((field) => field.storageKey)).toEqual([allowedName]);
+  });
+});
+
+/**
+ * The shared Embedded Data library end to end: define fields on the settings page, link one into a
+ * survey from the editor, file a survey's own field in the library, and see the library refuse to delete
+ * a field a survey still uses. Asserted on what the pages show and what the database holds, so it holds
+ * before and after these surfaces moved from server actions onto `/api/internal/embedded-data` (ENG-3984).
+ */
+test.describe("Embedded Data library @slow", () => {
+  test.setTimeout(1000 * 60 * 3);
+
+  test("defines, links, promotes and refuses to delete a field in use", async ({ page, users }) => {
+    const linked = uniqueName("plan_tier");
+    const renamed = uniqueName("plan_name");
+    const unused = uniqueName("unused");
+    const local = uniqueName("referrer");
+
+    const user = await users.create();
+    await user.login();
+    await page.waitForURL(/\/workspaces\/[^/]+\/surveys/);
+    const { workspaceId } = user;
+    if (!workspaceId) throw new Error("Workspace not seeded for the test user");
+    const libraryUrl = `/workspaces/${workspaceId}/settings/workspace/embedded-data`;
+    const libraryRow = (name: string) => page.getByRole("row").filter({ hasText: name });
+    const storedField = (key: string) => prisma.embeddedData.findFirst({ where: { workspaceId, key } });
+
+    const createLibraryField = async (name: string) => {
+      await page.getByRole("button", { name: "New field" }).click();
+      const dialog = page.getByRole("dialog");
+      // The key writes itself from the name.
+      await dialog.getByRole("textbox", { name: "Name" }).fill(name);
+      await dialog.getByRole("button", { name: "Create field" }).click();
+      await expect(libraryRow(name)).toBeVisible();
+    };
+
+    await test.step("define two library fields and rename one", async () => {
+      await page.goto(libraryUrl, { waitUntil: "domcontentloaded" });
+      await createLibraryField(linked);
+      await createLibraryField(unused);
+      expect(await storedField(linked)).toMatchObject({ name: linked, surveyId: null });
+
+      await libraryRow(linked).click();
+      const dialog = page.getByRole("dialog");
+      await dialog.getByRole("textbox", { name: "Name" }).fill(renamed);
+      await dialog.getByRole("button", { name: "Save", exact: true }).click();
+      await expect(libraryRow(renamed)).toBeVisible();
+      await expect.poll(async () => (await storedField(linked))?.name).toBe(renamed);
+    });
+
+    let surveyId = "";
+    await test.step("link a library field into a survey, and file the survey's own field in the library", async () => {
+      await page.goto(`/workspaces/${workspaceId}/surveys`, { waitUntil: "domcontentloaded" });
+      surveyId = await createSurveyFromScratch(page);
+
+      await openEmbeddedDataCard(page);
+      await editorPanel(page).getByRole("button", { name: "Add field", exact: true }).click();
+      await page
+        .getByTestId("embedded-data-library-row")
+        .filter({ hasText: renamed })
+        .getByRole("button", { name: "Add" })
+        .click();
+      await expect(embeddedFieldRow(page, renamed)).toBeVisible();
+
+      await addEmbeddedField(page, { name: local, source: "Passed in", type: "Text" });
+      await saveDraft(page);
+
+      await embeddedFieldRow(page, local)
+        .getByRole("button", { name: /Open options/ })
+        .click();
+      await page.getByRole("menuitem", { name: "Add to library", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Add to library" }).click();
+      await expect(page.getByText(`${local} is now a library field`)).toBeVisible();
+      await expect.poll(async () => (await storedField(local))?.surveyId).toBeNull();
+    });
+
+    await test.step("see where a field is used, and fail to delete it while it is", async () => {
+      await page.goto(libraryUrl, { waitUntil: "domcontentloaded" });
+      await libraryRow(renamed).getByText("1 survey").click();
+      const { name: surveyName } = await prisma.survey.findUniqueOrThrow({
+        where: { id: surveyId },
+        select: { name: true },
+      });
+      await expect(page.getByRole("link", { name: surveyName })).toBeVisible();
+      await page.keyboard.press("Escape");
+
+      await libraryRow(renamed)
+        .getByRole("button", { name: /Open options/ })
+        .click();
+      await page.getByRole("menuitem", { name: "Delete", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(page.getByText(`${renamed} is still used`)).toBeVisible();
+      expect(await storedField(linked)).not.toBeNull();
+      await page.keyboard.press("Escape");
+    });
+
+    await test.step("delete a field no survey uses", async () => {
+      await libraryRow(unused)
+        .getByRole("button", { name: /Open options/ })
+        .click();
+      await page.getByRole("menuitem", { name: "Delete", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Delete", exact: true }).click();
+      await expect(libraryRow(unused)).toHaveCount(0);
+      await expect.poll(() => storedField(unused)).toBeNull();
+    });
+  });
+});

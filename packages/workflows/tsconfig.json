@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "module": "es2020",
+    "moduleResolution": "bundler",
+    "outDir": "dist",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "exclude": ["node_modules", "dist"],
+  "extends": "@formbricks/config-typescript/js-library.json",
+  "include": ["src"]
+}

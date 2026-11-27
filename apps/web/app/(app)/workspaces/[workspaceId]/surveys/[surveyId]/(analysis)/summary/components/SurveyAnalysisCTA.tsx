@@ -1,0 +1,351 @@
+"use client";
+
+import { BellRing, Eye, ListRestart, RefreshCcwIcon, SquarePenIcon } from "lucide-react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { useState } from "react";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import { TSegment } from "@formbricks/types/segment";
+import { TUser } from "@formbricks/types/user";
+import { useWorkspaceContext } from "@/app/(app)/workspaces/[workspaceId]/context/workspace-context";
+import { useResponseFilter } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/components/response-filter-context";
+import { SuccessMessage } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/SuccessMessage";
+import { ShareSurveyModal } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/(analysis)/summary/components/share-survey-modal";
+import { SurveyStatusDropdown } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/components/SurveyStatusDropdown";
+import { useSurvey } from "@/app/(app)/workspaces/[workspaceId]/surveys/[surveyId]/context/survey-context";
+import { getAIUnavailableMessage } from "@/lib/ai/availability";
+import type { TAIUnavailableReason } from "@/lib/ai/service";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { EditPublicSurveyAlertDialog } from "@/modules/survey/components/edit-public-survey-alert-dialog";
+import { useSingleUseId } from "@/modules/survey/hooks/useSingleUseId";
+import { copySurvey } from "@/modules/survey/list/lib/api-client";
+import { getCustomCssCopyNotice } from "@/modules/survey/list/lib/custom-css-notice";
+import { AiGlyph, AiStatusLine } from "@/modules/ui/components/ai";
+import { Button } from "@/modules/ui/components/button";
+import { ConfirmationModal } from "@/modules/ui/components/confirmation-modal";
+import { IconBar } from "@/modules/ui/components/iconbar";
+import { useBeforeUnloadPrompt } from "@/modules/ui/hooks/use-before-unload-prompt";
+import { generateExampleResponses, resetSurvey } from "../lib/api-client";
+
+interface SurveyAnalysisCTAProps {
+  isReadOnly: boolean;
+  canManage: boolean;
+  user: TUser;
+  publicDomain: string;
+  responseCount: number;
+  segments: TSegment[];
+  isContactsEnabled: boolean;
+  isFormbricksCloud: boolean;
+  isStorageConfigured: boolean;
+  enterpriseLicenseRequestFormUrl: string;
+  aiUnavailableReason: TAIUnavailableReason | null;
+}
+
+interface ModalState {
+  start: boolean;
+  share: boolean;
+}
+
+export const SurveyAnalysisCTA = ({
+  isReadOnly,
+  canManage,
+  user,
+  publicDomain,
+  responseCount,
+  segments,
+  isContactsEnabled,
+  isFormbricksCloud,
+  isStorageConfigured,
+  enterpriseLicenseRequestFormUrl,
+  aiUnavailableReason,
+}: Readonly<SurveyAnalysisCTAProps>) => {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const [loading, setLoading] = useState(false);
+  const [modalState, setModalState] = useState<ModalState>({
+    start: searchParams.get("share") === "true",
+    share: false,
+  });
+  const [isResetModalOpen, setIsResetModalOpen] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isGeneratingExamples, setIsGeneratingExamples] = useState(false);
+
+  const { workspace } = useWorkspaceContext();
+  const { survey } = useSurvey();
+  const { refreshSingleUseId } = useSingleUseId(survey, isReadOnly);
+  const { refreshAnalysisData } = useResponseFilter();
+
+  const appSetupCompleted = survey.type === "app" && workspace.appSetupCompleted;
+
+  // The generation is a long request tied to the tab, so a reload mid-run throws away the result the
+  // user is waiting on and cannot cheaply ask for again.
+  useBeforeUnloadPrompt(() => isGeneratingExamples);
+
+  // `?share=true` opens the start view (the publish flow adds it). Synced during render when it flips.
+  const shareParam = searchParams.get("share") === "true";
+  const [syncedShareParam, setSyncedShareParam] = useState(shareParam);
+  if (shareParam !== syncedShareParam) {
+    setSyncedShareParam(shareParam);
+    setModalState((prev) => ({ ...prev, start: shareParam }));
+  }
+
+  const handleShareModalToggle = (open: boolean) => {
+    const params = new URLSearchParams(globalThis.location.search);
+    const currentShareParam = params.get("share") === "true";
+
+    if (open && !currentShareParam) {
+      params.set("share", "true");
+      router.push(`${pathname}?${params.toString()}`);
+    } else if (!open && currentShareParam) {
+      params.delete("share");
+      router.push(`${pathname}?${params.toString()}`);
+    }
+
+    setModalState((prev) => ({ ...prev, start: open }));
+  };
+
+  const duplicateSurveyAndRoute = async (surveyId: string) => {
+    setLoading(true);
+    try {
+      const copy = await copySurvey({ surveyId, targetWorkspaceId: workspace.id });
+      toast.success(t("workspace.surveys.survey_duplicated_successfully"));
+      const customCssNotice = getCustomCssCopyNotice(copy, t);
+      if (customCssNotice) toast.error(customCssNotice, { duration: 8000 });
+      router.push(`/workspaces/${workspace?.id}/surveys/${copy.id}/edit`);
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    }
+    setIsCautionDialogOpen(false);
+    setLoading(false);
+  };
+
+  const getPreviewUrl = async () => {
+    const surveyUrl = new URL(`${publicDomain}/s/${survey.id}`);
+
+    if (survey.singleUse?.enabled) {
+      const singleUseLinkParams = await refreshSingleUseId();
+      if (singleUseLinkParams) {
+        surveyUrl.searchParams.set("suId", singleUseLinkParams.suId);
+        if (singleUseLinkParams.suToken) {
+          surveyUrl.searchParams.set("suToken", singleUseLinkParams.suToken);
+        }
+      }
+    }
+
+    surveyUrl.searchParams.set("preview", "true");
+    return surveyUrl.toString();
+  };
+
+  const [isCautionDialogOpen, setIsCautionDialogOpen] = useState(false);
+
+  const handleResetSurvey = async () => {
+    setIsResetting(true);
+    try {
+      const result = await resetSurvey(survey.id);
+      toast.success(
+        t("workspace.surveys.summary.survey_reset_successfully", {
+          responseCount: result.deletedResponsesCount,
+          displayCount: result.deletedDisplaysCount,
+        })
+      );
+      router.refresh();
+      await refreshAnalysisData();
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+    }
+    setIsResetting(false);
+    setIsResetModalOpen(false);
+  };
+
+  const handleGenerateExampleResponses = async () => {
+    if (isGeneratingExamples) return;
+    setIsGeneratingExamples(true);
+    // The status line rides in the loading toast, where the static "Generating..." text used to sit,
+    // rather than in the action row: inline it widened the row enough to squeeze the survey title onto
+    // two lines for the whole wait. `icon: null` drops the toast's own spinner, since the status line
+    // brings the animated AI mark.
+    const loadingToastId = toast.loading(
+      <AiStatusLine
+        isActive
+        messages={[
+          t("workspace.surveys.summary.ai_status_reading_survey"),
+          t("workspace.surveys.summary.ai_status_drafting_answers"),
+          t("workspace.surveys.summary.ai_status_saving_responses"),
+        ]}
+      />,
+      { icon: null }
+    );
+    // Reusing the id turns the loading toast into the result in place. `icon: undefined` is deliberate:
+    // an update merges over the loading toast, so without it the `icon: null` above would carry over
+    // and the result would render without its check or cross.
+    const resultToastOptions = { id: loadingToastId, icon: undefined };
+    try {
+      const result = await generateExampleResponses(survey.id);
+      toast.success(
+        t("workspace.surveys.summary.example_responses_generated_successfully", {
+          count: result.createdCount,
+        }),
+        resultToastOptions
+      );
+      router.refresh();
+    } catch (error) {
+      toast.error(
+        getV3ApiErrorMessage(error, t("workspace.surveys.summary.example_responses_generation_failed")),
+        resultToastOptions
+      );
+    } finally {
+      setIsGeneratingExamples(false);
+    }
+  };
+
+  const exampleResponsesTooltip = (() => {
+    if (isGeneratingExamples) {
+      return t("workspace.surveys.summary.generating_example_responses");
+    }
+    if (aiUnavailableReason !== null) {
+      return getAIUnavailableMessage(aiUnavailableReason, t);
+    }
+    if (responseCount > 0) {
+      return t("workspace.surveys.summary.generate_example_responses_disabled_has_responses");
+    }
+    return t("workspace.surveys.summary.generate_example_responses");
+  })();
+
+  const iconActions = [
+    {
+      icon: RefreshCcwIcon,
+      tooltip: t("common.refresh"),
+      onClick: async () => {
+        if (isRefreshing) return;
+        setIsRefreshing(true);
+        try {
+          await refreshAnalysisData();
+          toast.success(t("common.data_refreshed_successfully"));
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : t("common.something_went_wrong");
+          toast.error(errorMessage);
+        } finally {
+          setIsRefreshing(false);
+        }
+      },
+      disabled: isRefreshing,
+      isVisible: true,
+    },
+    {
+      icon: BellRing,
+      tooltip: t("workspace.surveys.summary.configure_alerts"),
+      onClick: () => router.push(`/account/settings/notifications`),
+      isVisible: !isReadOnly && !survey.archivedAt,
+    },
+    {
+      icon: Eye,
+      tooltip: t("common.preview"),
+      onClick: async () => {
+        const previewUrl = await getPreviewUrl();
+        window.open(previewUrl, "_blank", "noopener,noreferrer");
+      },
+      isVisible: survey.type === "link" && !survey.archivedAt,
+    },
+    {
+      icon: AiGlyph,
+      // The one AI action in a bar of neutral tools, so it carries the kit's colour rather than
+      // sitting in the toolbar as another grey icon.
+      iconClassName: "text-ai-dark",
+      tooltip: exampleResponsesTooltip,
+      onClick: handleGenerateExampleResponses,
+      disabled: isGeneratingExamples || aiUnavailableReason !== null || responseCount > 0,
+      isVisible: !isReadOnly && !survey.archivedAt,
+    },
+    {
+      icon: ListRestart,
+      tooltip: t("workspace.surveys.summary.reset_survey"),
+      onClick: () => setIsResetModalOpen(true),
+      isVisible: canManage && !survey.archivedAt,
+    },
+    {
+      icon: SquarePenIcon,
+      tooltip: t("common.edit"),
+      onClick: () => {
+        if (responseCount > 0) {
+          setIsCautionDialogOpen(true);
+        } else {
+          router.push(`/workspaces/${workspace?.id}/surveys/${survey.id}/edit`);
+        }
+      },
+      // Archived surveys are read-only; editing is blocked server-side, so hide the entry point too.
+      isVisible: !isReadOnly && !survey.archivedAt,
+    },
+  ];
+
+  return (
+    <div className="ms-auto hidden max-w-full flex-wrap items-center justify-end gap-1.5 sm:flex">
+      {!isReadOnly && (appSetupCompleted || survey.type === "link") && survey.status !== "draft" && (
+        <SurveyStatusDropdown />
+      )}
+
+      <IconBar actions={iconActions} />
+      {!survey.archivedAt && (
+        <Button
+          onClick={() => {
+            setModalState((prev) => ({ ...prev, share: true }));
+          }}>
+          {t("workspace.surveys.summary.share_survey")}
+        </Button>
+      )}
+
+      {user && !survey.archivedAt && (
+        <ShareSurveyModal
+          survey={survey}
+          publicDomain={publicDomain}
+          open={modalState.start || modalState.share}
+          setOpen={(open) => {
+            if (!open) {
+              handleShareModalToggle(false);
+              setModalState((prev) => ({ ...prev, share: false }));
+            }
+          }}
+          user={user}
+          modalView={modalState.start ? "start" : "share"}
+          segments={segments}
+          isContactsEnabled={isContactsEnabled}
+          isFormbricksCloud={isFormbricksCloud}
+          isReadOnly={isReadOnly}
+          canManage={canManage}
+          isStorageConfigured={isStorageConfigured}
+          workspaceCustomScripts={workspace.customHeadScripts}
+          enterpriseLicenseRequestFormUrl={enterpriseLicenseRequestFormUrl}
+        />
+      )}
+      <SuccessMessage />
+
+      {responseCount > 0 && (
+        <EditPublicSurveyAlertDialog
+          open={isCautionDialogOpen}
+          setOpen={setIsCautionDialogOpen}
+          isLoading={loading}
+          primaryButtonAction={async () => {
+            setIsCautionDialogOpen(false);
+            router.push(`/workspaces/${workspace?.id}/surveys/${survey.id}/edit`);
+          }}
+          primaryButtonText={t("common.edit")}
+          secondaryButtonAction={() => duplicateSurveyAndRoute(survey.id)}
+          secondaryButtonText={t("workspace.surveys.edit.caution_edit_duplicate")}
+        />
+      )}
+
+      <ConfirmationModal
+        open={isResetModalOpen}
+        setOpen={setIsResetModalOpen}
+        title={t("workspace.surveys.summary.delete_all_existing_responses_and_displays")}
+        body={t("workspace.surveys.summary.reset_survey_warning")}
+        buttonText={t("workspace.surveys.summary.reset_survey")}
+        onConfirm={handleResetSurvey}
+        buttonVariant="destructive"
+        buttonLoading={isResetting}
+      />
+    </div>
+  );
+};

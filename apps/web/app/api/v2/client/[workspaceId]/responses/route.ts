@@ -1,0 +1,348 @@
+import { UAParser } from "ua-parser-js";
+import { logger } from "@formbricks/logger";
+import { type TIngestFlag } from "@formbricks/types/embedded-data-ingest";
+import { InvalidInputError, UniqueConstraintError } from "@formbricks/types/errors";
+import { TResponseWithQuotaFull } from "@formbricks/types/quota";
+import { isPlainRecord, pickAutoCapturedResponseMeta } from "@formbricks/types/responses";
+import { findRecentDuplicateResponse } from "@/app/api/client/[workspaceId]/responses/lib/duplicate-response";
+import { checkSurveyValidity } from "@/app/api/v2/client/[workspaceId]/responses/lib/utils";
+import { reportApiError } from "@/app/lib/api/api-error-reporter";
+import { parseAndValidateJsonBody } from "@/app/lib/api/parse-and-validate-json-body";
+import { responses } from "@/app/lib/api/response";
+import { sendToPipeline } from "@/app/lib/pipelines";
+import { applyAnonymizePolicy } from "@/lib/response/anonymize";
+import { resolveResponseCountry } from "@/lib/response/country";
+import { applyIngestContractToResponseInput } from "@/lib/response/ingest";
+import { getSurvey } from "@/lib/survey/service";
+import { getElementsFromBlocks } from "@/lib/survey/utils";
+import { getClientIpFromHeaders } from "@/lib/utils/client-ip";
+import { getOrganizationIdFromWorkspaceId } from "@/lib/utils/helper";
+import { resolveClientApiIds } from "@/lib/utils/resolve-client-id";
+import { formatValidationErrorsForV1Api, validateResponseData } from "@/modules/api/lib/validation";
+import { validateOtherOptionLengthForMultipleChoice } from "@/modules/api/v2/lib/element";
+import { getOpenedByCreativeMeta } from "@/modules/ee/creatives/lib/attribution";
+import { getIsContactsEnabled } from "@/modules/ee/license-check/lib/utils";
+import { createQuotaFullObject } from "@/modules/ee/quotas/lib/helpers";
+import { validateClientFileUploads } from "@/modules/storage/utils";
+import { createResponseWithQuotaEvaluation } from "./lib/response";
+import { TResponseInputV2, ZResponseInputV2 } from "./types/response";
+
+interface Context {
+  params: Promise<{
+    workspaceId: string;
+  }>;
+}
+
+type TResponseSurvey = NonNullable<Awaited<ReturnType<typeof getSurvey>>>;
+
+type TValidatedResponseInputResult =
+  | {
+      workspaceId: string;
+      responseInputData: TResponseInputV2;
+    }
+  | { response: Response };
+
+const getUnexpectedPublicErrorResponse = (): Response =>
+  responses.internalServerErrorResponse("Something went wrong. Please try again.", true);
+
+const parseAndValidateResponseInput = async (
+  request: Request,
+  workspaceId: string
+): Promise<TValidatedResponseInputResult> => {
+  const responseInputValidation = await parseAndValidateJsonBody({
+    request,
+    schema: ZResponseInputV2,
+    // Set on the parsed body rather than spread into a copy: a copy is a pass over every key the caller
+    // sent, before the schema has bounded any of them.
+    buildInput: (jsonInput) => {
+      if (!isPlainRecord(jsonInput)) return { workspaceId };
+      jsonInput.workspaceId = workspaceId;
+      return jsonInput;
+    },
+    malformedJsonMessage: "Invalid JSON in request body",
+  });
+
+  if ("response" in responseInputValidation) {
+    return responseInputValidation;
+  }
+
+  return {
+    workspaceId,
+    responseInputData: responseInputValidation.data,
+  };
+};
+
+const getContactsDisabledResponse = async (
+  workspaceId: string,
+  contactId: string | null | undefined
+): Promise<Response | null> => {
+  if (!contactId) {
+    return null;
+  }
+
+  const organizationId = await getOrganizationIdFromWorkspaceId(workspaceId);
+  const isContactsEnabled = await getIsContactsEnabled(organizationId);
+
+  return isContactsEnabled
+    ? null
+    : responses.forbiddenResponse("User identification is only available for enterprise users.", true);
+};
+
+const validateResponseSubmission = async (
+  workspaceId: string,
+  responseInputData: TResponseInputV2,
+  survey: TResponseSurvey,
+  invalidCalElementId: string | undefined
+): Promise<Response | null> => {
+  const surveyCheckResult = await checkSurveyValidity(survey, workspaceId, responseInputData);
+  if (surveyCheckResult) {
+    return surveyCheckResult;
+  }
+
+  // After the PIN and workspace checks, so a caller without access learns nothing about its input.
+  if (invalidCalElementId) {
+    return responses.badRequestResponse("Invalid booking details", { elementId: invalidCalElementId }, true);
+  }
+
+  if (
+    !validateClientFileUploads({
+      data: responseInputData.data,
+      workspaceId,
+      surveyId: survey.id,
+      blocks: survey.blocks,
+      questions: survey.questions,
+    })
+  ) {
+    return responses.badRequestResponse("Invalid file upload response", undefined, true);
+  }
+
+  const otherResponseInvalidQuestionId = validateOtherOptionLengthForMultipleChoice({
+    responseData: responseInputData.data,
+    surveyQuestions: getElementsFromBlocks(survey.blocks),
+    responseLanguage: responseInputData.language,
+  });
+
+  if (otherResponseInvalidQuestionId) {
+    return responses.badRequestResponse(
+      `Response exceeds character limit`,
+      {
+        questionId: otherResponseInvalidQuestionId,
+      },
+      true
+    );
+  }
+
+  const validationErrors = validateResponseData(
+    survey.blocks,
+    responseInputData.data,
+    responseInputData.language ?? "en",
+    survey.questions,
+    responseInputData.notShown
+  );
+
+  return validationErrors
+    ? responses.badRequestResponse(
+        "Validation failed",
+        formatValidationErrorsForV1Api(validationErrors),
+        true
+      )
+    : null;
+};
+
+const createResponseForRequest = async ({
+  request,
+  survey,
+  responseInputData,
+  country,
+  ingestFlags,
+}: {
+  request: Request;
+  survey: TResponseSurvey;
+  responseInputData: TResponseInputV2;
+  country: string | undefined;
+  ingestFlags: readonly TIngestFlag[];
+}): Promise<TResponseWithQuotaFull | Response> => {
+  const userAgent = request.headers.get("user-agent") || undefined;
+  const agent = new UAParser(userAgent);
+
+  try {
+    const meta: TResponseInputV2["meta"] = {
+      // The browser-runtime context the renderer snapshotted at display time (ENG-1841). This
+      // literal is a whitelist — anything not re-listed here never reaches the database — so the
+      // auto-captured keys have to be pulled in explicitly. Spread from the schema rather than
+      // retyped key by key, so the two cannot drift.
+      ...pickAutoCapturedResponseMeta(responseInputData?.meta),
+      source: responseInputData?.meta?.source,
+      url: responseInputData?.meta?.url,
+      userAgent: {
+        browser: agent.getBrowser().name,
+        device: agent.getDevice().type || "desktop",
+        os: agent.getOS().name,
+      },
+      country,
+      action: responseInputData?.meta?.action,
+      // Only the creative's id comes from the client; the server checks it and stamps the name.
+      ...(responseInputData.meta?.openedByCreativeId
+        ? await getOpenedByCreativeMeta({
+            creativeId: responseInputData.meta.openedByCreativeId,
+            workspaceId: survey.workspaceId,
+            surveyId: survey.id,
+          })
+        : {}),
+    };
+
+    if (survey.isCaptureIpEnabled && !survey.isAnonymizeResponsesEnabled) {
+      meta.ipAddress = await getClientIpFromHeaders();
+    }
+
+    const metaToStore = applyAnonymizePolicy(meta, survey.isAnonymizeResponsesEnabled);
+
+    return await createResponseWithQuotaEvaluation(
+      {
+        ...responseInputData,
+        meta: metaToStore,
+      },
+      ingestFlags
+    );
+  } catch (error) {
+    if (error instanceof InvalidInputError) {
+      return responses.badRequestResponse(error.message, undefined, true);
+    }
+
+    if (error instanceof UniqueConstraintError) {
+      return responses.conflictResponse(error.message, undefined, true);
+    }
+
+    const response = getUnexpectedPublicErrorResponse();
+    reportApiError({
+      request,
+      status: response.status,
+      error,
+    });
+    return response;
+  }
+};
+
+export const OPTIONS = async (): Promise<Response> => {
+  return responses.successResponse(
+    {},
+    true,
+    // Cache CORS preflight responses for 1 hour (conservative approach)
+    // Balances performance gains with flexibility for CORS policy changes
+    "public, s-maxage=3600, max-age=3600"
+  );
+};
+
+export const POST = async (request: Request, context: Context): Promise<Response> => {
+  const params = await context.params;
+  // Resolve: accepts either an environmentId (old SDK) or a workspaceId (new SDK)
+  const resolved = await resolveClientApiIds(params.workspaceId);
+  if (!resolved) {
+    return responses.notFoundResponse("Workspace", params.workspaceId);
+  }
+  const { workspaceId } = resolved;
+
+  const validatedInput = await parseAndValidateResponseInput(request, workspaceId);
+
+  if ("response" in validatedInput) {
+    return validatedInput.response;
+  }
+
+  const { responseInputData } = validatedInput;
+  const country = resolveResponseCountry(responseInputData.meta?.country, request.headers);
+
+  try {
+    const contactsDisabledResponse = await getContactsDisabledResponse(
+      workspaceId,
+      responseInputData.contactId
+    );
+    if (contactsDisabledResponse) {
+      return contactsDisabledResponse;
+    }
+
+    const survey = await getSurvey(responseInputData.surveyId);
+    if (!survey) {
+      return responses.notFoundResponse("Survey", responseInputData.surveyId, true);
+    }
+
+    // The Embedded Data ingest contract (ENG-1845), re-run server-side because this endpoint is
+    // public and the renderer's filtering is never trusted. It has to precede
+    // `validateResponseSubmission` on both counts: `validateResponseData` should see the values that
+    // will be stored, and `checkSurveyValidity` stamps `verifiedEmail` from the verification token —
+    // a forbidden field name no survey declares, so the contract has to run before that write rather
+    // than after it.
+    // The same step splits a Cal element's booking record out of `data` (the stored answer stays the
+    // string "booked").
+    const ingestResult = applyIngestContractToResponseInput(survey, responseInputData);
+
+    const validationResponse = await validateResponseSubmission(
+      workspaceId,
+      responseInputData,
+      survey,
+      ingestResult.invalidCalElementId
+    );
+    if (validationResponse) {
+      return validationResponse;
+    }
+
+    // Same fold as the v1 endpoint (ENG-1147): a scanner's click-time check and the contact's own
+    // click submit identical answers seconds apart, and the second gets the first one's id.
+    const duplicate = await findRecentDuplicateResponse({
+      surveyId: survey.id,
+      surveyType: survey.type,
+      contactId: responseInputData.contactId,
+      data: responseInputData.data,
+      finished: responseInputData.finished,
+      calBookings: responseInputData.calBookings,
+    });
+    if (duplicate) {
+      logger.info({ surveyId: survey.id, responseId: duplicate.id }, "Folded duplicate response submission");
+      return responses.successResponse({ id: duplicate.id, ...createQuotaFullObject() }, true);
+    }
+
+    const createdResponse = await createResponseForRequest({
+      request,
+      survey,
+      responseInputData,
+      country,
+      ingestFlags: ingestResult.flags,
+    });
+    if (createdResponse instanceof Response) {
+      return createdResponse;
+    }
+    const { quotaFull, ...responseData } = createdResponse;
+
+    await sendToPipeline({
+      event: "responseCreated",
+      workspaceId,
+      surveyId: responseData.surveyId,
+      response: responseData,
+    });
+
+    if (responseData.finished) {
+      await sendToPipeline({
+        event: "responseFinished",
+        workspaceId,
+        surveyId: responseData.surveyId,
+        response: responseData,
+      });
+    }
+
+    const quotaObj = createQuotaFullObject(quotaFull);
+
+    const responseDataWithQuota = {
+      id: responseData.id,
+      ...quotaObj,
+    };
+
+    return responses.successResponse(responseDataWithQuota, true);
+  } catch (error) {
+    const response = getUnexpectedPublicErrorResponse();
+    reportApiError({
+      request,
+      status: response.status,
+      error,
+    });
+    return response;
+  }
+};

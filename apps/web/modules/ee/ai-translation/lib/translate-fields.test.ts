@@ -1,0 +1,398 @@
+import { LEAKY_AI_ERRORS, findPlantedContent } from "@/lib/ai/__mocks__/leaky-ai-errors";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { AIOutputTokenLimitError } from "@formbricks/ai";
+import { InvalidInputError, TooManyRequestsError } from "@formbricks/types/errors";
+import {
+  AI_TRANSLATION_BATCH_TOO_LARGE,
+  AI_TRANSLATION_OUTPUT_TOO_LONG,
+  type TAITranslationField,
+  ZAITranslationFields,
+  translateFields,
+} from "./translate-fields";
+import {
+  AI_TRANSLATION_FIELD_TOO_LONG,
+  AI_TRANSLATION_MAX_FIELDS_PER_ACTION,
+  AI_TRANSLATION_MAX_FIELD_CHARS,
+  AI_TRANSLATION_SOURCE_CHARS_PER_BATCH,
+  AI_TRANSLATION_TOO_MANY_FIELDS,
+} from "./translation-batches";
+
+const aiTimeoutEnv = vi.hoisted(() => ({ multiplier: 1 }));
+
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/env", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/lib/env")>();
+  return {
+    ...original,
+    env: {
+      ...original.env,
+      get AI_TIMEOUT_MULTIPLIER() {
+        return aiTimeoutEnv.multiplier;
+      },
+    },
+  };
+});
+
+const mockGenerateOrganizationAIObject = vi.fn();
+vi.mock("@/lib/ai/service", () => ({
+  generateOrganizationAIObject: (...args: unknown[]) => mockGenerateOrganizationAIObject(...args),
+}));
+
+vi.mock("@formbricks/logger", () => ({
+  logger: { error: vi.fn(), info: vi.fn(), warn: vi.fn() },
+}));
+
+const baseInput = {
+  organizationId: "org-1",
+  workspaceId: "ws-1",
+  userId: "user-1",
+  sourceLanguage: "English",
+  targetLanguage: "German",
+};
+
+const fields: TAITranslationField[] = [
+  { path: "welcomeCard.headline.default", defaultText: "Welcome", isRichText: false },
+  { path: "questions.0.html.default", defaultText: "<p>Hello</p>", isRichText: true },
+];
+
+const makeFields = (count: number): TAITranslationField[] =>
+  Array.from({ length: count }, (_, index) => ({
+    path: `questions.${index}.headline.default`,
+    defaultText: `Text ${index}`,
+    isRichText: false,
+  }));
+
+const mockTranslationsFor = (fieldList: TAITranslationField[]): void => {
+  mockGenerateOrganizationAIObject.mockResolvedValue({
+    object: Object.fromEntries(fieldList.map((_, index) => [`t${index}`, `Translated ${index}`])),
+  });
+};
+
+describe("translation action field limit", () => {
+  test("accepts a field above the batching target and at the field limit", () => {
+    const field = { path: "long", defaultText: "x", isRichText: false };
+
+    expect(
+      ZAITranslationFields.safeParse([
+        { ...field, defaultText: "x".repeat(AI_TRANSLATION_SOURCE_CHARS_PER_BATCH + 1) },
+      ]).success
+    ).toBe(true);
+    expect(
+      ZAITranslationFields.safeParse([{ ...field, defaultText: "x".repeat(AI_TRANSLATION_MAX_FIELD_CHARS) }])
+        .success
+    ).toBe(true);
+  });
+
+  test("rejects an oversized field with an error naming the limit", () => {
+    const result = ZAITranslationFields.safeParse([
+      { path: "long", defaultText: "x".repeat(AI_TRANSLATION_MAX_FIELD_CHARS + 1), isRichText: false },
+    ]);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]).toMatchObject({
+        path: [],
+        message: AI_TRANSLATION_FIELD_TOO_LONG,
+      });
+    }
+  });
+
+  test("rejects a direct action call above the field-count limit", () => {
+    const fields = Array.from({ length: AI_TRANSLATION_MAX_FIELDS_PER_ACTION + 1 }, (_, index) => ({
+      path: `field-${index}`,
+      defaultText: "",
+      isRichText: false,
+    }));
+
+    expect(
+      ZAITranslationFields.safeParse(fields.slice(0, AI_TRANSLATION_MAX_FIELDS_PER_ACTION)).success
+    ).toBe(true);
+    const result = ZAITranslationFields.safeParse(fields);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]).toMatchObject({
+        path: [],
+        message: AI_TRANSLATION_TOO_MANY_FIELDS,
+      });
+    }
+  });
+});
+
+describe("translateFields", () => {
+  beforeEach(() => {
+    aiTimeoutEnv.multiplier = 1;
+    vi.clearAllMocks();
+  });
+
+  test("returns translations keyed by original field paths", async () => {
+    mockGenerateOrganizationAIObject.mockResolvedValue({
+      object: { t0: "Willkommen", t1: "<p>Hallo</p>" },
+    });
+
+    const result = await translateFields({ ...baseInput, fields });
+
+    expect(result).toEqual({
+      translations: {
+        "welcomeCard.headline.default": "Willkommen",
+        "questions.0.html.default": "<p>Hallo</p>",
+      },
+    });
+  });
+
+  test("sends opaque indexed IDs to the model, never the field paths", async () => {
+    mockGenerateOrganizationAIObject.mockResolvedValue({
+      object: { t0: "Willkommen", t1: "<p>Hallo</p>" },
+    });
+
+    await translateFields({ ...baseInput, fields });
+
+    expect(mockGenerateOrganizationAIObject).toHaveBeenCalledTimes(1);
+    const callArg = mockGenerateOrganizationAIObject.mock.calls[0][0];
+    expect(callArg.prompt).not.toContain("welcomeCard.headline.default");
+    expect(callArg.prompt).not.toContain("questions.0.html.default");
+    const userPayload = JSON.parse(callArg.prompt);
+    expect(userPayload).toEqual([
+      { id: "t0", text: "Welcome", richText: false },
+      { id: "t1", text: "<p>Hello</p>", richText: true },
+    ]);
+  });
+
+  test.each([1, 3])("translates with timeout multiplier %i", async (multiplier) => {
+    aiTimeoutEnv.multiplier = multiplier;
+    mockGenerateOrganizationAIObject.mockResolvedValue({
+      object: { t0: "Willkommen", t1: "<p>Hallo</p>" },
+    });
+
+    await translateFields({ ...baseInput, fields });
+
+    expect(mockGenerateOrganizationAIObject.mock.calls[0][0]).toMatchObject({
+      temperature: 0,
+      maxOutputTokens: 1024,
+      timeout: 60_000 * multiplier,
+    });
+  });
+
+  test("sends a mid-range request as three model-sized batches", async () => {
+    const midRangeFields = makeFields(20);
+    mockTranslationsFor(midRangeFields);
+
+    await translateFields({ ...baseInput, fields: midRangeFields });
+
+    expect(mockGenerateOrganizationAIObject).toHaveBeenCalledTimes(3);
+    expect(
+      mockGenerateOrganizationAIObject.mock.calls.map(([input]) => JSON.parse(input.prompt).length)
+    ).toEqual([8, 8, 4]);
+    expect(mockGenerateOrganizationAIObject.mock.calls.map(([input]) => input.maxOutputTokens)).toEqual([
+      1280, 1280, 1024,
+    ]);
+  });
+
+  test("reserves more output tokens for a long field", async () => {
+    mockGenerateOrganizationAIObject.mockResolvedValue({ object: { t0: "Translated" } });
+
+    await translateFields({
+      ...baseInput,
+      fields: [{ path: "long", defaultText: "x".repeat(2500), isRichText: false }],
+    });
+
+    expect(mockGenerateOrganizationAIObject.mock.calls[0][0].maxOutputTokens).toBe(2500);
+  });
+
+  test("never runs more than three model batches at once", async () => {
+    const largeBatchFields = makeFields(24);
+    let active = 0;
+    let maxActive = 0;
+    mockGenerateOrganizationAIObject.mockImplementation(async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await Promise.resolve();
+      active--;
+      return {
+        object: Object.fromEntries(
+          Array.from({ length: 8 }, (_, index) => [`t${index}`, `Translated ${index}`])
+        ),
+      };
+    });
+
+    const result = await translateFields({ ...baseInput, fields: largeBatchFields });
+
+    expect(Object.keys(result.translations)).toHaveLength(24);
+    expect(mockGenerateOrganizationAIObject).toHaveBeenCalledTimes(3);
+    expect(maxActive).toBe(3);
+  });
+
+  test("returns completed sibling translations when another model batch fails", async () => {
+    const actionFields = makeFields(16);
+    mockGenerateOrganizationAIObject
+      .mockRejectedValueOnce(
+        new AIOutputTokenLimitError({ maxOutputTokens: 8192, outputTokens: 8192, reasoningTokens: 0 })
+      )
+      .mockResolvedValueOnce({
+        object: Object.fromEntries(
+          Array.from({ length: 8 }, (_, index) => [`t${index}`, `Translated ${index}`])
+        ),
+      });
+
+    const result = await translateFields({ ...baseInput, fields: actionFields });
+
+    expect(result).toEqual({
+      translations: Object.fromEntries(
+        actionFields.slice(8).map((field, index) => [field.path, `Translated ${index}`])
+      ),
+      errorCode: AI_TRANSLATION_OUTPUT_TOO_LONG,
+    });
+  });
+
+  test("does not return an error message or prompt with partial results", async () => {
+    const actionFields = makeFields(16);
+    mockGenerateOrganizationAIObject
+      .mockRejectedValueOnce(new Error("private survey text from provider"))
+      .mockResolvedValueOnce({
+        object: Object.fromEntries(
+          Array.from({ length: 8 }, (_, index) => [`t${index}`, `Translated ${index}`])
+        ),
+      });
+
+    const result = await translateFields({ ...baseInput, fields: actionFields });
+
+    expect(result.errorCode).toBe("ai_translation_failed");
+    expect(JSON.stringify(result)).not.toContain("private survey text");
+    expect(Object.keys(result.translations)).toHaveLength(8);
+  });
+
+  test("keeps the quota error code with partial results", async () => {
+    mockGenerateOrganizationAIObject
+      .mockRejectedValueOnce(new TooManyRequestsError("ai_quota_exceeded", 30))
+      .mockResolvedValueOnce({
+        object: Object.fromEntries(
+          Array.from({ length: 8 }, (_, index) => [`t${index}`, `Translated ${index}`])
+        ),
+      });
+
+    const result = await translateFields({ ...baseInput, fields: makeFields(16) });
+
+    expect(result.errorCode).toBe("ai_quota_exceeded");
+    expect(Object.keys(result.translations)).toHaveLength(8);
+  });
+
+  test("rejects a fourth model batch before making any AI calls", async () => {
+    await expect(translateFields({ ...baseInput, fields: makeFields(25) })).rejects.toThrow(
+      new InvalidInputError(AI_TRANSLATION_BATCH_TOO_LARGE)
+    );
+    expect(mockGenerateOrganizationAIObject).not.toHaveBeenCalled();
+  });
+
+  test("returns empty object without calling the model when no fields are provided", async () => {
+    const result = await translateFields({ ...baseInput, fields: [] });
+
+    expect(result).toEqual({ translations: {} });
+    expect(mockGenerateOrganizationAIObject).not.toHaveBeenCalled();
+  });
+
+  test("throws when the model omits any requested ID from the response", async () => {
+    mockGenerateOrganizationAIObject.mockResolvedValue({
+      object: { t0: "Willkommen" }, // t1 missing
+    });
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toThrow(
+      "AI translation returned incomplete result"
+    );
+  });
+
+  test("throws when the model returns an empty string for any ID", async () => {
+    mockGenerateOrganizationAIObject.mockResolvedValue({
+      object: { t0: "Willkommen", t1: "" }, // empty string treated as missing
+    });
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toThrow(
+      "AI translation returned incomplete result"
+    );
+  });
+
+  // ENG-2831: the token-limit error was neither an expected error nor a mapped code, so the modal fell
+  // back to a generic "Translation failed" and every occurrence landed in Sentry. It has to reach the
+  // client as a code it can explain.
+  test("maps an output token limit overflow to the ai_output_too_long code", async () => {
+    mockGenerateOrganizationAIObject.mockRejectedValue(
+      new AIOutputTokenLimitError({ maxOutputTokens: 8192, outputTokens: 8192, reasoningTokens: 0 })
+    );
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toThrow(
+      new InvalidInputError(AI_TRANSLATION_OUTPUT_TOO_LONG)
+    );
+  });
+
+  test("propagates errors thrown by the AI provider", async () => {
+    mockGenerateOrganizationAIObject.mockRejectedValue(new Error("provider failed"));
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toThrow("provider failed");
+  });
+
+  // ENG-3720: a rejection from here reaches the server action client, which writes a thrown error whole
+  // to the logs and to Sentry — and an AI SDK error carries the survey text and the model's translation.
+  test.each(LEAKY_AI_ERRORS)("rethrows a failure with %s without what the call carried", async (_, build) => {
+    const error = build();
+    mockGenerateOrganizationAIObject.mockRejectedValue(error);
+
+    const rejection = await translateFields({ ...baseInput, fields }).catch((thrown: unknown) => thrown);
+
+    expect(rejection).toMatchObject({ name: "RedactedAIError", originalName: error.name });
+    expect(findPlantedContent(rejection)).toBeUndefined();
+  });
+
+  test("rethrows the quota error unchanged, so the client still gets its code", async () => {
+    const quotaError = new TooManyRequestsError("ai_quota_exceeded", 30);
+    mockGenerateOrganizationAIObject.mockRejectedValue(quotaError);
+
+    await expect(translateFields({ ...baseInput, fields })).rejects.toBe(quotaError);
+  });
+
+  test("echoes empty defaultText through without calling the model", async () => {
+    const allEmpty: TAITranslationField[] = [
+      { path: "welcomeCard.subheader.default", defaultText: "", isRichText: false },
+      { path: "endings.0.subheader.default", defaultText: "", isRichText: false },
+    ];
+
+    const result = await translateFields({ ...baseInput, fields: allEmpty });
+
+    expect(result).toEqual({
+      translations: {
+        "welcomeCard.subheader.default": "",
+        "endings.0.subheader.default": "",
+      },
+    });
+    expect(mockGenerateOrganizationAIObject).not.toHaveBeenCalled();
+  });
+
+  test("translates non-empty fields and echoes empty ones in the same call", async () => {
+    const mixed: TAITranslationField[] = [
+      { path: "welcomeCard.headline.default", defaultText: "Welcome", isRichText: false },
+      { path: "welcomeCard.subheader.default", defaultText: "", isRichText: false },
+      { path: "questions.0.headline.default", defaultText: "How are you?", isRichText: false },
+    ];
+
+    // Empty fields are filtered out before indexing, so the model only sees
+    // the two non-empty entries as t0 and t1.
+    mockGenerateOrganizationAIObject.mockResolvedValue({
+      object: { t0: "Willkommen", t1: "Wie geht es dir?" },
+    });
+
+    const result = await translateFields({ ...baseInput, fields: mixed });
+
+    expect(result).toEqual({
+      translations: {
+        "welcomeCard.headline.default": "Willkommen",
+        "welcomeCard.subheader.default": "",
+        "questions.0.headline.default": "Wie geht es dir?",
+      },
+    });
+
+    // Confirm the model never saw the empty field in the payload.
+    const callArg = mockGenerateOrganizationAIObject.mock.calls[0][0];
+    const userPayload = JSON.parse(callArg.prompt);
+    expect(userPayload).toEqual([
+      { id: "t0", text: "Welcome", richText: false },
+      { id: "t1", text: "How are you?", richText: false },
+    ]);
+  });
+});

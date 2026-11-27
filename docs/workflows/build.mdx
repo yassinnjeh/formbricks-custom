@@ -1,0 +1,122 @@
+---
+title: "Build a workflow"
+description: "Choose and configure a workflow trigger and action, check the workflow, and enable it."
+icon: "rocket"
+---
+
+Use the workflow builder to combine a trigger with the steps it should run. This guide uses the **Response
+completed** trigger and the **Send email** action as examples. The builder lists the options available in your
+Formbricks version. Changes to draft and disabled workflows are saved automatically.
+
+Each trigger and step has its own page. Triggers: [Response completed](/workflows/response-completed) and
+[Webhook trigger](/workflows/webhook-trigger). Logic: [If/else](/workflows/if-else), [Filter](/workflows/filter)
+and [Switch](/workflows/switch). Actions: [Send an email](/workflows/send-email) and
+[HTTP request](/workflows/http-request).
+
+<Frame>
+  <img
+    src="/images/platform/workflows/workflow-builder.webp"
+    alt="Workflow builder with a Webhook trigger, a Filter, an HTTP request and an If/else whose Then branch sends an email"
+  />
+</Frame>
+
+## Before you begin
+
+You need write or manage access to the workspace. For the **Response completed** example, you also need a
+survey in the same workspace as the workflow.
+
+If you use **Send email** and the message should go to an address collected from a response, the survey
+needs a compatible recipient source. See [Send an email](/workflows/send-email).
+
+## Create a workflow
+
+<Steps>
+  <Step title="Open Workflows">
+    Select **Workflows** in the workspace navigation, then select **New workflow**. Formbricks creates a
+    draft and opens the builder. Rename the workflow using the title at the top of the page.
+  </Step>
+
+<Step title="Add a trigger">
+  Select **Add trigger**, then choose a trigger from the list, such as **Response completed**. Select the
+  trigger card to open its configuration.
+</Step>
+
+  <Step title="Add steps">
+    Select the **+** below the trigger, then choose a step from the list: an action such as **Send email** or
+    **HTTP request**, or **If/else**, **Switch** or **Filter** under **Logic**. Select the step's card to open its
+    configuration. A workflow holds up to 25 steps.
+  </Step>
+</Steps>
+
+## Work on the canvas
+
+### Add, move and remove steps
+
+- **Insert a step between two steps.** Select the **+** on the line between them (**Insert step here**), or
+  select **Insert step** in the ⋮ menu of the step before. If/else and Switch have no **Insert step**: use the
+  **+** at the start of a branch.
+- **Move a step.** Drag its card onto another **+**, which shows **Move here**, or select **Move to…** in its ⋮
+  menu and pick a place. A Send email or HTTP request step moves alone. An If/else, Switch or Filter moves with
+  every step after it.
+- **Delete a step.** Select **Delete** in its ⋮ menu, or select its card and press `Backspace` or `Delete`.
+  Deleting an If/else or Switch asks first, because its branches go with it.
+
+### Cut, copy and paste
+
+**Cut** and **Copy** in a step's ⋮ menu take the step and every step after it, with all branches. Then select
+the **+** where they should go and select **Paste here**.
+
+- **Cut** moves the same steps, with their secret header values. Press `Escape` to cancel a cut.
+- **Copy** adds new steps each time you paste. Secret header values are not copied, so enter them again in each
+  copy.
+- After a paste, a step may read a Variable from a step that no longer runs before it. The editor warns you and
+  marks that step on the canvas.
+
+With a step selected, `⌘X` / `Ctrl+X`, `⌘C` / `Ctrl+C` and `⌘V` / `Ctrl+V` cut, copy and paste.
+
+### Undo and redo
+
+**Undo** and **Redo** sit next to the autosave status, above the canvas. They cover every edit, on the canvas
+and in the step panels. Shortcuts, when you are not typing in a field:
+
+| Action | Mac           | Windows and Linux          |
+| ------ | ------------- | -------------------------- |
+| Undo   | `⌘Z`          | `Ctrl+Z`                   |
+| Redo   | `⌘⇧Z`         | `Ctrl+Shift+Z` or `Ctrl+Y` |
+
+### Move around and arrange
+
+The controls at the bottom of the canvas zoom in and out, **Fit to screen**, and switch between **Pointer
+mode** (the default: select and drag steps) and **Pan mode** (drag to move the view; steps can't be selected or
+dragged). The **Layout** menu has:
+
+- **Auto layout**: tidies up the steps.
+- **Arrange left to right** or **Arrange top to bottom**: switches the direction the workflow is drawn in.
+
+## Check for problems and enable
+
+The editor checks the workflow as you build it. The bottom-right corner of the canvas shows **Valid** when the
+workflow can run. Otherwise it shows how many problems there are, such as **2 problems**. Select it to see
+**Validation problems**: each one names what to fix, such as a step that needs setting up or a survey ending
+that no longer exists. Select a problem to open its step, with the field to fix in focus.
+
+A [Test run](/workflows/test-runs) goes further: it runs the draft with the expected payload (a Webhook trigger)
+or an existing survey response (a Response completed trigger) and shows what each step would do, without sending
+anything.
+
+Open the status menu and select **Enable** when you are ready to start the workflow. **Enable** stays off
+while there are problems. An enabled workflow listens for its configured trigger. Its definition is
+read-only while enabled; select **Disable** before editing it again. The one exception is replacing a
+[secret header](/workflows/http-request#secret-headers) value in the editor, which updates the enabled workflow
+right away.
+
+<Note>
+  Enabling verifies that the workflow is executable. A workflow with incomplete or outdated configuration
+  cannot be enabled.
+</Note>
+
+### Discard changes
+
+After you disable an enabled workflow and edit it, you can go back to the version that was last enabled: open
+the status menu and select **Discard changes**. The workflow goes back to that version, and Undo brings your
+changes back.

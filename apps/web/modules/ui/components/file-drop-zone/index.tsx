@@ -1,0 +1,135 @@
+"use client";
+
+import { ArrowUpFromLineIcon } from "lucide-react";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { getDroppedFiles, setDropEffect } from "@formbricks/survey-ui/drag-data";
+import { cn } from "@/lib/cn";
+import { LoadingSpinner } from "@/modules/ui/components/loading-spinner";
+
+export interface FileDropZoneProps {
+  id: string;
+  accept?: string;
+  onFileSelect: (file: File) => void | Promise<void>;
+  isLoading?: boolean;
+  disabled?: boolean;
+  primaryText: string;
+  secondaryText?: string;
+  helpText?: string;
+  loadingText?: string;
+  className?: string;
+}
+
+export const FileDropZone = ({
+  id,
+  accept,
+  onFileSelect,
+  isLoading = false,
+  disabled = false,
+  primaryText,
+  secondaryText,
+  helpText,
+  loadingText,
+  className,
+}: Readonly<FileDropZoneProps>) => {
+  const { t } = useTranslation();
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const isBusy = isLoading || isProcessing;
+  const canDrop = !isBusy && !disabled;
+  const resolvedLoadingText = loadingText ?? t("common.loading");
+
+  const handleFile = async (file: File | undefined) => {
+    if (!file || isBusy || disabled) return;
+
+    try {
+      const result = onFileSelect(file);
+      if (result instanceof Promise) {
+        setIsProcessing(true);
+        await result;
+      }
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDropEffect(e, canDrop ? "copy" : "none");
+    if (canDrop && !isDragOver) setIsDragOver(true);
+  };
+
+  // Leaving into a child of the zone is still inside it: only a leave to outside clears the state.
+  const handleDragLeave = (e: React.DragEvent<HTMLLabelElement>) => {
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    setIsDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(false);
+    if (!canDrop) return;
+    void handleFile(getDroppedFiles(e)[0]);
+  };
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    void handleFile(e.target.files?.[0]);
+    e.target.value = "";
+  };
+
+  return (
+    <div
+      className={cn(
+        "rounded-lg border-2 border-dashed border-slate-300 bg-slate-50 transition-colors",
+        // The same light slate as the editor's file uploader on hover; a file held over it also
+        // darkens the dashed edge, so the zone says it will take the drop.
+        canDrop && "hover:bg-slate-100",
+        isDragOver && "border-slate-400 bg-slate-100",
+        isBusy && "opacity-70",
+        className
+      )}
+      aria-busy={isBusy}>
+      {/* Drag-and-drop is an enhancement; the keyboard-accessible path is the associated file input below. */}
+      <label
+        htmlFor={id}
+        className={cn(
+          "flex flex-col items-center justify-center p-6",
+          canDrop ? "cursor-pointer" : "cursor-not-allowed"
+        )}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}>
+        {isBusy ? (
+          <>
+            <LoadingSpinner className="h-8 w-8" />
+            <p className="mt-2 text-sm text-slate-600">{resolvedLoadingText}</p>
+          </>
+        ) : (
+          <>
+            <ArrowUpFromLineIcon
+              className={cn("size-8 transition-colors", isDragOver ? "text-slate-600" : "text-slate-400")}
+              aria-hidden="true"
+            />
+            <p className="mt-2 text-sm text-slate-600">
+              <span className="font-semibold">{primaryText}</span>
+              {secondaryText ? ` ${secondaryText}` : null}
+            </p>
+            {helpText ? <p className="mt-1 text-xs text-slate-400">{helpText}</p> : null}
+          </>
+        )}
+        {/* sr-only (not `hidden`) keeps the input in the tab order so keyboard users can focus it
+            and open the file picker with Enter/Space; the visible dropzone is the label above. */}
+        <input
+          type="file"
+          id={id}
+          accept={accept}
+          className="sr-only"
+          disabled={isBusy || disabled}
+          onChange={handleChange}
+        />
+      </label>
+    </div>
+  );
+};

@@ -1,0 +1,80 @@
+import "@/styles/globals.css";
+
+export { Button, buttonVariants } from "@/components/general/button";
+export {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuCheckboxItem,
+  DropdownMenuRadioItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuGroup,
+  DropdownMenuPortal,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuRadioGroup,
+} from "@/components/general/dropdown-menu";
+export { ElementHeader, type ElementHeaderProps } from "@/components/general/element-header";
+export { ElementMedia, type ElementMediaProps } from "@/components/general/element-media";
+export { Input, type InputProps } from "@/components/general/input";
+export { OpenText, type OpenTextProps } from "@/components/elements/open-text";
+export {
+  MultiSelect,
+  type MultiSelectProps,
+  type MultiSelectOption,
+} from "@/components/elements/multi-select";
+export {
+  SingleSelect,
+  type SingleSelectProps,
+  type SingleSelectOption,
+} from "@/components/elements/single-select";
+export { Matrix, type MatrixProps, type MatrixOption } from "@/components/elements/matrix";
+export { DateElement, type DateElementProps } from "@/components/elements/date";
+// Also published on the ./drag-data subpath for the app's drop targets; exporting it here keeps the
+// build from tree-shaking the helpers only the app uses.
+export { getDraggedItems, getDroppedFileList, getDroppedFiles, setDropEffect } from "@/lib/drag-data";
+export { getDateFnsLocale } from "@/lib/locale";
+export { FB_PART, FB_PART_ATTRIBUTE, FB_PARTS, type TFbPart } from "@/lib/parts";
+export { SurveyPortalContainerContext } from "@/lib/portal-container";
+export { sanitizeSurveyHtml, stripInlineStyles } from "@/lib/utils";
+export { isSafeMediaUrl } from "@/lib/video";
+export { isSafeLinkUrl } from "@/lib/url";
+export {
+  PictureSelect,
+  type PictureSelectProps,
+  type PictureSelectOption,
+} from "@/components/elements/picture-select";
+export { FileUpload, type FileUploadProps, type UploadedFile } from "@/components/elements/file-upload";
+export { FormField, type FormFieldProps, type FormFieldConfig } from "@/components/elements/form-field";
+export { Rating, type RatingProps } from "@/components/elements/rating";
+export { NPS, type NPSProps } from "@/components/elements/nps";
+export { Ranking, type RankingProps, type RankingOption } from "@/components/elements/ranking";
+export { CTA, type CTAProps } from "@/components/elements/cta";
+export { Consent, type ConsentProps } from "@/components/elements/consent";
+export {
+  Signature,
+  DEFAULT_SIGNATURE_LABELS,
+  type SignatureProps,
+  type SignatureLabels,
+} from "@/components/elements/signature";
+export {
+  EMPTY_SIGNATURE,
+  clearSignature,
+  hasSignatureInput,
+  isSignatureSigned,
+  signatureFingerprint,
+  type SignatureMode,
+  type SignaturePoint,
+  type SignatureStroke,
+  type SignatureValue,
+} from "@/lib/signature/signature-model";
+export {
+  SIGNATURE_PNG_FILE_NAME,
+  SIGNATURE_PNG_MIME_TYPE,
+  exportSignaturePng,
+} from "@/lib/signature/signature-export";
+export { loadSignatureFont } from "@/lib/signature/signature-font";

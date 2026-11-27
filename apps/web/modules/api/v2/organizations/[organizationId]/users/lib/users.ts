@@ -1,0 +1,524 @@
+import { prisma } from "@formbricks/database";
+import { OrganizationRole, Prisma, TeamUserRole } from "@formbricks/database/prisma";
+import { TUser } from "@formbricks/database/zod/users";
+import { Result, err, ok } from "@formbricks/types/error-handlers";
+import { MCP_GRANT_REVOKE_TRANSACTION_TIMEOUT_MS } from "@/lib/authzed/mcp-grant-timeouts";
+import { reconcileOrganizationMembership } from "@/lib/authzed/organization-membership";
+import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
+import { reconcileTeamWorkspaceRelationships } from "@/lib/authzed/team-workspace";
+import { lockUserActiveState, reactivateLockedUser } from "@/lib/user/reactivation";
+import { isUniqueConstraintError } from "@/lib/utils/prisma-constraint";
+import { getUsersQuery } from "@/modules/api/v2/organizations/[organizationId]/users/lib/utils";
+import {
+  TGetUsersFilter,
+  TUserInput,
+  TUserInputPatch,
+} from "@/modules/api/v2/organizations/[organizationId]/users/types/users";
+import { ApiErrorDetails, ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
+import { ApiResponseWithMeta } from "@/modules/api/v2/types/api-success";
+import {
+  LastActiveOwnerError,
+  runOwnerGuardedTransaction,
+} from "@/modules/organization/settings/teams/lib/owner-guard";
+
+/**
+ * A user's team memberships, limited to teams of this organization. A user can belong to several
+ * organizations, so an unfiltered `teamUsers` also returns (and, in `updateUser`, would modify) the
+ * teams of the others. Shared by every read here so no query forgets the scope.
+ */
+const teamUsersInOrganization = (organizationId: string) =>
+  ({
+    where: { team: { organizationId } },
+    include: { team: true },
+  }) satisfies Prisma.TeamUserFindManyArgs;
+
+export const getUsers = async (
+  organizationId: string,
+  params: TGetUsersFilter
+): Promise<Result<ApiResponseWithMeta<TUser[]>, ApiErrorResponseV2>> => {
+  try {
+    const query = getUsersQuery(organizationId, params);
+
+    const [users, count] = await prisma.$transaction([
+      prisma.user.findMany({
+        ...query,
+        include: {
+          teamUsers: teamUsersInOrganization(organizationId),
+          memberships: {
+            select: {
+              role: true,
+              organizationId: true,
+            },
+          },
+        },
+      }),
+      prisma.user.count({
+        where: query.where,
+      }),
+    ]);
+
+    const returnedUsers = users.map(
+      (user) =>
+        ({
+          id: user.id,
+          createdAt: user.createdAt,
+          updatedAt: user.updatedAt,
+          email: user.email,
+          name: user.name,
+          lastLoginAt: user.lastLoginAt,
+          isActive: user.isActive,
+          role: user.memberships.filter((membership) => membership.organizationId === organizationId)[0].role,
+          teams: user.teamUsers.map((teamUser) => teamUser.team.name),
+        }) as TUser
+    );
+
+    return ok({
+      data: returnedUsers,
+      meta: {
+        total: count,
+        limit: params.limit,
+        offset: params.skip,
+      },
+    });
+  } catch (error) {
+    return err({
+      type: "internal_server_error",
+      details: [{ field: "users", issue: error instanceof Error ? error.message : "Unknown error occurred" }],
+    });
+  }
+};
+
+export const createUser = async (
+  userInput: TUserInput,
+  organizationId: string
+): Promise<Result<TUser, ApiErrorResponseV2>> => {
+  const { name, email, role, teams, isActive } = userInput;
+
+  try {
+    const existingTeams = teams && (await getExistingTeamsFromInput(teams, organizationId));
+
+    let teamUsersToCreate;
+
+    if (existingTeams) {
+      teamUsersToCreate = existingTeams.map((team) => ({
+        role: TeamUserRole.contributor,
+        team: {
+          connect: {
+            id: team.id,
+          },
+        },
+      }));
+    }
+
+    const prismaData: Prisma.UserCreateInput = {
+      name,
+      email,
+      isActive: isActive,
+      memberships: {
+        create: {
+          accepted: true, // auto accept because there is no invite
+          role: role.toLowerCase() as OrganizationRole,
+          organization: {
+            connect: {
+              id: organizationId,
+            },
+          },
+        },
+      },
+      teamUsers:
+        existingTeams && existingTeams.length > 0
+          ? {
+              create: teamUsersToCreate,
+            }
+          : undefined,
+    };
+
+    const user = await prisma.user.create({
+      data: prismaData,
+      include: {
+        memberships: {
+          select: {
+            role: true,
+            organizationId: true,
+          },
+        },
+      },
+    });
+
+    await reconcileOrganizationMembership(organizationId, user.id);
+    await runPostCommitProjection("api_v2_organization_user_create", () =>
+      reconcileTeamWorkspaceRelationships({
+        teamMemberships: (existingTeams ?? []).map(({ id: teamId }) => ({ teamId, userId: user.id })),
+      })
+    );
+
+    const returnedUser = {
+      id: user.id,
+      createdAt: user.createdAt,
+      updatedAt: user.updatedAt,
+      email: user.email,
+      name: user.name,
+      lastLoginAt: user.lastLoginAt,
+      isActive: user.isActive,
+      role: user.memberships.filter((membership) => membership.organizationId === organizationId)[0].role,
+      teams: existingTeams ? existingTeams.map((team) => team.name) : [],
+    } as TUser;
+
+    return ok(returnedUser);
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      // `email` is the only user-facing unique constraint on this create, so map any P2002 to a
+      // conflict rather than gating on the (adapter-dependent) field list — this can never 500.
+      return err({
+        type: "conflict",
+        details: [{ field: "email", issue: "A user with this email already exists" }],
+      });
+    }
+
+    return err({
+      type: "internal_server_error",
+      details: [{ field: "user", issue: error instanceof Error ? error.message : "Unknown error occurred" }],
+    });
+  }
+};
+
+// Thrown inside updateUser's transaction when the request would change an account-wide field of a
+// user who also belongs to another organization; carried out as a 409, like the last-owner conflict:
+// the same request succeeds for a user in this organization alone, so it conflicts with the user's
+// current state rather than being malformed.
+class AccountFieldsConflictError extends Error {
+  constructor(readonly details: ApiErrorDetails) {
+    super("Cannot change the account-wide fields of this user from this organization");
+  }
+}
+
+const OTHER_ORGANIZATIONS_ISSUE =
+  "cannot be changed from one organization while the user also belongs to other organizations";
+
+/**
+ * `name` and `isActive` belong to the account, not to this organization's membership: changing them here
+ * changes them in every other organization the user belongs to, and deactivating locks the user out of
+ * all of them. So only an organization the user belongs to alone may change them, as the data retention
+ * members policy and Reactivate in the member list already require. Sending the stored value is no
+ * change and stays allowed, so a client that echoes the whole user back keeps working.
+ *
+ * Decided under the user row's lock (`lockUserActiveState`), which a membership being added in another
+ * organization waits on, so one added meanwhile is counted. Returns whether the account was active.
+ */
+const lockAndCheckAccountFields = async (
+  tx: Prisma.TransactionClient,
+  userId: string,
+  organizationId: string,
+  { name, isActive }: Pick<TUserInputPatch, "name" | "isActive">
+): Promise<{ wasActive: boolean }> => {
+  await lockUserActiveState(tx, userId);
+  const account = await tx.user.findUniqueOrThrow({
+    where: { id: userId },
+    select: {
+      name: true,
+      isActive: true,
+      memberships: {
+        where: { organizationId: { not: organizationId } },
+        select: { organizationId: true },
+        take: 1,
+      },
+    },
+  });
+
+  const changedFields: ("isActive" | "name")[] = [];
+  if (isActive !== undefined && isActive !== account.isActive) changedFields.push("isActive");
+  if (name !== undefined && name !== account.name) changedFields.push("name");
+
+  if (account.memberships.length > 0 && changedFields.length > 0) {
+    throw new AccountFieldsConflictError(
+      changedFields.map((field) => ({ field, issue: OTHER_ORGANIZATIONS_ISSUE }))
+    );
+  }
+
+  return { wasActive: account.isActive };
+};
+
+/** What `updateUser` returns for an error its transaction threw. */
+const toUpdateUserError = (error: unknown, demoting: boolean): ApiErrorResponseV2 => {
+  if (error instanceof LastActiveOwnerError) {
+    return {
+      type: "conflict",
+      // Names the input that would have removed the owner; a demotion wins when the same request also
+      // deactivates.
+      details: [
+        { field: demoting ? "role" : "isActive", issue: "Cannot remove the last owner of the organization" },
+      ],
+    };
+  }
+  if (error instanceof AccountFieldsConflictError) {
+    return { type: "conflict", details: error.details };
+  }
+  return {
+    type: "internal_server_error",
+    details: [{ field: "user", issue: error instanceof Error ? error.message : "Unknown error occurred" }],
+  };
+};
+
+/** The user row `updateUser` writes, with the memberships it reads the role from. */
+type TUpdatedUser = Prisma.UserGetPayload<{
+  include: { memberships: { select: { role: true; organizationId: true } } };
+}>;
+
+export const updateUser = async (
+  userInput: TUserInputPatch,
+  organizationId: string
+): Promise<Result<TUser, ApiErrorResponseV2>> => {
+  const { name, email, role, teams, isActive } = userInput;
+  let existingTeams: string[] = [];
+  let newTeams: Awaited<ReturnType<typeof getExistingTeamsFromInput>>;
+  // Whether this request could take an active owner out of the organization: demoting them or
+  // deactivating them. Decided from the request alone; whether the user is an active owner is read
+  // inside the transaction, under the owners' lock (`runOwnerGuardedTransaction`).
+  const demoting = role !== undefined && role !== OrganizationRole.owner;
+  const mayRemoveOwner = demoting || isActive === false;
+
+  try {
+    // Restrict the lookup to a user with a membership in the authenticated organization,
+    // and scope teamUsers to teams that belong to the same organization. Looking up by
+    // email alone would surface users from other organizations and allow mutations to
+    // their global fields and team memberships.
+    const existingUser = await prisma.user.findFirst({
+      where: {
+        email,
+        memberships: { some: { organizationId } },
+      },
+      include: {
+        memberships: {
+          select: {
+            role: true,
+            organizationId: true,
+          },
+        },
+        teamUsers: teamUsersInOrganization(organizationId),
+      },
+    });
+
+    if (!existingUser) {
+      return err({
+        type: "not_found",
+        details: [{ field: "user", issue: "not found" }],
+      });
+    }
+
+    // Capture the existing team names for the user (within the authenticated organization).
+    existingTeams = existingUser.teamUsers.map((teamUser) => teamUser.team.name);
+
+    // Build an array of operations for deleting teamUsers that are not in the input.
+    const deleteTeamOps: Prisma.PrismaPromise<unknown>[] = [];
+    existingUser.teamUsers.forEach((teamUser) => {
+      if (teams && !teams?.includes(teamUser.team.name)) {
+        deleteTeamOps.push(
+          prisma.teamUser.delete({
+            where: {
+              teamId_userId: {
+                teamId: teamUser.team.id,
+                userId: existingUser.id,
+              },
+            },
+            include: {
+              team: {
+                include: {
+                  workspaceTeams: {
+                    select: { workspaceId: true },
+                  },
+                },
+              },
+            },
+          })
+        );
+      }
+    });
+
+    // Look up teams from the input that exist in this organization.
+    newTeams = await getExistingTeamsFromInput(teams, organizationId);
+    const existingUserTeamNames = existingUser.teamUsers.map((teamUser) => teamUser.team.name);
+
+    // Build an array of operations for creating new teamUsers.
+    const createTeamOps: Prisma.PrismaPromise<unknown>[] = [];
+    newTeams?.forEach((team) => {
+      if (!existingUserTeamNames.includes(team.name)) {
+        createTeamOps.push(
+          prisma.teamUser.create({
+            data: {
+              role: TeamUserRole.contributor,
+              user: { connect: { id: existingUser.id } },
+              team: { connect: { id: team.id } },
+            },
+            include: {
+              team: {
+                include: {
+                  workspaceTeams: {
+                    select: { workspaceId: true },
+                  },
+                },
+              },
+            },
+          })
+        );
+      }
+    });
+
+    // `email` is how the user was found, so it is never written: another account-wide field this
+    // organization has no business changing.
+    const prismaData: Prisma.UserUpdateInput = {
+      name: name ?? undefined,
+      isActive: isActive ?? undefined,
+      memberships: {
+        updateMany: {
+          where: {
+            organizationId,
+          },
+          data: {
+            role: role ? (role.toLowerCase() as OrganizationRole) : undefined,
+          },
+        },
+      },
+    };
+
+    let updatedUser: TUpdatedUser;
+
+    const touchesAccountFields = name !== undefined || isActive !== undefined;
+
+    if (mayRemoveOwner || touchesAccountFields) {
+      // The last-owner check and the write must be one atomic unit: read then act in two separate
+      // statements lets two callers removing different owners at once both read "more than one owner"
+      // and both writes land, leaving none. `runOwnerGuardedTransaction` locks the owners first (the
+      // lock the data retention members sweep takes too) and checks under it, before the user row.
+      //
+      // A change to the account's own fields is decided under the user row's lock
+      // (`lockAndCheckAccountFields`). A false→true change then goes through `reactivateLockedUser`,
+      // like Reactivate in the member list, so the data retention members clock restarts and the old
+      // notice is cleared. Without it the member would be deactivated again the next night, with no
+      // warning.
+      updatedUser = await runOwnerGuardedTransaction(
+        organizationId,
+        mayRemoveOwner ? existingUser.id : null,
+        async (tx) => {
+          const account = touchesAccountFields
+            ? await lockAndCheckAccountFields(tx, existingUser.id, organizationId, { name, isActive })
+            : null;
+          const reactivating = isActive === true && account?.wasActive === false;
+
+          // Re-run against `tx` rather than reusing deleteTeamOps/createTeamOps below: those are
+          // built against the root client, so awaiting them here would run them as separate
+          // queries outside this transaction instead of as part of it.
+          for (const teamUser of existingUser.teamUsers) {
+            if (teams && !teams.includes(teamUser.team.name)) {
+              await tx.teamUser.delete({
+                where: {
+                  teamId_userId: { teamId: teamUser.team.id, userId: existingUser.id },
+                },
+              });
+            }
+          }
+          for (const team of newTeams ?? []) {
+            if (!existingUserTeamNames.includes(team.name)) {
+              await tx.teamUser.create({
+                data: {
+                  role: TeamUserRole.contributor,
+                  user: { connect: { id: existingUser.id } },
+                  team: { connect: { id: team.id } },
+                },
+              });
+            }
+          }
+
+          // Update by id so the mutation is bound to the org-scoped lookup above. Email is
+          // a global unique key and using it here would defeat the membership check.
+          const user = await tx.user.update({
+            where: { id: existingUser.id },
+            data: prismaData,
+            include: {
+              memberships: {
+                select: { role: true, organizationId: true },
+              },
+            },
+          });
+          if (reactivating) await reactivateLockedUser(tx, existingUser.id);
+          return user;
+        },
+        // Every path here updates the user's row, which a Revoke or a bulk end of their MCP grants can hold
+        // while it waits behind a reconciling pass.
+        { timeout: MCP_GRANT_REVOKE_TRANSACTION_TIMEOUT_MS }
+      );
+    } else {
+      // Update by id so the mutation is bound to the org-scoped lookup above. Email is
+      // a global unique key and using it here would defeat the membership check.
+      const updateUserOp = prisma.user.update({
+        where: { id: existingUser.id },
+        data: prismaData,
+        include: {
+          memberships: {
+            select: { role: true, organizationId: true },
+          },
+        },
+      });
+
+      // Combine all operations into one transaction.
+      const operations = [...deleteTeamOps, ...createTeamOps, updateUserOp];
+
+      // Execute the transaction. The result will be an array with the results in the same order.
+      const results = await prisma.$transaction(operations);
+
+      // Retrieve the updated user result. Since the update was the last operation, it is the last item.
+      // The update is the last operation, so its row is the last result.
+      updatedUser = results.at(-1) as TUpdatedUser;
+    }
+
+    await reconcileOrganizationMembership(organizationId, updatedUser.id);
+    const affectedTeamIds = new Set([
+      ...existingUser.teamUsers.map(({ team }) => team.id),
+      ...(newTeams ?? []).map(({ id }) => id),
+    ]);
+    await runPostCommitProjection("api_v2_organization_user_update", () =>
+      reconcileTeamWorkspaceRelationships({
+        teamMemberships: [...affectedTeamIds].map((teamId) => ({ teamId, userId: updatedUser.id })),
+      })
+    );
+
+    const returnedUser = {
+      id: updatedUser.id,
+      createdAt: updatedUser.createdAt,
+      updatedAt: updatedUser.updatedAt,
+      email: updatedUser.email,
+      name: updatedUser.name,
+      lastLoginAt: updatedUser.lastLoginAt,
+      isActive: updatedUser.isActive,
+      role: updatedUser.memberships.find((m) => m.organizationId === organizationId)?.role,
+      teams: newTeams ? newTeams.map((team) => team.name) : existingTeams,
+    } as TUser;
+
+    return ok(returnedUser);
+  } catch (error) {
+    return err(toUpdateUserError(error, demoting));
+  }
+};
+
+const getExistingTeamsFromInput = async (userInputTeams: string[] | undefined, organizationId: string) => {
+  let existingTeams;
+
+  if (userInputTeams) {
+    existingTeams = await prisma.team.findMany({
+      where: {
+        name: { in: userInputTeams },
+        organizationId,
+      },
+      select: {
+        id: true,
+        name: true,
+        workspaceTeams: {
+          select: {
+            workspaceId: true,
+          },
+        },
+      },
+    });
+  }
+
+  return existingTeams;
+};

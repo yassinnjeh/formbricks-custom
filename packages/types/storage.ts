@@ -1,0 +1,317 @@
+import { z } from "zod";
+import { ZStorageUrl } from "./common";
+
+export const STORAGE_ERROR_CODES = {
+  S3_CREDENTIALS_ERROR: "s3_credentials_error",
+  S3_CLIENT_ERROR: "s3_client_error",
+} as const;
+
+export const STORAGE_CONFIGURATION_ERROR_CODES = new Set<string>([
+  STORAGE_ERROR_CODES.S3_CREDENTIALS_ERROR,
+  STORAGE_ERROR_CODES.S3_CLIENT_ERROR,
+]);
+
+export type TStorageConfigurationErrorCode = (typeof STORAGE_ERROR_CODES)[keyof typeof STORAGE_ERROR_CODES];
+
+export interface TStorageApiErrorDetails {
+  fileName?: string;
+  storage_error_code?: string;
+}
+
+// Single source of truth for allowed file extensions
+const ALLOWED_FILE_EXTENSIONS_TUPLE = [
+  "heic",
+  "png",
+  "jpeg",
+  "jpg",
+  "webp",
+  "ico",
+  "pdf",
+  "eml",
+  "doc",
+  "docx",
+  "xls",
+  "xlsx",
+  "ppt",
+  "pptx",
+  "txt",
+  "csv",
+  "mp4",
+  "mov",
+  "avi",
+  "mkv",
+  "webm",
+  "mp3",
+  "zip",
+  "rar",
+  "7z",
+  "tar",
+] as const;
+
+// Derive zod enum from the tuple
+export const ZAllowedFileExtension = z.enum(ALLOWED_FILE_EXTENSIONS_TUPLE);
+
+export type TAllowedFileExtension = z.infer<typeof ZAllowedFileExtension>;
+
+// Export the array derived from the tuple
+export const ALLOWED_FILE_EXTENSIONS: TAllowedFileExtension[] = [...ALLOWED_FILE_EXTENSIONS_TUPLE];
+
+/**
+ * Image extensions accepted for survey media (question/element/choice `imageUrl`) and offered by the
+ * editor's image pickers. Single source of truth so URL validation, uploads, and the picker can't
+ * drift apart.
+ *
+ * Kept a strict subset of the upload allowlist — `satisfies` enforces this at compile time — so any
+ * URL that passes image validation is always something the user can actually upload to Formbricks.
+ * `svg` is deliberately excluded: we don't sanitize SVGs, so allowing them would be an XSS vector.
+ */
+export const IMAGE_FILE_EXTENSIONS = [
+  "png",
+  "jpeg",
+  "jpg",
+  "webp",
+  "heic",
+] as const satisfies readonly TAllowedFileExtension[];
+
+export const mimeTypes: Record<TAllowedFileExtension, string> = {
+  heic: "image/heic",
+  png: "image/png",
+  jpeg: "image/jpeg",
+  jpg: "image/jpeg",
+  webp: "image/webp",
+  ico: "image/x-icon",
+  pdf: "application/pdf",
+  eml: "message/rfc822",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  txt: "text/plain",
+  csv: "text/csv",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+  avi: "video/x-msvideo",
+  mkv: "video/x-matroska",
+  webm: "video/webm",
+  mp3: "audio/mpeg",
+  zip: "application/zip",
+  rar: "application/vnd.rar",
+  "7z": "application/x-7z-compressed",
+  tar: "application/x-tar",
+};
+
+/**
+ * The media type Formbricks stores and serves for a file, derived from its extension alone.
+ *
+ * A stored object's `Content-Type` must never come from the uploader: a browser reads a list such as
+ * `image/png;,text/html` as its last valid type, so an echoed client string can turn an allowed `.png`
+ * into HTML on the app origin. Returns `undefined` for an extension outside the upload allowlist.
+ */
+export const getMimeTypeForFileName = (fileName: string): string | undefined => {
+  const extension = fileName.split(".").pop()?.toLowerCase();
+  if (!extension || extension === fileName.toLowerCase()) return undefined;
+
+  const { success, data } = ZAllowedFileExtension.safeParse(extension);
+  return success ? mimeTypes[data] : undefined;
+};
+
+export const ZAccessType = z.enum(["public", "private"]);
+export type TAccessType = z.infer<typeof ZAccessType>;
+
+export const ZDownloadFileRequest = z.object({
+  fileName: z
+    .string()
+    .trim()
+    .min(1)
+    .refine(
+      (fn) => {
+        const fileExtension = fn.split(".").pop() as TAllowedFileExtension | undefined;
+        if (!fileExtension || fileExtension.toLowerCase() === fn.toLowerCase()) {
+          return false;
+        }
+
+        return true;
+      },
+      {
+        error: "File name must have an extension",
+      }
+    ),
+  accessType: ZAccessType,
+});
+
+export const ZDeleteFileRequest = ZDownloadFileRequest;
+
+export const ZUploadFileConfig = z.object({
+  allowedFileExtensions: z.array(z.string()).optional(),
+  surveyId: z.string().optional(),
+  elementId: z.string().optional(),
+});
+
+export type TUploadFileConfig = z.infer<typeof ZUploadFileConfig>;
+
+export type TUploadFileAccess = {
+  pinAuthToken?: string | null;
+  singleUseId?: string | null;
+  url?: string | null;
+};
+
+/**
+ * An upload request's extension list: the element's own, picked from the allowed set. The survey schema
+ * does not make a saved list unique, so repeats are dropped first; what is left can never be longer than
+ * the allowed set, and an over-long list is refused before any entry is checked. A list past
+ * {@link MAX_RAW_ALLOWED_FILE_EXTENSIONS} is refused as sent, with that limit named, before it is
+ * deduplicated, so a huge one costs no more than the one issue that refuses it.
+ */
+export const MAX_RAW_ALLOWED_FILE_EXTENSIONS = 1_000;
+
+const ZAllowedFileExtensionsInput = z
+  .preprocess((value, ctx) => {
+    if (!Array.isArray(value)) return value;
+    const list: unknown[] = value;
+    if (list.length > MAX_RAW_ALLOWED_FILE_EXTENSIONS) {
+      ctx.addIssue({
+        code: "too_big",
+        origin: "array",
+        maximum: MAX_RAW_ALLOWED_FILE_EXTENSIONS,
+        inclusive: true,
+        input: list,
+      });
+      return list;
+    }
+    return [...new Set(list)];
+  }, z.array(ZAllowedFileExtension).max(ALLOWED_FILE_EXTENSIONS_TUPLE.length))
+  .optional();
+
+export const ZUploadPrivateFileRequest = z
+  .object({
+    fileName: z.string().trim().min(1),
+    fileType: z.string().trim().min(1),
+    allowedFileExtensions: ZAllowedFileExtensionsInput,
+    surveyId: z.cuid2(),
+    elementId: z
+      .string()
+      .trim()
+      .min(1)
+      .regex(
+        /^[a-zA-Z0-9_-]+$/,
+        "Element id must contain only alphanumeric characters, hyphens, or underscores"
+      ),
+    workspaceId: z.cuid2(),
+    // Credentials the respondent already holds for a PIN-protected or single-use link survey. The
+    // server checks them exactly as the client response APIs do; surveys without either ignore them.
+    pinAuthToken: z.string().nullish(),
+    singleUseId: z.string().nullish(),
+    url: z.string().nullish(),
+  })
+  .superRefine((data, ctx) => {
+    refineFileUploadInput({
+      data: {
+        fileName: data.fileName,
+        fileType: data.fileType,
+        allowedFileExtensions: data.allowedFileExtensions,
+      },
+      ctx,
+    });
+  });
+
+export type TUploadPrivateFileRequest = z.infer<typeof ZUploadPrivateFileRequest>;
+
+export const ZUploadFileResponse = z.object({
+  data: z.object({
+    signedUrl: z.string(),
+    fileUrl: ZStorageUrl,
+    signingData: z
+      .object({
+        signature: z.string(),
+        timestamp: z.number(),
+        uuid: z.string(),
+      })
+      .nullable(),
+    presignedFields: z.record(z.string(), z.string()).optional(),
+    updatedFileName: z.string(),
+  }),
+});
+
+export type TUploadFileResponse = z.infer<typeof ZUploadFileResponse>;
+
+export const ZUploadPublicFileRequest = z
+  .object({
+    fileName: z.string().trim().min(1),
+    fileType: z.string().trim().min(1),
+    workspaceId: z.cuid2(),
+    allowedFileExtensions: ZAllowedFileExtensionsInput,
+  })
+  .superRefine((data, ctx) => {
+    refineFileUploadInput({
+      data: {
+        fileName: data.fileName,
+        fileType: data.fileType,
+        allowedFileExtensions: data.allowedFileExtensions,
+      },
+      ctx,
+    });
+  });
+
+export type TUploadPublicFileRequest = z.infer<typeof ZUploadPublicFileRequest>;
+
+const refineFileUploadInput = ({
+  data,
+  ctx,
+}: {
+  data: {
+    fileName: string;
+    fileType: string;
+    allowedFileExtensions?: TAllowedFileExtension[];
+  };
+  ctx: z.RefinementCtx;
+}): void => {
+  const fileExtension = data.fileName.split(".").pop()?.toLowerCase() as TAllowedFileExtension | undefined;
+
+  if (!fileExtension || fileExtension.toLowerCase() === data.fileName.toLowerCase()) {
+    ctx.addIssue({
+      code: "custom",
+      message: "File name must have an extension",
+      path: ["fileName"],
+    });
+
+    return;
+  }
+
+  const { success } = ZAllowedFileExtension.safeParse(fileExtension);
+
+  if (!success) {
+    ctx.addIssue({
+      code: "custom",
+      message: "File extension is not allowed for security reasons",
+      path: ["fileName"],
+    });
+
+    return;
+  }
+
+  // Parameters are tolerated ("image/jpeg; charset=binary"), a list of types is not: browsers act on the
+  // last type in "image/png;,text/html". The server stores and serves the type derived from the
+  // extension either way, so this only refuses a declared type that disagrees with the file name.
+  const normalizedFileType = data.fileType.toLowerCase().split(";")[0].trim();
+  if (data.fileType.includes(",") || normalizedFileType !== mimeTypes[fileExtension]) {
+    ctx.addIssue({
+      code: "custom",
+      message: "File type doesn't match the file extension",
+      path: ["fileType"],
+    });
+
+    return;
+  }
+
+  if (data.allowedFileExtensions?.length) {
+    if (!data.allowedFileExtensions.includes(fileExtension)) {
+      ctx.addIssue({
+        code: "custom",
+        message: `File extension is not allowed, allowed extensions are: ${data.allowedFileExtensions.join(", ")}`,
+        path: ["fileName"],
+      });
+    }
+  }
+};

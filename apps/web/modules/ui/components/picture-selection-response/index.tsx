@@ -1,0 +1,55 @@
+"use client";
+
+import Image from "next/image";
+import { cn } from "@/lib/cn";
+import { isExternalImageSrc } from "@/lib/image-hosts";
+import { getChoiceBadgeText } from "@/modules/survey/lib/element-code-label";
+import { IdBadge } from "@/modules/ui/components/id-badge";
+
+interface PictureSelectionResponseProps {
+  readonly choices: { id: string; imageUrl: string; code?: string }[];
+  readonly selected: string | number | string[];
+  readonly isExpanded?: boolean;
+  readonly showId: boolean;
+}
+
+export const PictureSelectionResponse = ({
+  choices,
+  selected,
+  isExpanded = true,
+  showId,
+}: PictureSelectionResponseProps) => {
+  if (typeof selected !== "object") return null;
+
+  const choiceImageMapping = choices.reduce(
+    (acc, choice) => {
+      acc[choice.id] = choice.imageUrl;
+      return acc;
+    },
+    {} as Record<string, string>
+  );
+
+  return (
+    <div className={cn("my-1 flex gap-x-5 gap-y-4", isExpanded ? "flex-wrap" : "", showId ? "flex-col" : "")}>
+      {selected.map((id) => (
+        <div className="flex items-center gap-2" key={id}>
+          {choiceImageMapping[id] && (
+            <>
+              <div className="relative h-10 w-16">
+                <Image
+                  src={choiceImageMapping[id]}
+                  alt={choiceImageMapping[id].split("/").pop() || "Image"}
+                  fill
+                  style={{ objectFit: "cover" }}
+                  className="rounded-lg"
+                  unoptimized={isExternalImageSrc(choiceImageMapping[id])}
+                />
+              </div>
+              {showId && <IdBadge id={getChoiceBadgeText({ choices }, id)} />}
+            </>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};

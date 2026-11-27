@@ -1,0 +1,202 @@
+import { z } from "zod";
+import { ZWorkflowStatus } from "../types/common";
+import { ZWorkflowDefinition } from "../types/document";
+import {
+  ZWorkflowRunData,
+  ZWorkflowRunLog,
+  ZWorkflowRunStatus,
+  ZWorkflowTriggerRunPayload,
+} from "../types/runs";
+import { ZWorkflowTriggerType } from "../types/triggers";
+import { ZIsoDateTime } from "./common";
+import { ZWorkflowRunStep } from "./run-detail";
+
+/**
+ * API resource shapes returned by the v3 Workflows endpoints. These are the serializer outputs:
+ * dates are ISO 8601 strings, derived projections (`triggerType`, `surveyId`, `lastRun`) are
+ * always present, and nullable fields are emitted explicitly rather than omitted. They are
+ * intentionally distinct from row shapes in `@formbricks/database`.
+ */
+
+export const ZWorkflowRunSummary = z
+  .object({
+    id: z.cuid2(),
+    workflowId: z.cuid2(),
+    workspaceId: z.cuid2(),
+    workflowVersionId: z
+      .cuid2()
+      .nullable()
+      .describe(
+        "Immutable workflow version snapshot the run executes against. Null for dry runs of never-enabled workflows."
+      ),
+    status: ZWorkflowRunStatus,
+    isDryRun: z.boolean(),
+    triggerType: ZWorkflowTriggerType,
+    surveyId: z.cuid2().nullable(),
+    responseId: z
+      .cuid2()
+      .nullable()
+      .describe("Survey response that triggered the run. Null for synthesized dry-run data."),
+    error: z.string().nullable().describe("Terminal or most recent failure reason."),
+    attempt: z.number().int().nonnegative().describe("Retry attempt counter; retries never change status."),
+    createdAt: ZIsoDateTime,
+    updatedAt: ZIsoDateTime,
+    startedAt: ZIsoDateTime.nullable(),
+    finishedAt: ZIsoDateTime.nullable(),
+  })
+  .describe("Slim run shape embedded as lastRun in workflow resources.");
+export type TWorkflowRunSummary = z.infer<typeof ZWorkflowRunSummary>;
+
+export const ZWorkflowRunListItem = ZWorkflowRunSummary.extend({
+  workflowName: z
+    .string()
+    .min(1)
+    .describe("Name of the workflow this run belongs to, joined for the runs-list display."),
+}).describe(
+  "Run-list row: the slim summary plus the resolved workflow name. Distinct from the embedded lastRun summary, which omits the name (the parent workflow already carries it)."
+);
+export type TWorkflowRunListItem = z.infer<typeof ZWorkflowRunListItem>;
+
+export const ZWorkflowRunLogResource = ZWorkflowRunLog.required({
+  input: true,
+  output: true,
+  error: true,
+  startedAt: true,
+  finishedAt: true,
+}).describe("Persisted trace entry for one run step, with every field emitted explicitly.");
+export type TWorkflowRunLogResource = z.infer<typeof ZWorkflowRunLogResource>;
+
+export const ZWorkflowRunResource = ZWorkflowRunSummary.extend({
+  triggerPayload: ZWorkflowTriggerRunPayload,
+  data: ZWorkflowRunData,
+  logs: z
+    .array(ZWorkflowRunLogResource)
+    .describe("Persisted step-by-step trace ordered by sequence. Empty while the run is queued."),
+  idempotencyKey: z.string().nullable().describe("Deduplication key for this run, unique per workflow."),
+  nextAttemptAt: ZIsoDateTime.nullable(),
+  lastErrorAt: ZIsoDateTime.nullable(),
+  callerIp: z
+    .string()
+    .nullable()
+    .describe("The caller's IP for a run a Webhook Secret URL call started; null otherwise."),
+  workflowVersionNumber: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .describe("The number of the version the run executed; null for a Test run, which runs the draft."),
+  steps: z
+    .array(ZWorkflowRunStep)
+    .describe(
+      "Run detail per step: the steps that ran, in order, then the steps on If/else branches the run did not take (`not_taken`)."
+    ),
+  contentDeletedAt: ZIsoDateTime.nullable().describe(
+    "When the run's content was deleted, `contentRetentionDays` after the run finished: the payload keeps only its type, ids and trigger time, data and step input/output are empty, errors and callerIp are null, steps carry no detail. Null while the content is kept."
+  ),
+  contentRetentionDays: z
+    .number()
+    .int()
+    .positive()
+    .nullable()
+    .describe(
+      'The retention period in days that applied when the content was deleted, for "Details deleted after N days". Null while the content is kept.'
+    ),
+}).describe("Full debug-oriented run shape returned by run detail and Test run creation.");
+export type TWorkflowRunResource = z.infer<typeof ZWorkflowRunResource>;
+
+/** Categories of problem a dry-run validation can surface, so callers (or agents) can branch on `code`. */
+export const ZWorkflowTestProblemCode = z.enum([
+  "definition_not_executable",
+  "survey_not_found",
+  "ending_card_not_found",
+  "survey_not_workspace_visible",
+  "recipient_not_allowed",
+  "survey_link_survey_not_found",
+  "survey_link_survey_not_link",
+]);
+export type TWorkflowTestProblemCode = z.infer<typeof ZWorkflowTestProblemCode>;
+
+export const ZWorkflowTestProblem = z
+  .object({
+    code: ZWorkflowTestProblemCode,
+    field: z
+      .string()
+      .describe("Dotted path to the offending field, e.g. definition.trigger.config.surveyId."),
+    message: z.string().describe("Human-readable explanation of the problem."),
+  })
+  .describe("A single problem found while validating a workflow for a dry run.");
+export type TWorkflowTestProblem = z.infer<typeof ZWorkflowTestProblem>;
+
+export const ZWorkflowWarningCode = z.enum(["survey_link_key_not_accepted"]);
+export type TWorkflowWarningCode = z.infer<typeof ZWorkflowWarningCode>;
+
+export const ZWorkflowWarning = z
+  .object({
+    code: ZWorkflowWarningCode,
+    field: z
+      .string()
+      .describe("Dotted path to the field, e.g. definition.nodes.0.config.surveyLink.embeddedData.1.key."),
+    message: z.string().describe("Human-readable explanation."),
+  })
+  .describe(
+    "Something that does not stop the workflow from running but probably needs a look, such as an Embedded Data key the linked survey drops."
+  );
+export type TWorkflowWarning = z.infer<typeof ZWorkflowWarning>;
+
+export const ZWorkflowTestResult = z
+  .object({
+    workflowId: z.cuid2(),
+    ok: z
+      .boolean()
+      .describe(
+        "True when the definition is executable, every trigger reference resolves, and every literal send_email recipient can access this workspace."
+      ),
+    problems: z
+      .array(ZWorkflowTestProblem)
+      .describe("Every problem found, so all issues can be fixed at once. Empty when ok is true."),
+    warnings: z
+      .array(ZWorkflowWarning)
+      .describe("Things that will not stop the workflow from running but probably need a look."),
+  })
+  .describe(
+    "Result of dry-running (testing) a workflow: whether it would execute and, if not, why not. No run is created and no side effects occur."
+  );
+export type TWorkflowTestResult = z.infer<typeof ZWorkflowTestResult>;
+
+export const ZWorkflowListItem = z
+  .object({
+    id: z.cuid2(),
+    workspaceId: z.cuid2(),
+    name: z.string().min(1),
+    description: z.string().nullable(),
+    status: ZWorkflowStatus,
+    triggerType: ZWorkflowTriggerType.nullable().describe(
+      "Derived from definition.trigger.triggerType. Null while the draft has no trigger."
+    ),
+    surveyId: z
+      .cuid2()
+      .nullable()
+      .describe("Derived from definition.trigger.config.surveyId. Null while the draft has no trigger."),
+    createdBy: z.cuid2().nullable().describe("Null when the creating user was deleted."),
+    creator: z
+      .object({ name: z.string() })
+      .nullable()
+      .describe("Creating user's name; null when the creator was deleted."),
+    createdAt: ZIsoDateTime,
+    updatedAt: ZIsoDateTime,
+    lastRun: ZWorkflowRunSummary.nullable().describe(
+      "Most recent run summary (dry runs included). Null when the workflow has never run."
+    ),
+    runCount: z
+      .number()
+      .int()
+      .nonnegative()
+      .describe("Number of real runs for this workflow; Test runs (dry runs) are not counted."),
+  })
+  .describe("Slim workflow shape returned by the workflow list. Excludes the definition.");
+export type TWorkflowListItem = z.infer<typeof ZWorkflowListItem>;
+
+export const ZWorkflowResource = ZWorkflowListItem.extend({
+  definition: ZWorkflowDefinition,
+}).describe("Full workflow shape returned by detail, create, update, duplicate, and lifecycle operations.");
+export type TWorkflowResource = z.infer<typeof ZWorkflowResource>;

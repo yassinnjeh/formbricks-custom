@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "types": ["node"]
+  },
+  "exclude": ["node_modules"],
+  "extends": "@formbricks/config-typescript/js-library.json",
+  "include": ["src"]
+}

@@ -1,0 +1,41 @@
+import { Metadata } from "next";
+import React from "react";
+import { NoScriptWarning } from "@/app/components/NoScriptWarning";
+import { CspNonceProvider } from "@/lib/csp/nonce";
+import { getServerCspNonce } from "@/lib/csp/server-nonce";
+import { SentryClientConfigScript } from "@/lib/sentry/SentryClientConfigScript";
+import { I18nProvider } from "@/lingodotdev/client";
+import { getLocale } from "@/lingodotdev/language";
+import { ServerActionNotices } from "@/modules/ui/components/server-action-notices";
+import "../modules/ui/globals.css";
+
+export const metadata: Metadata = {
+  title: {
+    template: "%s | Formbricks",
+    default: "Formbricks",
+  },
+  description: "Open-Source Survey Suite",
+};
+
+const RootLayout = async ({ children }: { readonly children: React.ReactNode }) => {
+  const [locale, nonce] = await Promise.all([getLocale(), getServerCspNonce()]);
+
+  return (
+    <html lang={locale} translate="no">
+      <body className="flex h-dvh flex-col transition-all ease-in-out">
+        {/* First in the document so instrumentation-client.ts can start Sentry as early as possible. */}
+        <SentryClientConfigScript nonce={nonce} />
+        <NoScriptWarning locale={locale} />
+        <CspNonceProvider nonce={nonce}>
+          <I18nProvider language={locale}>
+            {children}
+            {/* After the page, so keyboard users reach the notices by tabbing on from its content. */}
+            <ServerActionNotices />
+          </I18nProvider>
+        </CspNonceProvider>
+      </body>
+    </html>
+  );
+};
+
+export default RootLayout;

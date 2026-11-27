@@ -1,0 +1,138 @@
+import { logger } from "@formbricks/logger";
+import { can } from "@/lib/authorization";
+import { getWorkspaceAuthorizationActionForMethod } from "@/lib/authorization/permission-action";
+import { resolveSurveyActorContext } from "@/lib/survey/visibility/actor-context";
+import { SURVEY_ACTION_FOR_METHOD, canApiKeyReachSurveyResource } from "@/lib/survey/visibility/api-key";
+import { getOrganizationIdFromSurveyId } from "@/lib/utils/helper";
+import { authenticatedApiClient } from "@/modules/api/v2/auth/authenticated-api-client";
+import { responses } from "@/modules/api/v2/lib/response";
+import { handleApiError } from "@/modules/api/v2/lib/utils";
+import { getWorkspaceId } from "@/modules/api/v2/management/lib/helper";
+import { calculateExpirationDate } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/lib/utils";
+import { getContactsInSegment } from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/segments/[segmentId]/lib/contact";
+import {
+  ZContactLinksBySegmentParams,
+  ZContactLinksBySegmentQuery,
+} from "@/modules/api/v2/management/surveys/[surveyId]/contact-links/segments/[segmentId]/types/contact";
+import { ApiErrorResponseV2 } from "@/modules/api/v2/types/api-error";
+import { getContactSurveyLink } from "@/modules/ee/contacts/lib/contact-survey-link";
+import { getIsContactsEnabled } from "@/modules/ee/license-check/lib/utils";
+
+export const GET = async (
+  request: Request,
+  props: { params: Promise<{ surveyId: string; segmentId: string }> }
+) =>
+  authenticatedApiClient({
+    request,
+    externalParams: props.params,
+    schemas: {
+      params: ZContactLinksBySegmentParams,
+      query: ZContactLinksBySegmentQuery,
+    },
+    handler: async ({ authentication, parsedInput }) => {
+      const { params, query } = parsedInput;
+
+      if (!params) {
+        return handleApiError(request, {
+          type: "bad_request",
+          details: [{ field: "params", issue: "missing" }],
+        });
+      }
+
+      const workspaceIdResult = await getWorkspaceId(params.surveyId, false);
+
+      if (!workspaceIdResult.ok) {
+        return handleApiError(request, workspaceIdResult.error);
+      }
+
+      const { workspaceId } = workspaceIdResult.data;
+
+      // Checked at write level despite being a GET: this endpoint *mints* credentials rather than reading
+      // anything. Each returned link carries a signed contact token that opens the survey as that contact and
+      // submits a response for them, so a reporting-only (read) key must not be able to create them.
+      if (
+        !(await can(
+          { type: "apiKey", id: authentication.apiKeyId },
+          getWorkspaceAuthorizationActionForMethod("POST"),
+          { type: "workspace", id: workspaceId }
+        )) ||
+        // ENG-3282: a personal link to a restricted survey is out of an API key's reach, at the same level
+        // as a response write.
+        !(await canApiKeyReachSurveyResource(authentication.apiKeyId, SURVEY_ACTION_FOR_METHOD.POST, {
+          type: "survey",
+          id: params.surveyId,
+        }))
+      ) {
+        return handleApiError(request, {
+          type: "unauthorized",
+        });
+      }
+
+      const organizationId = await getOrganizationIdFromSurveyId(params.surveyId);
+      const isContactsEnabled = await getIsContactsEnabled(organizationId);
+      if (!isContactsEnabled) {
+        return handleApiError(request, {
+          type: "forbidden",
+          details: [
+            { field: "contacts", issue: "Contacts are only enabled for Enterprise Edition, please upgrade." },
+          ],
+        });
+      }
+
+      // Get contacts based on segment
+      const contactsResult = await getContactsInSegment(
+        params.surveyId,
+        params.segmentId,
+        await resolveSurveyActorContext({ type: "apiKey", id: authentication.apiKeyId }, organizationId),
+        query?.limit || 10,
+        query?.skip || 0,
+        query?.attributeKeys
+      );
+
+      if (!contactsResult.ok) {
+        return handleApiError(request, contactsResult.error as ApiErrorResponseV2);
+      }
+
+      const { data: contacts, meta } = contactsResult.data;
+
+      // Calculate expiration date based on expirationDays
+      let expiresAt: string | null = null;
+      if (query?.expirationDays) {
+        expiresAt = calculateExpirationDate(query.expirationDays);
+      }
+
+      // Generate survey links for each contact
+      const contactLinks = await Promise.all(
+        contacts.map(async (contact) => {
+          const { contactId, attributes } = contact;
+
+          const surveyUrlResult = await getContactSurveyLink(
+            contactId,
+            params.surveyId,
+            query?.expirationDays || undefined
+          );
+
+          if (!surveyUrlResult.ok) {
+            logger.error(
+              { error: surveyUrlResult.error, contactId: contactId, surveyId: params.surveyId },
+              "Failed to generate survey URL for contact"
+            );
+            return null;
+          }
+
+          return {
+            contactId,
+            attributes,
+            surveyUrl: surveyUrlResult.data,
+            expiresAt,
+          };
+        })
+      );
+
+      const filteredContactLinks = contactLinks.filter(Boolean);
+      return responses.successResponse({
+        data: filteredContactLinks,
+        meta,
+      });
+    },
+  });

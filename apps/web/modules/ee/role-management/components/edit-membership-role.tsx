@@ -1,0 +1,135 @@
+"use client";
+
+import { ChevronDownIcon } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import toast from "react-hot-toast";
+import { useTranslation } from "react-i18next";
+import type { TOrganizationRole } from "@formbricks/types/memberships";
+import { getAccessFlags, getOrganizationRoleLabels } from "@/lib/membership/utils";
+import { getV3ApiErrorMessage } from "@/modules/api/lib/v3-client";
+import { updateInviteRole, updateMemberRole } from "@/modules/ee/role-management/lib/api-client";
+import { getAssignableOrganizationRoles } from "@/modules/ee/role-management/lib/assignable-roles";
+import { isRoleEditDisabled } from "@/modules/ee/role-management/lib/role-edit-rules";
+import { Badge } from "@/modules/ui/components/badge";
+import { Button } from "@/modules/ui/components/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/modules/ui/components/dropdown-menu";
+
+interface Role {
+  readonly currentUserRole: TOrganizationRole;
+  readonly memberRole: TOrganizationRole;
+  readonly organizationId: string;
+  readonly memberId?: string;
+  readonly userId: string;
+  readonly memberAccepted?: boolean;
+  readonly inviteId?: string;
+  readonly doesOrgHaveMoreThanOneOwner?: boolean;
+  readonly isFormbricksCloud: boolean;
+  readonly isDashboardViewerRoleEnabled: boolean;
+  readonly isUserManagementDisabledFromUi: boolean;
+}
+
+export function EditMembershipRole({
+  memberRole,
+  organizationId,
+  currentUserRole,
+  memberId,
+  userId,
+  memberAccepted,
+  inviteId,
+  doesOrgHaveMoreThanOneOwner,
+  isFormbricksCloud,
+  isDashboardViewerRoleEnabled,
+  isUserManagementDisabledFromUi,
+}: Role) {
+  const { t } = useTranslation();
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+
+  const roleLabels = getOrganizationRoleLabels(t);
+  const { isOwner, isManager } = getAccessFlags(currentUserRole);
+  const isOwnerOrManager = isOwner || isManager;
+
+  const disableRole = isRoleEditDisabled({
+    isUserManagementDisabledFromUi,
+    currentUserRole,
+    memberRole,
+    memberId,
+    userId,
+    memberAccepted,
+    doesOrgHaveMoreThanOneOwner,
+  });
+
+  const handleMemberRoleUpdate = async (role: TOrganizationRole) => {
+    setLoading(true);
+
+    try {
+      if (memberAccepted && memberId) {
+        await updateMemberRole({ userId: memberId, organizationId, body: { role } });
+      }
+
+      if (inviteId) {
+        await updateInviteRole({ inviteId, body: { role } });
+      }
+    } catch (error) {
+      toast.error(getV3ApiErrorMessage(error, t("common.something_went_wrong_please_try_again")));
+      setLoading(false);
+      return;
+    }
+
+    setLoading(false);
+    router.refresh();
+  };
+
+  const handleRoleChange = (role: TOrganizationRole) => {
+    void handleMemberRoleUpdate(role);
+  };
+
+  const getMembershipRoles = () =>
+    getAssignableOrganizationRoles({
+      assignerRole: currentUserRole,
+      isFormbricksCloud,
+      isDashboardViewerRoleEnabled,
+    });
+
+  if (isOwnerOrManager) {
+    return (
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            className="flex items-center gap-1 p-2 text-xs"
+            disabled={disableRole}
+            loading={loading}
+            size="sm"
+            variant="secondary">
+            <span className="ml-1">{roleLabels[memberRole]}</span>
+            <ChevronDownIcon className="size-4" />
+          </Button>
+        </DropdownMenuTrigger>
+        {!disableRole && (
+          <DropdownMenuContent>
+            <DropdownMenuRadioGroup
+              onValueChange={(value) => {
+                handleRoleChange(value.toLowerCase() as TOrganizationRole);
+              }}
+              value={memberRole}>
+              {getMembershipRoles().map((role) => (
+                <DropdownMenuRadioItem key={role} value={role}>
+                  {roleLabels[role]}
+                </DropdownMenuRadioItem>
+              ))}
+            </DropdownMenuRadioGroup>
+          </DropdownMenuContent>
+        )}
+      </DropdownMenu>
+    );
+  }
+
+  return <Badge size="tiny" type="gray" text={roleLabels[memberRole]} />;
+}

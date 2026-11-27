@@ -1,0 +1,27 @@
+allOf:
+  - $ref: ./SurveyElementBase.yml
+  - type: object
+    required:
+      - choices
+    properties:
+      code:
+        $ref: ./SurveyQuestionCode.yml
+      type:
+        type: string
+        enum:
+          - ranking
+      optionsCopiedFrom:
+        $ref: ./SurveyOptionsCopiedFrom.yml
+      choices:
+        type: array
+        minItems: 2
+        maxItems: 25
+        items:
+          $ref: ./SurveyChoice.yml
+      otherOptionPlaceholder:
+        $ref: ./TranslatableText.yml
+      shuffleOption:
+        $ref: ./SurveyShuffleOption.yml
+      validation:
+        $ref: ./SurveyValidation.yml
+unevaluatedProperties: false

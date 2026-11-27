@@ -1,0 +1,284 @@
+import { prisma } from "@formbricks/database";
+import { Prisma } from "@formbricks/database/prisma";
+import { logger } from "@formbricks/logger";
+import { loggableError } from "@/lib/utils/loggable-error";
+import { captureWorkflowRunFailed } from "@/modules/ee/workflows/lib/analytics/run-failure";
+import { toJsonRecord } from "./json-record";
+import {
+  WORKFLOW_RUN_RECONCILE_BATCH_SIZE,
+  WORKFLOW_RUN_STUCK_RUNNING_MAX_AGE_MS,
+  WORKFLOW_TEST_RUN_INTERRUPTED_MAX_AGE_MS,
+} from "./reconcile-constants";
+
+interface ReconcileStuckRunningWorkflowRunsInput {
+  /** Injected clock for deterministic staleness-threshold tests; defaults to wall-clock. */
+  now?: Date;
+  logContext?: Record<string, unknown>;
+}
+
+export interface ReconcileStuckRunningWorkflowRunsResult {
+  scanned: number;
+  recovered: number;
+  stepsSkipped: number;
+}
+
+/**
+ * Periodic reconciler for the **execution-side orphan**: a `WorkflowRun` stuck `running` after the
+ * executor crashed/stalled between claiming a step (`WorkflowRunLog` row → `running`, written BEFORE
+ * the send) and recording its result. Once that happens the run is wedged: every BullMQ redelivery
+ * sees the `running` step row and bails (`STEP_BAIL`, at-most-once — never re-send), the job completes
+ * without error so no retry fires, and nothing moves the run to a terminal state. This is the
+ * "future orphan-reconciler" the executor defers to (see `process-workflow-run-job.ts`).
+ *
+ * - **Staleness by `updatedAt`, not `startedAt`:** the executor never touches the run row between the
+ *   claim and the terminal write, and a non-final failure bumps `updatedAt` while keeping status
+ *   `running`. So "`running` with no `updatedAt` movement for `WORKFLOW_RUN_STUCK_RUNNING_MAX_AGE_MS`"
+ *   means no executor activity at all — including no in-flight retry (the whole attempts×backoff
+ *   window is ≲1 min, far inside the 1h threshold), so no live owner can be racing.
+ * - **Recover, don't resume:** a stuck run cannot be re-run — its `running` step rows block every
+ *   claim path (a `running` step bails; after this sweep a `skipped` step matches no re-claim
+ *   condition either). The send may or may not have gone out, so we surface the failure rather than
+ *   guess. Recovery = mark the run `failed` (distinct error) so redeliveries no-op on the executor's
+ *   pre-claim terminal-status check.
+ * - **Steps → `skipped`, never `failed`:** the executor re-claims a `failed` step and re-sends it, so
+ *   `failed` here would re-arm a double-send and break at-most-once. `skipped` records "outcome
+ *   unknown, not retried" and matches no claim path.
+ * - **Run-first, then steps:** the run is claimed-for-failure with a status-guarded `updateMany`
+ *   (`status: "running"`); only when we win (`count > 0`) do we touch its steps — so we never skip
+ *   the steps of a run a live owner still holds. A crash between the two writes leaves a `failed` run
+ *   with `running` step rows: cosmetic only, since the terminal-status guard makes those steps
+ *   unreachable forever.
+ * - **Benign overwrite race:** `sendOwnedStep` finalizes a step with an unconditional write by
+ *   `(runId, stepId)`. If an impossibly-slow owner finalizes a step *after* we skipped it, its true
+ *   outcome overwrites our `skipped` — harmless, and combined with the guarded run terminal writes
+ *   (which reject clobbering a `failed` run) every interleaving still yields zero double-sends.
+ * - **`data.steps` mirror not reconstructed:** the run's denormalized step mirror is left as-is; the
+ *   authoritative per-step record is the `WorkflowRunLog` rows this sweep marks `skipped`.
+ * - **Bounded / isolated:** one batch per tick, oldest-first; one run's failure is logged and skipped
+ *   so it never aborts the sweep. Running-state cardinality is tiny, so a backlog is not expected.
+ */
+export const reconcileStuckRunningWorkflowRuns = async ({
+  now = new Date(),
+  logContext,
+}: ReconcileStuckRunningWorkflowRunsInput): Promise<ReconcileStuckRunningWorkflowRunsResult> => {
+  const staleThreshold = new Date(now.getTime() - WORKFLOW_RUN_STUCK_RUNNING_MAX_AGE_MS);
+
+  // Index-assisted by @@index([status, createdAt]) on the `status = 'running'` prefix; running-state
+  // cardinality is tiny (executions are seconds long), so the residual `updatedAt` filter + sort are
+  // cheap. Oldest first so the longest-stuck runs are surfaced first.
+  const stuck = await prisma.workflowRun.findMany({
+    where: {
+      status: "running",
+      isDryRun: false,
+      updatedAt: { lt: staleThreshold },
+    },
+    orderBy: { updatedAt: "asc" },
+    take: WORKFLOW_RUN_RECONCILE_BATCH_SIZE,
+    select: {
+      id: true,
+      workflowId: true,
+      workspaceId: true,
+      startedAt: true,
+      updatedAt: true,
+      // Only for the failure analytics below; the recovery itself needs neither.
+      triggerType: true,
+      attempt: true,
+    },
+  });
+
+  let recovered = 0;
+  let stepsSkipped = 0;
+
+  for (const run of stuck) {
+    const runLogContext = {
+      ...logContext,
+      workflowRunId: run.id,
+      workflowId: run.workflowId,
+      workspaceId: run.workspaceId,
+    };
+
+    try {
+      // Claim-for-failure, tenant- and status-guarded: only a run still `running` is ours to recover.
+      // A 0-row result means the owner finalized it between the scan and here — leave its verdict alone.
+      const failed = await prisma.workflowRun.updateMany({
+        where: { id: run.id, workspaceId: run.workspaceId, status: "running" },
+        data: {
+          status: "failed",
+          error: "Workflow run was abandoned mid-execution (stale running) and recovered by the reconciler",
+          lastErrorAt: now,
+          finishedAt: now,
+        },
+      });
+
+      if (failed.count === 0) {
+        continue;
+      }
+
+      recovered += 1;
+
+      // This reconciler is one of the three writers of a terminal `failed`, so it reports the
+      // failure like the runner does (ENG-2851) — otherwise a pod that died mid-step would show up
+      // in the snapshot's `runs_24h_failed` and in no `workflow_run_failed` event.
+      await captureWorkflowRunFailed({
+        runId: run.id,
+        workflowId: run.workflowId,
+        workspaceId: run.workspaceId,
+        triggerType: run.triggerType,
+        errorKind: "abandoned_mid_execution",
+        attempt: run.attempt,
+      });
+
+      // Only after we own the failure: flip the orphaned in-flight steps to `skipped` (never `failed`,
+      // which the executor would re-claim and re-send). 0 is legitimate — a crash before the first
+      // step was ever claimed leaves no `running` step rows.
+      const skipped = await prisma.workflowRunLog.updateMany({
+        where: { runId: run.id, status: "running" },
+        data: {
+          status: "skipped",
+          error: "Step outcome unknown: run abandoned mid-execution; not retried (at-most-once)",
+          finishedAt: now,
+        },
+      });
+      stepsSkipped += skipped.count;
+
+      logger.warn(
+        {
+          ...runLogContext,
+          startedAt: run.startedAt,
+          updatedAt: run.updatedAt,
+          stepsSkipped: skipped.count,
+        },
+        "Stuck running workflow run recovered; marked failed"
+      );
+    } catch (error) {
+      // Isolate per run: a single recovery failure must not abort the sweep; the next tick retries.
+      logger.error({ ...runLogContext, err: error }, "Failed to recover stuck running workflow run");
+    }
+  }
+
+  return { scanned: stuck.length, recovered, stepsSkipped };
+};
+
+const STUCK_SENDING_ERROR =
+  "The HTTP request was still sending after an hour and was marked failed; it may or may not have reached its target";
+
+/**
+ * The 1-hour rule for "Don't wait" HTTP requests (ENG-7179, ADR 0047): a step still `running` with
+ * `delivery: "sending"` an hour after it started — its job was lost to a crash, or dropped by an older
+ * worker during a rolling upgrade — is marked `failed` on its own row. The run is left alone (it
+ * finished long ago, and a "Don't wait" call never fails it). Each write is guarded on `running`, so a
+ * job that finishes in between keeps its own outcome; the job in turn only writes a row still
+ * `running`, so a late job never overwrites this one. Served by `@@index([status, startedAt])`.
+ */
+export const failStuckSendingHttpRequests = async ({
+  now = new Date(),
+  logContext,
+}: ReconcileStuckRunningWorkflowRunsInput): Promise<{ scanned: number; failed: number }> => {
+  const stuck = await prisma.workflowRunLog.findMany({
+    where: {
+      status: "running",
+      stepType: "http_request",
+      startedAt: { lt: new Date(now.getTime() - WORKFLOW_RUN_STUCK_RUNNING_MAX_AGE_MS) },
+      output: { path: ["delivery"], equals: "sending" },
+    },
+    orderBy: { startedAt: "asc" },
+    take: WORKFLOW_RUN_RECONCILE_BATCH_SIZE,
+    select: { id: true, runId: true, stepId: true, output: true },
+  });
+
+  let failed = 0;
+  for (const row of stuck) {
+    try {
+      const output = toJsonRecord(row.output);
+      const written = await prisma.workflowRunLog.updateMany({
+        where: { id: row.id, status: "running" },
+        data: {
+          status: "failed",
+          error: STUCK_SENDING_ERROR,
+          finishedAt: now,
+          output: { ...output, delivery: "failed" },
+        },
+      });
+      failed += written.count;
+    } catch (error) {
+      // A database error for this row is logged and the batch goes on; anything else is a bug and
+      // fails the job. By name and code only: a Prisma message can quote the step's recorded request.
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError)) throw error;
+      logger.error(
+        {
+          ...logContext,
+          ...loggableError(error),
+          code: error.code,
+          workflowRunId: row.runId,
+          stepId: row.stepId,
+        },
+        "Failed to mark a stuck sending HTTP request failed"
+      );
+    }
+  }
+  if (failed > 0)
+    logger.warn({ ...logContext, failed }, "Stuck sending workflow HTTP requests marked failed");
+  return { scanned: stuck.length, failed };
+};
+
+const INTERRUPTED_TEST_RUN_ERROR = "Test run was interrupted";
+const UNFINISHED_STATUSES = ["queued", "running"] as const;
+
+/**
+ * Test runs whose request was cut short (ENG-7354). A Test run executes inside the request that
+ * started it (ADR 0049), so a run still `queued` or `running` 10 minutes after it was created will
+ * never finish: it is marked `failed` with "Test run was interrupted", and its in-flight steps
+ * `skipped`. It is never queued, since a worker would run it with the real effects, and not reported
+ * as a workflow failure, like any Test run. Writes are guarded on the run still being unfinished, so a
+ * run that finishes in between keeps its own outcome. Served by `@@index([status, createdAt])`.
+ */
+export const failInterruptedTestRuns = async ({
+  now = new Date(),
+  logContext,
+}: ReconcileStuckRunningWorkflowRunsInput): Promise<{ scanned: number; failed: number }> => {
+  const interrupted = await prisma.workflowRun.findMany({
+    where: {
+      status: { in: [...UNFINISHED_STATUSES] },
+      isDryRun: true,
+      createdAt: { lt: new Date(now.getTime() - WORKFLOW_TEST_RUN_INTERRUPTED_MAX_AGE_MS) },
+    },
+    orderBy: { createdAt: "asc" },
+    take: WORKFLOW_RUN_RECONCILE_BATCH_SIZE,
+    select: { id: true, workspaceId: true },
+  });
+  if (interrupted.length === 0) return { scanned: 0, failed: 0 };
+
+  let failed = 0;
+  for (const run of interrupted) {
+    // One transaction per run, so a run is never left failed with a step still running, and a run that
+    // can't be written (a lock, a timeout) rolls back alone and stays eligible for the next sweep.
+    try {
+      failed += await prisma.$transaction(async (tx) => {
+        const result = await tx.workflowRun.updateMany({
+          where: {
+            id: run.id,
+            workspaceId: run.workspaceId,
+            isDryRun: true,
+            status: { in: [...UNFINISHED_STATUSES] },
+          },
+          data: { status: "failed", error: INTERRUPTED_TEST_RUN_ERROR, lastErrorAt: now, finishedAt: now },
+        });
+        if (result.count === 0) return 0;
+        // A Test run's effects are fakes, so a step left `running` sent nothing.
+        await tx.workflowRunLog.updateMany({
+          where: { runId: run.id, run: { workspaceId: run.workspaceId }, status: "running" },
+          data: { status: "skipped", error: INTERRUPTED_TEST_RUN_ERROR, finishedAt: now },
+        });
+        return result.count;
+      });
+    } catch (error) {
+      logger.error(
+        { ...logContext, err: error, workflowRunId: run.id, workspaceId: run.workspaceId },
+        "Could not mark an interrupted Test run failed"
+      );
+    }
+  }
+
+  if (failed > 0) logger.warn({ ...logContext, failed }, "Interrupted Test runs marked failed");
+  return { scanned: interrupted.length, failed };
+};

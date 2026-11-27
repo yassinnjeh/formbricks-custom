@@ -1,0 +1,79 @@
+import { useState } from "react";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/modules/ui/components/dialog";
+
+interface ModalWithTabsProps {
+  readonly open: boolean;
+  readonly setOpen: (v: boolean) => void;
+  readonly icon?: React.ReactNode;
+  readonly label?: string;
+  readonly description?: string;
+  readonly tabs: TabProps[];
+  readonly closeOnOutsideClick?: boolean;
+}
+
+interface TabProps {
+  title: string;
+  children: React.ReactNode;
+}
+
+export const ModalWithTabs = ({
+  open,
+  setOpen,
+  tabs,
+  icon,
+  label,
+  description,
+  closeOnOutsideClick,
+}: ModalWithTabsProps) => {
+  const [activeTab, setActiveTab] = useState(0);
+
+  const handleTabClick = (index: number) => {
+    setActiveTab(index);
+  };
+
+  // Closing returns to the first tab for the next open. Adjusted during render.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (!open) setActiveTab(0);
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogContent disableCloseOnOutsideClick={closeOnOutsideClick}>
+        <DialogHeader>
+          {icon}
+          <DialogTitle>{label}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
+        <DialogBody>
+          {tabs.length > 1 ? (
+            <div className="flex h-full w-full items-center justify-center gap-x-2 border-b border-slate-200 px-6">
+              {tabs.map((tab, index) => (
+                <button
+                  type="button"
+                  key={index}
+                  className={`mr-4 px-1 pb-3 focus:outline-hidden ${
+                    activeTab === index
+                      ? "border-b-2 border-brand-dark font-semibold text-slate-900"
+                      : "text-slate-500 hover:text-slate-700"
+                  }`}
+                  onClick={() => handleTabClick(index)}>
+                  {tab.title}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <div className={tabs.length > 1 ? "flex-1 pt-4" : "flex-1"}>{tabs[activeTab].children}</div>
+        </DialogBody>
+      </DialogContent>
+    </Dialog>
+  );
+};

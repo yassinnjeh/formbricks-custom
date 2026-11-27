@@ -1,0 +1,78 @@
+---
+title: "Make"
+description:
+  "Discover how to seamlessly integrate Formbricks with Make.com. Dive into our comprehensive guide to set up scenarios, connect with a plethora of apps, and send your survey data to more than 1000 platforms."
+icon: "circle-nodes"
+---
+
+Make is a powerful tool to send information between Formbricks and thousands of apps. Here's how to set it up.
+
+<Note>
+  Nailed down your survey?? Any changes in the survey cause additional work in the *Scenario*. It makes sense to first settle on the survey you want to run and then get to setting up Make.
+</Note>
+
+## Step 1: Check your question codes
+
+Every question has a **question code**, such as `q1` or `nps`, and the `dataByQuestionCode` group of the trigger output shows your answers under these codes. You can read and change the code in the **Settings** tab of a question, under **Recode**, **before** you activate the survey. Once the survey is active, codes are locked, so the scenario you build on them keeps working.
+
+<Note>
+  Question codes start with a lowercase letter and use lowercase letters, digits and `_`. Pick short, readable names such as `nps` or `visit_reason`. Learn more in [Question codes and answer codes](/surveys/analysis/question-codes).
+</Note>
+
+<Note>
+  The Question ID of a question is generated and cannot be changed. If you need it, choose **Copy question ID** in the question's **⋯** menu.
+</Note>
+
+## Step 2: Setup Make.com
+
+Visit [Make.com](https://make.com) to start a new scenario.
+
+![Create New Scenario](/images/platform/features/integrations/make/create-new-scenario.webp)
+
+Search for `Formbricks`:
+
+![Search Formbricks](/images/platform/features/integrations/make/search-formbricks.webp)
+
+Choose the event to trigger the Scenario:
+
+![Select Triggers](/images/platform/features/integrations/make/select-trigger.webp)
+
+## Step 3: Connect Formbricks with Make
+
+Click "Create a webhook":
+
+![Create Webhook](/images/platform/features/integrations/make/create-webhook.webp)
+
+Enter the Formbricks API Host and API Key. API Host is by default set to [https://app.formbricks.com](https://app.formbricks.com) but can be modified for self-hosting instances. Learn how to get an API Key from the [API Key tutorial](/api-reference/generate-key).
+
+![Enter API Key](/images/platform/features/integrations/make/enter-api-key-and-host.webp)
+
+## Step 4: Select Survey
+
+Choose from your created surveys:
+
+![Select Survey](/images/platform/features/integrations/make/select-survey.webp)
+
+## Step 5: Send a test response
+
+You need a test response for Make setup.
+
+![Submit Test Response](/images/platform/features/integrations/make/submit-test-response.webp)
+
+## Step 6: Set up Google Sheet
+
+Decide on the desired action for the data. Here, we'll send submissions to a Google Sheet:
+
+![Add Module](/images/platform/features/integrations/make/add-module.webp)
+
+Choose "Add a Row" for the action:
+
+![Select Action](/images/platform/features/integrations/make/select-action.webp)
+
+Specify the spreadsheet details and match the Formbricks data:
+
+![Select Fields](/images/platform/features/integrations/make/select-fields.webp)
+
+A new row gets added to the spreadsheet for every response:
+
+![Result](/images/platform/features/integrations/make/result.webp)

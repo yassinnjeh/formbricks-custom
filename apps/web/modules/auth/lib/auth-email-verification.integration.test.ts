@@ -1,0 +1,219 @@
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { prisma } from "@formbricks/database";
+import { TooManyRequestsError } from "@formbricks/types/errors";
+import { resetDb } from "@/integration/reset-db";
+import { WEBAPP_URL } from "@/lib/constants";
+import { capturePostHogEvent } from "@/lib/posthog";
+import { auth } from "@/modules/auth/lib/auth";
+import * as brevo from "@/modules/auth/lib/brevo";
+import { queueAuditEventBackground } from "@/modules/ee/audit-logs/lib/handler";
+import {
+  sendPasswordResetLinkEmail,
+  sendPasswordResetNotifyEmail,
+  sendVerificationLinkEmail,
+} from "@/modules/email";
+
+// Spy createBrevoCustomer (the afterEmailVerification side effect) without hitting the Brevo API.
+vi.mock("@/modules/auth/lib/brevo", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/modules/auth/lib/brevo")>();
+  return { ...actual, createBrevoCustomer: vi.fn().mockResolvedValue(undefined) };
+});
+
+// Spy queueAuditEventBackground (the `signedIn` audit, `signInAuditPlugin`) so the auto-login-after-
+// verification path can be asserted without depending on the real setImmediate/headers() emission.
+vi.mock("@/modules/ee/audit-logs/lib/handler", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/modules/ee/audit-logs/lib/handler")>();
+  return { ...actual, queueAuditEventBackground: vi.fn().mockResolvedValue(undefined) };
+});
+
+// Spy capturePostHogEvent (the other afterEmailVerification side effect) without hitting PostHog.
+
+/**
+ * Integration coverage for email verification + password reset (ENG-1054) against a real Postgres.
+ * Exercises the Better Auth email callbacks (which reuse the Formbricks mailer — captured here): the
+ * single-use password-reset token (getAndDelete), the bcrypt re-hash + revokeSessionsOnPasswordReset on
+ * reset, and the idempotent stateless-JWT verify-email.
+ */
+
+// Verification links are query-form (/verify-email?token=…); reset links are path-form
+// (/reset-password/<token>?callbackURL=…). Handle both.
+const tokenFromLink = (link: string): string => {
+  const url = new URL(link);
+  return url.searchParams.get("token") ?? url.pathname.split("/").filter(Boolean).pop() ?? "";
+};
+
+beforeEach(async () => {
+  await resetDb();
+  vi.clearAllMocks();
+});
+
+describe("Better Auth email verification (real Postgres)", () => {
+  test("sign-up sends a verification link; consuming it flips emailVerified to true", async () => {
+    await auth.api.signUpEmail({
+      body: { email: "verify@example.com", password: "Passw0rd!", name: "Vera" },
+      asResponse: true,
+    });
+    expect((await prisma.user.findUnique({ where: { email: "verify@example.com" } }))?.emailVerified).toBe(
+      false
+    );
+
+    expect(sendVerificationLinkEmail).toHaveBeenCalledTimes(1);
+    const token = tokenFromLink(vi.mocked(sendVerificationLinkEmail).mock.calls[0][0].verifyLink);
+    expect(token).toBeTruthy();
+
+    // autoSignIn is off, so sign-up creates no session (verification is still pending) and emits
+    // no signedIn audit.
+    expect(await prisma.session.count()).toBe(0);
+    expect(queueAuditEventBackground).not.toHaveBeenCalled();
+
+    await auth.api.verifyEmail({ query: { token } });
+
+    const verifiedUser = await prisma.user.findUnique({ where: { email: "verify@example.com" } });
+    expect(verifiedUser?.emailVerified).toBe(true);
+    // ENG-2562: consuming the link verifies the address but does NOT establish a session. This row
+    // used to assert 1 — the ENG-1746 auto-sign-in — and that is precisely the pre-hijacking defect:
+    // whoever clicks the link is not necessarily whoever chose the password, so handing the clicker a
+    // session signs a victim into an attacker's account. The session is now minted only against a
+    // sign-up intent cookie, which a server-side `auth.api.verifyEmail` has no way to carry (there is
+    // no browser here) — see better-auth-verification-autosignin.integration.test.ts for the granted
+    // path driven through the real hook chain.
+    expect(await prisma.session.count()).toBe(0);
+    // No session means no `signedIn` audit either.
+    expect(queueAuditEventBackground).not.toHaveBeenCalled();
+    // afterEmailVerification re-homes the createBrevoCustomer side effect (fire-and-forget)
+    expect(brevo.createBrevoCustomer).toHaveBeenCalledWith({
+      id: verifiedUser?.id,
+      email: "verify@example.com",
+    });
+    // ...and captures the analytics event for the confirmation
+    expect(capturePostHogEvent).toHaveBeenCalledWith(verifiedUser?.id, "user_email_confirmed");
+
+    // verify-email is a stateless signed JWT (no getAndDelete), so re-verifying is idempotent:
+    // the already-verified branch returns { status: true, user: null } and creates no session
+    const replay = await auth.api.verifyEmail({ query: { token } });
+    expect(replay).toMatchObject({ status: true, user: null });
+    expect(await prisma.session.count()).toBe(0);
+    // afterEmailVerification fires once per user — the replay must NOT re-emit the event
+    expect(capturePostHogEvent).toHaveBeenCalledTimes(1);
+    expect(queueAuditEventBackground).not.toHaveBeenCalled();
+  });
+
+  // ENG-3823: anyone could call the HTTP route for any address and spend its verification-email cap. It is
+  // closed with `disabledPaths`, which only the HTTP router reads; the in-process call the app uses stays.
+  test("the native resend route is closed over HTTP, and the in-process call still sends", async () => {
+    await auth.api.signUpEmail({
+      body: { email: "route@example.com", password: "Passw0rd!", name: "Route" },
+      asResponse: true,
+    });
+    vi.mocked(sendVerificationLinkEmail).mockClear();
+
+    const response = await auth.handler(
+      new Request(`${WEBAPP_URL}/api/auth/send-verification-email`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: WEBAPP_URL },
+        body: JSON.stringify({ email: "route@example.com" }),
+      })
+    );
+    expect(response.status).toBe(404);
+    expect(sendVerificationLinkEmail).not.toHaveBeenCalled();
+
+    await auth.api.sendVerificationEmail({ body: { email: "route@example.com" } });
+    expect(sendVerificationLinkEmail).toHaveBeenCalledOnce();
+  });
+
+  // A resend reaches the caller, so a capped one must answer like a sent one: an error only for addresses
+  // with an unverified account would say which addresses have one (ENG-3823). Other failures still surface.
+  test("a capped resend answers like a sent one, while other send failures still surface", async () => {
+    await auth.api.signUpEmail({
+      body: { email: "capped@example.com", password: "Passw0rd!", name: "Cap" },
+      asResponse: true,
+    });
+
+    vi.mocked(sendVerificationLinkEmail).mockRejectedValueOnce(
+      new TooManyRequestsError("Maximum number of requests reached. Please try again later.")
+    );
+    await expect(
+      auth.api.sendVerificationEmail({ body: { email: "capped@example.com" } })
+    ).resolves.toMatchObject({ status: true });
+
+    vi.mocked(sendVerificationLinkEmail).mockRejectedValueOnce(new Error("smtp connection refused"));
+    await expect(auth.api.sendVerificationEmail({ body: { email: "capped@example.com" } })).rejects.toThrow();
+  });
+});
+
+describe("Better Auth password reset (real Postgres)", () => {
+  test("reset re-hashes the password, revokes sessions, and invalidates the old credentials", async () => {
+    await auth.api.signUpEmail({
+      body: { email: "reset@example.com", password: "OldPassw0rd!", name: "Rhea" },
+      asResponse: true,
+    });
+    await prisma.user.update({ where: { email: "reset@example.com" }, data: { emailVerified: true } });
+
+    // establish a live session so we can assert it gets revoked
+    await auth.api.signInEmail({
+      body: { email: "reset@example.com", password: "OldPassw0rd!" },
+      asResponse: true,
+    });
+    expect(await prisma.session.count()).toBe(1);
+
+    // an OAuth grant minted while the account was exposed (ENG-7364): the reset has to end it too
+    const user = await prisma.user.findUniqueOrThrow({ where: { email: "reset@example.com" } });
+    const now = new Date();
+    await prisma.oauthClient.create({
+      data: { clientId: "eng7364-client", redirectUris: ["http://127.0.0.1:33418/callback"], scopes: [] },
+    });
+    await prisma.oauthConsent.create({
+      data: {
+        clientId: "eng7364-client",
+        userId: user.id,
+        scopes: ["offline_access"],
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+    await prisma.oauthRefreshToken.create({
+      data: {
+        token: "eng7364-refresh",
+        clientId: "eng7364-client",
+        userId: user.id,
+        scopes: ["offline_access"],
+        createdAt: now,
+        expiresAt: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000),
+      },
+    });
+
+    await auth.api.requestPasswordReset({ body: { email: "reset@example.com", redirectTo: "/" } });
+    expect(sendPasswordResetLinkEmail).toHaveBeenCalledTimes(1);
+    const token = tokenFromLink(vi.mocked(sendPasswordResetLinkEmail).mock.calls[0][0].verifyLink);
+    expect(token).toBeTruthy();
+
+    await auth.api.resetPassword({ body: { token, newPassword: "NewPassw0rd!" } });
+
+    // onPasswordReset side effect (ENG-1054): the user gets the "password changed" security
+    // notification. (The audit event from the same hook is unit-tested in better-auth-observability.)
+    expect(sendPasswordResetNotifyEmail).toHaveBeenCalledTimes(1);
+    // ...sent to the user who reset (not some other recipient) — count alone wouldn't catch that.
+    expect(sendPasswordResetNotifyEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ email: "reset@example.com" })
+    );
+
+    // the reset token is single-use (consumed via getAndDelete) — replaying it fails
+    await expect(auth.api.resetPassword({ body: { token, newPassword: "Another1!" } })).rejects.toBeTruthy();
+
+    // sessions revoked on reset (revokeSessionsOnPasswordReset)
+    expect(await prisma.session.count()).toBe(0);
+    // OAuth grants revoked on reset (ENG-7364)
+    expect(await prisma.oauthRefreshToken.count({ where: { userId: user.id, revoked: null } })).toBe(0);
+    expect(await prisma.oauthConsent.count({ where: { userId: user.id } })).toBe(0);
+    // old password no longer works
+    await expect(
+      auth.api.signInEmail({ body: { email: "reset@example.com", password: "OldPassw0rd!" } })
+    ).rejects.toBeTruthy();
+    // new password works
+    const ok = await auth.api.signInEmail({
+      body: { email: "reset@example.com", password: "NewPassw0rd!" },
+      asResponse: true,
+    });
+    expect(ok.status).toBe(200);
+  });
+});

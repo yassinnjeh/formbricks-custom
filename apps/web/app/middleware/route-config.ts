@@ -1,0 +1,56 @@
+/**
+ * Routes that should be accessible on the public domain (PUBLIC_URL)
+ * Uses whitelist approach - only these routes are allowed on public domain
+ */
+const PUBLIC_ROUTES = {
+  // Survey routes
+  SURVEY_ROUTES: [
+    /^\/s\/[^/]+/, // /s/[surveyId] - survey pages
+    /^\/c\/[^/]+/, // /c/[jwt] - contact survey pages
+    /^\/p\/[^/]+/, // /p/[prettyUrl] - pretty URL pages
+  ],
+
+  // API routes accessible from public domain
+  API_ROUTES: [
+    /^\/api\/v[12]\/client\//, // /api/v1/client/** and /api/v2/client/**
+    // Only the anonymous receiver moves; the static regeneration endpoint stays admin-only.
+    /^\/api\/v3\/workflows\/[^/]+\/webhook\/(?!regenerate$)[^/]+$/,
+    // The link-survey page's two unauthenticated gate calls, by exact path: the rest of `/api/internal` is
+    // the dashboard's and stays off the survey domain.
+    /^\/api\/internal\/link-survey-verification-emails$/,
+    /^\/api\/internal\/link-survey-pin-verifications$/,
+  ],
+} as const;
+
+const COMMON_ROUTES = {
+  HEALTH_ROUTES: [/^\/health$/], // /health endpoint
+  PUBLIC_STORAGE_ROUTES: [
+    /^\/storage\/[^/]+\/public\//, // /storage/[environmentId]/public/** - public storage
+  ],
+} as const;
+
+/**
+ * Get public only route patterns as a flat array
+ */
+export const getPublicDomainRoutePatterns = (): RegExp[] => {
+  return Object.values(PUBLIC_ROUTES).flat();
+};
+
+/**
+ * Get all public route patterns as a flat array
+ */
+export const getAllPubliclyAccessibleRoutePatterns = (): RegExp[] => {
+  const routes = {
+    ...PUBLIC_ROUTES,
+    ...COMMON_ROUTES,
+  };
+
+  return Object.values(routes).flat();
+};
+
+/**
+ * Check if a URL matches any of the given route patterns
+ */
+export const matchesAnyPattern = (url: string, patterns: RegExp[]): boolean => {
+  return patterns.some((pattern) => pattern.test(url));
+};

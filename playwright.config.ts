@@ -1,0 +1,119 @@
+import { defineConfig, devices } from "@playwright/test";
+
+/**
+ * Read environment variables from file.
+ * https://github.com/motdotla/dotenv
+ */
+require("dotenv").config({ path: ".env" });
+
+/**
+ * PW_WORKERS (the E2E_WORKERS repository variable in e2e.yml) overrides the worker count. Playwright
+ * turns an unparseable value into "NaN workers", runs no tests and exits 0, which would turn the required
+ * E2E check green, so anything but a positive integer or a percentage (`8`, `50%`) fails here instead.
+ */
+const parseWorkers = (raw: string | undefined): number | string | undefined => {
+  if (!raw) return undefined;
+  if (!/^[1-9]\d*%?$/.test(raw)) {
+    throw new Error(`PW_WORKERS must be a positive integer or a percentage like "50%", got "${raw}".`);
+  }
+  return raw.endsWith("%") ? raw : Number(raw);
+};
+
+/**
+ * See https://playwright.dev/docs/test-configuration.
+ */
+export default defineConfig({
+  testDir: "./apps/web/playwright",
+  /* Run tests in files in parallel */
+  fullyParallel: true,
+  /* Retry on CI only */
+  retries: process.env.CI ? 2 : 0,
+  /* Timeout for each test */
+  timeout: 120000,
+  /* Fail the test run after the first failure */
+  maxFailures: process.env.CI ? undefined : 1, // Allow more failures in CI to avoid cascading shutdowns
+  /* On CI use one worker per CPU. The app, Postgres and the other services share the runner, so
+     going above one per core only adds contention; 4 workers on the 4 vCPU GitHub runner and 8 on
+     an 8 vCPU runner both measured well. PW_WORKERS overrides it (see parseWorkers above). */
+  workers: parseWorkers(process.env.PW_WORKERS) ?? (process.env.CI ? "100%" : undefined),
+  /* Stop before the CI step's 15-minute limit (e2e.yml "Run E2E Tests"): a run killed by the
+     runner never writes its HTML report, so a hang leaves nothing to read. Stopping here fails
+     the run normally and keeps the report and the failing test names. */
+  globalTimeout: process.env.CI ? 13 * 60 * 1000 : undefined,
+  /* Reporter to use. See https://playwright.dev/docs/test-reporters. On CI the line reporter also
+     names each failing test in the job log, which the HTML report alone does not. */
+  reporter: process.env.CI
+    ? [["line"], ["html", { outputFolder: "playwright-report", open: "never" }]]
+    : [["html", { outputFolder: "playwright-report", open: "never" }]],
+  /* Shared settings for all the workspaces below. See https://playwright.dev/docs/api/class-testoptions. */
+  use: {
+    /* Base URL to use in actions like `await page.goto('/')`. PLAYWRIGHT_BASE_URL points a local run at a
+       dev server on another port (the app's WEBAPP_URL must match it); CI leaves it unset. */
+    baseURL: process.env.PLAYWRIGHT_BASE_URL ?? "http://localhost:3000",
+
+    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
+    trace: "on-first-retry",
+    permissions: ["clipboard-read", "clipboard-write"],
+    screenshot: "only-on-failure", // Capture screenshots only on test failure
+    video: "retain-on-failure", // Optionally record video on failure
+  },
+
+  /* Configure projects for major browsers */
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+      testMatch: "**/*.spec.ts",
+      grepInvert: /@timing/,
+    },
+
+    /* Latency-comparison tests (@timing) measure sub-100ms differences, so they must not share the
+       machine with the parallel suite: with 4 workers on the app's own vCPUs the measurement is
+       noise. Depending on "chromium" makes this project start only once that one has finished.
+       Dependency projects ignore CLI file and grep filters, so `pnpm test:e2e security.spec.ts` or
+       `--project=chromium-timing` runs the whole chromium project first. To run only the timing test,
+       use `--project=chromium-timing --no-deps`: `--no-deps` alone puts both projects in one phase.
+       One worker, so two @timing tests never run beside each other either. */
+    {
+      name: "chromium-timing",
+      use: { ...devices["Desktop Chrome"] },
+      testMatch: "**/*.spec.ts",
+      grep: /@timing/,
+      dependencies: ["chromium"],
+      workers: 1,
+    },
+
+    // Resource hints and CSP enforcement differ by browser; run the SDK journey in Firefox too.
+    {
+      name: "firefox-csp",
+      use: { ...devices["Desktop Firefox"], permissions: [] },
+      testMatch: "**/survey-csp.spec.ts",
+      grep: /SDK setup under a host CSP/,
+    },
+
+    // {
+    //   name: "webkit",
+    //   use: { ...devices["Desktop Safari"] },
+    // },
+
+    /* Test against mobile viewports. */
+    // {
+    //   name: "Mobile Chrome",
+    //   use: { ...devices["Pixel 5"] },
+    // },
+    // {
+    //   name: "Mobile Safari",
+    //   use: { ...devices["iPhone 12"] },
+    // },
+
+    /* Test against branded browsers. */
+    // {
+    //   name: "Microsoft Edge",
+    //   use: { ...devices["Desktop Edge"], channel: "msedge" },
+    // },
+    // {
+    //   name: "Google Chrome",
+    //   use: { ...devices["Desktop Chrome"], channel: "chrome" },
+    // },
+  ],
+});

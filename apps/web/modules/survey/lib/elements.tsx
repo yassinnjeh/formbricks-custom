@@ -1,0 +1,329 @@
+import { TFunction } from "i18next";
+import {
+  ArrowUpFromLineIcon,
+  CalendarDaysIcon,
+  CheckIcon,
+  ContactIcon,
+  FileDigitIcon,
+  FileType2Icon,
+  GaugeIcon,
+  Grid3X3Icon,
+  HomeIcon,
+  ImageIcon,
+  ListIcon,
+  ListOrderedIcon,
+  type LucideIcon,
+  MessageSquareTextIcon,
+  MousePointerClickIcon,
+  PhoneIcon,
+  PresentationIcon,
+  Rows3Icon,
+  SignatureIcon,
+  SmilePlusIcon,
+  StarIcon,
+} from "lucide-react";
+import type { JSX } from "react";
+import { TSurveyElementTypeEnum } from "@formbricks/types/surveys/elements";
+import { getElementPreset } from "./element-presets";
+import { getElementTypeLabel } from "./element-type-labels";
+
+export enum TElementCategory {
+  Input = "input",
+  Choice = "choice",
+  Scoring = "scoring",
+  Contact = "contact",
+  Content = "content",
+}
+
+export type TElementCategoryMeta = {
+  id: TElementCategory;
+  label: string;
+  /** Which of the two picker columns this category renders in. */
+  column: 1 | 2;
+  /** Tailwind classes for the icon "chip" (background tint + icon color). */
+  iconClassName: string;
+  /** Tailwind classes for the category header label. */
+  labelClassName: string;
+};
+
+export type TElement = {
+  id: TSurveyElementTypeEnum;
+  label: string;
+  description: string;
+  icon: LucideIcon;
+  category: TElementCategory;
+  preset: Record<string, unknown>;
+};
+
+export const getElementTypes = (t: TFunction): TElement[] => [
+  {
+    id: TSurveyElementTypeEnum.OpenText,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.OpenText, t),
+    description: t("templates.free_text_description"),
+    icon: MessageSquareTextIcon,
+    category: TElementCategory.Input,
+    preset: getElementPreset(TSurveyElementTypeEnum.OpenText, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.MultipleChoiceSingle,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.MultipleChoiceSingle, t),
+    description: t("templates.single_select_description"),
+    icon: Rows3Icon,
+    category: TElementCategory.Choice,
+    preset: getElementPreset(TSurveyElementTypeEnum.MultipleChoiceSingle, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.MultipleChoiceMulti,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.MultipleChoiceMulti, t),
+    description: t("templates.multi_select_description"),
+    icon: ListIcon,
+    category: TElementCategory.Choice,
+    preset: getElementPreset(TSurveyElementTypeEnum.MultipleChoiceMulti, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.PictureSelection,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.PictureSelection, t),
+    description: t("templates.picture_selection_description"),
+    icon: ImageIcon,
+    category: TElementCategory.Choice,
+    preset: getElementPreset(TSurveyElementTypeEnum.PictureSelection, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Rating,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Rating, t),
+    description: t("templates.rating_description"),
+    icon: StarIcon,
+    category: TElementCategory.Scoring,
+    preset: getElementPreset(TSurveyElementTypeEnum.Rating, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.NPS,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.NPS, t),
+    description: t("templates.nps_description"),
+    icon: PresentationIcon,
+    category: TElementCategory.Scoring,
+    preset: getElementPreset(TSurveyElementTypeEnum.NPS, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.CSAT,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.CSAT, t),
+    description: t("templates.csat_description"),
+    icon: SmilePlusIcon,
+    category: TElementCategory.Scoring,
+    preset: getElementPreset(TSurveyElementTypeEnum.CSAT, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.CES,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.CES, t),
+    description: t("templates.ces_description"),
+    icon: GaugeIcon,
+    category: TElementCategory.Scoring,
+    preset: getElementPreset(TSurveyElementTypeEnum.CES, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Ranking,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Ranking, t),
+    description: t("templates.ranking_description"),
+    icon: ListOrderedIcon,
+    category: TElementCategory.Choice,
+    preset: getElementPreset(TSurveyElementTypeEnum.Ranking, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Matrix,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Matrix, t),
+    description: t("templates.matrix_description"),
+    icon: Grid3X3Icon,
+    category: TElementCategory.Choice,
+    preset: getElementPreset(TSurveyElementTypeEnum.Matrix, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.CTA,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.CTA, t),
+    description: t("templates.cta_description"),
+    icon: MousePointerClickIcon,
+    category: TElementCategory.Content,
+    preset: getElementPreset(TSurveyElementTypeEnum.CTA, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Consent,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Consent, t),
+    description: t("templates.consent_description"),
+    icon: CheckIcon,
+    category: TElementCategory.Content,
+    preset: getElementPreset(TSurveyElementTypeEnum.Consent, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.FileUpload,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.FileUpload, t),
+    description: t("templates.file_upload_description"),
+    icon: ArrowUpFromLineIcon,
+    category: TElementCategory.Input,
+    preset: getElementPreset(TSurveyElementTypeEnum.FileUpload, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Signature,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Signature, t),
+    description: t("templates.signature_description"),
+    icon: SignatureIcon,
+    category: TElementCategory.Input,
+    preset: getElementPreset(TSurveyElementTypeEnum.Signature, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Date,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Date, t),
+    description: t("templates.date_description"),
+    icon: CalendarDaysIcon,
+    category: TElementCategory.Input,
+    preset: getElementPreset(TSurveyElementTypeEnum.Date, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Cal,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Cal, t),
+    description: t("templates.schedule_a_meeting_description"),
+    icon: PhoneIcon,
+    category: TElementCategory.Contact,
+    preset: getElementPreset(TSurveyElementTypeEnum.Cal, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.Address,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.Address, t),
+    description: t("templates.address_description"),
+    icon: HomeIcon,
+    category: TElementCategory.Contact,
+    preset: getElementPreset(TSurveyElementTypeEnum.Address, t),
+  },
+  {
+    id: TSurveyElementTypeEnum.ContactInfo,
+    label: getElementTypeLabel(TSurveyElementTypeEnum.ContactInfo, t),
+    description: t("templates.contact_info_description"),
+    icon: ContactIcon,
+    category: TElementCategory.Contact,
+    preset: getElementPreset(TSurveyElementTypeEnum.ContactInfo, t),
+  },
+];
+
+/**
+ * Ordered metadata for the element-type categories used to group the "Add Block"
+ * picker into two logical, color-coded columns. Order here defines the order the
+ * categories appear in (top-to-bottom within each column).
+ */
+export const getElementCategories = (t: TFunction): TElementCategoryMeta[] => [
+  {
+    id: TElementCategory.Input,
+    label: t("workspace.surveys.edit.element_category_input"),
+    column: 1,
+    iconClassName: "bg-emerald-50 text-emerald-700",
+    labelClassName: "text-emerald-700",
+  },
+  {
+    id: TElementCategory.Choice,
+    label: t("workspace.surveys.edit.element_category_choice"),
+    column: 1,
+    iconClassName: "bg-blue-50 text-blue-700",
+    labelClassName: "text-blue-700",
+  },
+  {
+    id: TElementCategory.Scoring,
+    label: t("workspace.surveys.edit.element_category_scoring"),
+    column: 2,
+    iconClassName: "bg-amber-50 text-amber-700",
+    labelClassName: "text-amber-700",
+  },
+  {
+    id: TElementCategory.Contact,
+    label: t("workspace.surveys.edit.element_category_contact"),
+    column: 2,
+    iconClassName: "bg-violet-50 text-violet-700",
+    labelClassName: "text-violet-700",
+  },
+  {
+    id: TElementCategory.Content,
+    label: t("workspace.surveys.edit.element_category_content"),
+    column: 2,
+    iconClassName: "bg-slate-100 text-slate-600",
+    labelClassName: "text-slate-500",
+  },
+];
+
+export const getCXElementTypes = (t: TFunction) =>
+  getElementTypes(t).filter((elementType) => {
+    return [
+      TSurveyElementTypeEnum.OpenText,
+      TSurveyElementTypeEnum.MultipleChoiceSingle,
+      TSurveyElementTypeEnum.MultipleChoiceMulti,
+      TSurveyElementTypeEnum.Rating,
+      TSurveyElementTypeEnum.NPS,
+      TSurveyElementTypeEnum.CSAT,
+      TSurveyElementTypeEnum.CES,
+      TSurveyElementTypeEnum.Consent,
+      TSurveyElementTypeEnum.CTA,
+    ].includes(elementType.id);
+  });
+
+export type TElementCategoryGroup = {
+  category: TElementCategoryMeta;
+  elements: TElement[];
+};
+
+/**
+ * Groups the available element types by category, in the same category order and
+ * within-category order as the "Add Block" picker, omitting categories with no elements.
+ * Lets other element-type pickers (e.g. "Add question to block", "Change question type")
+ * reuse the same sections/ordering instead of rendering a flat list.
+ */
+export const getGroupedElementTypes = (t: TFunction, isCxMode = false): TElementCategoryGroup[] => {
+  const availableElementTypes = isCxMode ? getCXElementTypes(t) : getElementTypes(t);
+  const categories = getElementCategories(t);
+
+  const elementsByCategory = new Map<TElementCategory, TElement[]>();
+  for (const elementType of availableElementTypes) {
+    const group = elementsByCategory.get(elementType.category) ?? [];
+    group.push(elementType);
+    elementsByCategory.set(elementType.category, group);
+  }
+
+  return categories
+    .map((category) => ({ category, elements: elementsByCategory.get(category.id) ?? [] }))
+    .filter((group) => group.elements.length > 0);
+};
+
+export const getElementIconMap = (t: TFunction): Record<TSurveyElementTypeEnum, JSX.Element> =>
+  getElementTypes(t).reduce(
+    (prev, curr) => ({
+      ...prev,
+      [curr.id]: <curr.icon className="size-4" />,
+    }),
+    {} as Record<TSurveyElementTypeEnum, JSX.Element>
+  );
+
+export const getElementNameMap = (t: TFunction) =>
+  getElementTypes(t).reduce(
+    (prev, curr) => ({
+      ...prev,
+      [curr.id]: curr.label,
+    }),
+    {}
+  ) as Record<TSurveyElementTypeEnum, string>;
+
+export const getElementIcon = (type: TSurveyElementTypeEnum, t: TFunction) => {
+  return getElementTypes(t).find((elementType) => elementType.id === type)?.icon;
+};
+
+export const VARIABLES_ICON_MAP = {
+  text: <FileType2Icon className="size-4" />,
+  number: <FileDigitIcon className="size-4" />,
+};
+
+export const getCXElementNameMap = (t: TFunction) =>
+  getCXElementTypes(t).reduce(
+    (prev, curr) => ({
+      ...prev,
+      [curr.id]: curr.label,
+    }),
+    {}
+  ) as Record<TSurveyElementTypeEnum, string>;
+
+export const getTSurveyElementTypeEnumName = (id: string, t: TFunction) => {
+  const elementType = getElementTypes(t).find((elementType) => elementType.id === id);
+  return elementType?.label;
+};

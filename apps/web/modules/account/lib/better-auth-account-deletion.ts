@@ -1,0 +1,155 @@
+import "server-only";
+import type { BetterAuthOptions } from "better-auth";
+import { APIError } from "better-auth/api";
+import { prisma } from "@formbricks/database";
+import { logger } from "@formbricks/logger";
+import { deleteUserOrganizationRelationships } from "@/lib/authzed/organization-membership";
+import { runPostCommitProjection } from "@/lib/authzed/projection-boundary";
+import { deleteUserTeamRelationships } from "@/lib/authzed/team-workspace";
+import { DEFAULT_LOCALE } from "@/lib/constants";
+import { markInstanceSetupCompleted } from "@/lib/instance/service";
+import { deleteOrganization, getOrganizationsWhereUserIsSingleOwner } from "@/lib/organization/service";
+import { capturePostHogEvent } from "@/lib/posthog";
+import { ACCOUNT_DELETION_SOLE_OWNER_BLOCK_MESSAGE } from "@/modules/account/constants";
+import { deleteBrevoCustomerByEmail } from "@/modules/auth/lib/brevo";
+import { getIsMultiOrgEnabled } from "@/modules/ee/license-check/lib/utils";
+import type { AuthHookContext } from "@/modules/ee/sso/lib/better-auth-hooks";
+import { sendAccountDeletedEmail } from "@/modules/email";
+import {
+  activateEmailAuditErasureIntent,
+  requestEmailAuditErasureBeforeUserDeletion,
+} from "@/modules/email/lib/email-audit-maintenance";
+import { queueAccountDeletionAuditEvent } from "./account-deletion-audit";
+
+type DeleteUserConfig = NonNullable<NonNullable<BetterAuthOptions["user"]>["deleteUser"]>;
+
+/**
+ * Better Auth `user.deleteUser` config (ENG-1054, design doc §14) — re-expresses Formbricks' account
+ * deletion on Better Auth's native flow, replacing the prior bespoke SSO IdP re-authentication.
+ *
+ * The confirmation friction is asymmetric and lives at the edges (Phase 6, not here): credential users
+ * confirm with their password (Better Auth verifies it before `beforeDelete`); SSO users confirm via an
+ * email link (a server action mints a `delete-account-<token>` verification value that Better Auth's
+ * native `GET /delete-user/callback` consumes). The global `sendDeleteAccountVerification` is
+ * intentionally NOT set in auth.ts — it would email credential users too.
+ *
+ * The hooks below run for BOTH paths and only get `(user, request)`, so everything is derived from
+ * `user.id` / `user.email`. The DeleteAccountModal drives this flow (credential users call
+ * `authClient.deleteUser`; SSO users go through the email-link request action). The `[...all]` route is
+ * mounted, so the deletion endpoints are live.
+ */
+
+/**
+ * Pre-delete steps that do NOT cascade from the `User` row — mirrors `lib/user/service.ts deleteUser`
+ * plus the single-org guard the prior account-deletion path enforced:
+ *  - Block deletion on single-org instances when the user is the sole owner of any organization
+ *    (it would be orphaned) — they must transfer ownership first.
+ *  - Otherwise delete the organizations they solely own (only reachable in the multi-org case) and
+ *    the invites they created.
+ * The user, sessions, accounts, and memberships are removed by Better Auth's deleteUser + the same
+ * Prisma cascade `deleteUserById` relies on, so they need no explicit handling here.
+ */
+export const accountDeletionBeforeDelete: NonNullable<DeleteUserConfig["beforeDelete"]> = async (user) => {
+  const soleOwnerOrganizations = await getOrganizationsWhereUserIsSingleOwner(user.id);
+
+  if (soleOwnerOrganizations.length > 0 && !(await getIsMultiOrgEnabled())) {
+    // Failure-path audit parity: record the blocked deletion attempt before surfacing the error
+    // (the afterDelete success audit never runs for a blocked deletion).
+    await queueAccountDeletionAuditEvent({
+      status: "failure",
+      targetUserId: user.id,
+      oldUser: user,
+    });
+    throw new APIError("BAD_REQUEST", {
+      message: ACCOUNT_DELETION_SOLE_OWNER_BLOCK_MESSAGE,
+    });
+  }
+
+  // ENG-7313: the instance has been set up, since this user exists. Record it before the user can go, so the
+  // last account's deletion can never leave the instance looking fresh, even if the marker write at sign-up
+  // failed. Idempotent; a failure here fails the deletion rather than risk re-opening setup.
+  await markInstanceSetupCompleted();
+
+  await requestEmailAuditErasureBeforeUserDeletion(user.id, user.email);
+
+  for (const organization of soleOwnerOrganizations) {
+    await deleteOrganization(organization.id);
+  }
+  await prisma.invite.deleteMany({ where: { creatorId: user.id } });
+};
+
+/**
+ * Tell the deleted user their account is gone (ENG-862), off the request path: the deletion has already
+ * committed, so a slow or failing mailer must neither delay the response nor surface as an error. The
+ * user row is gone and Better Auth's user object carries no locale, so the email uses the default locale.
+ */
+const queueAccountDeletedEmail = (user: { id: string; email: string }): void => {
+  setImmediate(async () => {
+    try {
+      const sent = await sendAccountDeletedEmail({ email: user.email, locale: DEFAULT_LOCALE });
+      if (!sent) {
+        logger.warn({ userId: user.id }, "Account deletion email was not sent (mailer reported no delivery)");
+      }
+    } catch (error) {
+      logger.error({ error, userId: user.id }, "Failed to send account deletion email");
+    }
+  });
+};
+
+/**
+ * Post-delete cleanup (the user row is already gone) — mirrors the tail of the deleteUser service and
+ * the prior success audit: remove the Brevo contact, emit the account-deletion audit event, and queue
+ * the account-deleted email. A Brevo or email failure is logged, not thrown: the deletion has already
+ * committed, so surfacing an error for a completed delete would be misleading.
+ */
+export const accountDeletionAfterDelete: NonNullable<DeleteUserConfig["afterDelete"]> = async (user) => {
+  await activateEmailAuditErasureIntent(user.id);
+  await runPostCommitProjection("account_delete_organization_cleanup", () =>
+    deleteUserOrganizationRelationships(user.id)
+  );
+  await runPostCommitProjection("account_delete_team_cleanup", () => deleteUserTeamRelationships(user.id));
+
+  try {
+    await deleteBrevoCustomerByEmail({ email: user.email });
+  } catch (error) {
+    logger.error({ error, userId: user.id }, "Failed to delete Brevo customer after account deletion");
+  }
+
+  await queueAccountDeletionAuditEvent({
+    oldUser: user,
+    status: "success",
+    targetUserId: user.id,
+  });
+
+  queueAccountDeletedEmail(user);
+
+  // Analytics parity with the prior account-deletion success path (fire-and-forget; self-swallowing).
+  capturePostHogEvent(user.id, "delete_account");
+};
+
+export const accountDeletionConfig = {
+  enabled: true,
+  beforeDelete: accountDeletionBeforeDelete,
+  afterDelete: accountDeletionAfterDelete,
+} satisfies DeleteUserConfig;
+
+/**
+ * `hooks.before` guard for `POST /delete-user` (ENG-1054, S1). Better Auth verifies the password only
+ * when one is sent; otherwise it allows deletion on session freshness alone (the `freshAge` window), so
+ * a credential user with a recent session could delete their account without re-confirming the
+ * password. We require an explicit confirmation factor — the password (credential users) or a deletion
+ * token — on the POST entry point. The credential DeleteAccountModal always sends the password and SSO
+ * users delete via the emailed `GET /delete-user/callback` (which carries its own token), so a real
+ * client never trips this; it's defense in depth against a direct API call. Better Auth still verifies
+ * whichever factor is supplied.
+ */
+export const requireDeletionConfirmationBeforeHandler = async (ctx: AuthHookContext): Promise<void> => {
+  if (ctx.path !== "/delete-user") return;
+
+  const body = ctx.body as { password?: unknown; token?: unknown } | undefined;
+  if (body?.password || body?.token) return; // Better Auth verifies the supplied factor
+
+  throw new APIError("BAD_REQUEST", {
+    message: "Password confirmation is required to delete your account.",
+  });
+};

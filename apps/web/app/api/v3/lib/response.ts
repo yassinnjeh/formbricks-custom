@@ -1,0 +1,834 @@
+/**
+ * V3 API response helpers — RFC 9457 Problem Details (application/problem+json)
+ * and list envelope for success responses.
+ */
+import { clipInvalidParam } from "./invalid-params";
+
+const PROBLEM_JSON = "application/problem+json" as const;
+const CACHE_NO_STORE = "private, no-store" as const;
+
+/**
+ * Authentication scheme advertised on a 401. RFC 9110 §15.5.2 requires "a WWW-Authenticate header field
+ * containing at least one challenge **applicable to the target resource**" — the qualifier is the whole
+ * point, so quote it in full: an inapplicable challenge does not satisfy the requirement, it just makes
+ * a false statement about the endpoint.
+ *
+ * Bearer is applicable wherever this API accepts `Authorization: Bearer <fbk_…>`, which `api-key-auth.ts`
+ * does — so on the `apiKey` and `both` auth modes, and nowhere else. RFC 6750 §3 requires at least one
+ * auth-param, so the realm stays; a bare `Bearer` would be non-conformant.
+ *
+ * Deliberately NOT sent on `session` routes, and not by `problemUnauthorized` itself: cookies are not an
+ * HTTP authentication scheme (they appear nowhere in the IANA HTTP Authentication Scheme Registry), so a
+ * cookie-only endpoint has no applicable challenge and the MUST is unsatisfiable there. The repo's own
+ * OpenAPI already concedes this by modelling the session as `type: apiKey, in: cookie` rather than
+ * `type: http`. Omitting beats advertising a scheme the route will never honour.
+ *
+ * The MCP surface builds its own richer challenge (`resource_metadata` and `scope`, which its spec
+ * MUSTs and its SDK parses) in `withOAuthChallenge` — see `@/modules/mcp/auth`.
+ */
+export const BEARER_CHALLENGE = 'Bearer realm="formbricks"' as const;
+
+/** Attach the bearer challenge to a 401. Applied by the wrapper for the auth modes it is true of. */
+export function withBearerChallenge(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set("WWW-Authenticate", BEARER_CHALLENGE);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
+ * The `code` vocabulary of this API's problem responses: a stable, locale-independent discriminator that
+ * clients switch on instead of parsing `detail` (see `parseV3ApiError` in `@/modules/api/lib/v3-client`
+ * and `responseToMcpToolResult` in `@/modules/mcp/errors`).
+ *
+ * This list is the source of truth. `Problem.yml` in the OpenAPI spec publishes the same set, and
+ * `problem-codes.test.ts` fails if the two drift — the spec used to be hand-maintained, with nothing
+ * checking it against the emitters. Codes are additive: removing or renaming one is a breaking change
+ * for every client that branches on it.
+ *
+ * `invalid_workflow_state` and `workflow_not_executable` are emitted only by `@formbricks/workflows`,
+ * which mirrors this vocabulary rather than importing it (it is a leaf package, deliberately
+ * dependency-free) and also emits five of the codes above; its own `WORKFLOW_PROBLEM_CODES` is held to
+ * this set by a drift test on the same spec file. Named rather than counted: the array is kept sorted by
+ * `problem-codes.test.ts`, so any positional claim falsifies itself on the next insertion.
+ */
+export const V3_PROBLEM_CODES = [
+  "ai_features_not_enabled",
+  "ai_generated_payload_invalid",
+  "ai_instance_not_configured",
+  "ai_output_too_long",
+  "ai_provider_auth_failed",
+  "ai_smart_tools_disabled",
+  "bad_gateway",
+  "bad_request",
+  "chart_in_use",
+  "conflict",
+  "creatives_not_entitled",
+  "custom_css_plan_required",
+  "dashboards_plan_required",
+  "forbidden",
+  "internal_server_error",
+  "invalid_workflow_state",
+  "not_authenticated",
+  "not_found",
+  "payload_too_large",
+  "projection_pending",
+  "service_unavailable",
+  "stored_survey_invalid",
+  "survey_has_linked_creatives",
+  "survey_not_workspace_visible",
+  "too_many_requests",
+  "unprocessable_content",
+  "unsupported_media_type",
+  "visibility_blocked_by_connections",
+  "visibility_change_not_allowed",
+  "visibility_not_enabled",
+  "workflow_not_executable",
+  "workspace_survey_limit_reached",
+] as const;
+
+export type V3ProblemCode = (typeof V3_PROBLEM_CODES)[number];
+
+/**
+ * Codes emitted only by internal routes (`app/api/internal` and the older `app/api/(internal)` group),
+ * which reuse these RFC 9457 helpers but are session-only and carry no published contract.
+ *
+ * Kept apart from `V3_PROBLEM_CODES` rather than folded into it, because that list is held to
+ * `Problem.yml` by exact equality in both directions: adding an internal code there would publish, to
+ * every public client, a discriminator no public operation can ever return — which is the same defect
+ * as an undocumented code, pointing the other way. `problem-codes.test.ts` asserts the two sets stay
+ * disjoint and that none of these reaches the spec.
+ */
+export const INTERNAL_PROBLEM_CODES = [
+  "ai_translation_batch_too_large",
+  "attachment_export_empty",
+  "attachment_export_expired",
+  "attachment_export_filter_conflict",
+  "attachment_export_not_ready",
+  "attachment_export_too_large",
+  "attachment_export_unavailable",
+  "capacity_reached",
+  "concurrency_limit_reached",
+  "formbricks_file_invalid",
+  "formbricks_file_too_new",
+  "idempotency_key_in_use",
+  "idempotency_key_reused",
+  "mcp_grant_beyond_scopes",
+  "mcp_grant_changed",
+  "mcp_grant_invalid",
+  "mcp_grant_not_saved",
+  "mcp_grant_selection_unavailable",
+  "member_in_other_organizations",
+  "retention_exemption_exists",
+  "retention_exemption_not_active",
+  "retention_export_too_large",
+  "survey_active",
+] as const;
+
+export type InternalProblemCode = (typeof INTERNAL_PROBLEM_CODES)[number];
+
+/**
+ * What the shared helpers accept. A public v3 route should only ever pass a `V3ProblemCode`; the union
+ * exists so an internal route can reuse the same helpers without widening the field back to `string`.
+ */
+export type ProblemCode = V3ProblemCode | InternalProblemCode;
+
+const V3_PROBLEM_CODE_SET = new Set<V3ProblemCode>(V3_PROBLEM_CODES);
+
+export function isV3ProblemCode(value: unknown): value is V3ProblemCode {
+  return typeof value === "string" && V3_PROBLEM_CODE_SET.has(value as V3ProblemCode);
+}
+
+export const INVALID_PARAM_CODES = [
+  "dangling_reference",
+  "document_limit_exceeded",
+  "duplicate_identifier",
+  "duplicate_locale",
+  "excel_export_other_survey",
+  "file_limit_exceeded",
+  "file_type_unsupported",
+  "file_unreadable",
+  "forbidden_identifier",
+  "immutable_answer_code",
+  "immutable_identifier",
+  "immutable_option_deletion",
+  "immutable_option_text",
+  "immutable_question_code",
+  "immutable_question_type",
+  "invalid_locale",
+  "invalid_reference",
+  "limit_exceeded",
+  "misordered_reference",
+  "missing_required_field",
+  "missing_translation",
+  "qsf_limit_exceeded",
+  "qsf_not_recognized",
+  "read_only_field",
+  "unsupported_field",
+  "unsupported_locale",
+] as const;
+
+export type InvalidParamCode = (typeof INVALID_PARAM_CODES)[number];
+
+const INVALID_PARAM_CODE_SET = new Set<InvalidParamCode>(INVALID_PARAM_CODES);
+
+export function isInvalidParamCode(value: unknown): value is InvalidParamCode {
+  return typeof value === "string" && INVALID_PARAM_CODE_SET.has(value as InvalidParamCode);
+}
+
+export type InvalidParam = {
+  name: string;
+  reason: string;
+  code?: InvalidParamCode;
+  identifier?: string;
+  referenceType?:
+    | "block"
+    | "element"
+    | "ending"
+    | "hiddenField"
+    | "language"
+    | "variable"
+    | "variableName"
+    | "recall";
+  missingId?: string;
+  firstUsedAt?: string;
+  conflictsWith?: string;
+};
+
+export type ProblemExtension = {
+  code?: ProblemCode;
+  requestId: string;
+  details?: Record<string, unknown>;
+  invalid_params?: InvalidParam[];
+};
+
+export type ProblemBody = {
+  type?: string;
+  title: string;
+  status: number;
+  detail: string;
+  instance?: string;
+} & ProblemExtension;
+
+function problemResponse(
+  status: number,
+  title: string,
+  detail: string,
+  requestId: string,
+  options?: {
+    type?: string;
+    instance?: string;
+    code?: ProblemCode;
+    details?: Record<string, unknown>;
+    invalid_params?: InvalidParam[];
+    headers?: Record<string, string>;
+  }
+): Response {
+  const body: ProblemBody = {
+    title,
+    status,
+    detail,
+    requestId,
+    ...(options?.type && { type: options.type }),
+    ...(options?.instance && { instance: options.instance }),
+    ...(options?.code && { code: options.code }),
+    ...(options?.details && { details: options.details }),
+    // Clipped here as well as where the bounded reporters build them: dozens of routes build params
+    // inline, and any of them may carry caller text.
+    ...(options?.invalid_params && { invalid_params: options.invalid_params.map(clipInvalidParam) }),
+  };
+
+  const headers: Record<string, string> = {
+    "Content-Type": PROBLEM_JSON,
+    "Cache-Control": CACHE_NO_STORE,
+    "X-Request-Id": requestId,
+    ...options?.headers,
+  };
+
+  return Response.json(body, { status, headers });
+}
+
+export function problemBadRequest(
+  requestId: string,
+  detail: string,
+  options?: { invalid_params?: InvalidParam[]; instance?: string; code?: ProblemCode }
+): Response {
+  return problemResponse(400, "Bad Request", detail, requestId, {
+    code: options?.code ?? "bad_request",
+    instance: options?.instance,
+    invalid_params: options?.invalid_params,
+  });
+}
+
+export function problemPayloadTooLarge(
+  requestId: string,
+  detail: string = "Payload Too Large",
+  instance?: string,
+  invalidParams?: InvalidParam[]
+): Response {
+  return problemResponse(413, "Payload Too Large", detail, requestId, {
+    code: "payload_too_large",
+    instance,
+    invalid_params: invalidParams,
+  });
+}
+
+/**
+ * 415: the request body, or the file it carries, is a kind this route does not take. `acceptPost`
+ * names the media type the route does take, sent as `Accept-Post` (the Linked Data Platform header
+ * RFC 9110 §15.5.16 points to for saying which formats a POST accepts).
+ */
+export function problemUnsupportedMediaType(
+  requestId: string,
+  detail: string,
+  options?: { instance?: string; invalid_params?: InvalidParam[]; acceptPost?: string }
+): Response {
+  return problemResponse(415, "Unsupported Media Type", detail, requestId, {
+    code: "unsupported_media_type",
+    instance: options?.instance,
+    invalid_params: options?.invalid_params,
+    ...(options?.acceptPost ? { headers: { "Accept-Post": options.acceptPost } } : {}),
+  });
+}
+
+export function problemUnauthorized(
+  requestId: string,
+  detail: string = "Not authenticated",
+  instance?: string
+): Response {
+  return problemResponse(401, "Unauthorized", detail, requestId, {
+    code: "not_authenticated",
+    instance,
+  });
+}
+
+export function problemForbidden(
+  requestId: string,
+  detail: string = "You are not authorized to access this resource",
+  instance?: string,
+  code: ProblemCode = "forbidden"
+): Response {
+  return problemResponse(403, "Forbidden", detail, requestId, {
+    code,
+    instance,
+  });
+}
+
+/**
+ * An AI capability the caller cannot use: 503 when this deployment has no AI configured at all, 403 when
+ * it is configured but not enabled for the organization.
+ *
+ * `title` is the HTTP reason phrase for the status, not a description of the cause. RFC 9457 §4.2.1
+ * requires that of a problem whose `type` is absent (and therefore `about:blank`), which is every v3
+ * problem. The cause is carried by `code`, which is what clients branch on anyway — see
+ * `getAiErrorMessage` in `@/modules/survey/components/template-list/lib/ai-error-messages`.
+ */
+export function problemAIUnavailable(
+  requestId: string,
+  detail: string,
+  code: V3ProblemCode,
+  instance?: string
+): Response {
+  const isNotConfigured = code === "ai_instance_not_configured";
+
+  return problemResponse(
+    isNotConfigured ? 503 : 403,
+    isNotConfigured ? "Service Unavailable" : "Forbidden",
+    detail,
+    requestId,
+    { code, instance }
+  );
+}
+
+export function problemUnprocessableContent(
+  requestId: string,
+  detail: string,
+  options?: {
+    invalid_params?: InvalidParam[];
+    instance?: string;
+    code?: ProblemCode;
+    details?: Record<string, unknown>;
+  }
+): Response {
+  return problemResponse(422, "Unprocessable Content", detail, requestId, {
+    code: options?.code ?? "unprocessable_content",
+    instance: options?.instance,
+    invalid_params: options?.invalid_params,
+    ...(options?.details ? { details: options.details } : {}),
+  });
+}
+
+/**
+ * ENG-2949: adding or editing custom CSS needs the Scale plan on Formbricks Cloud. Independent of the
+ * resource, so it reveals nothing about it; removing CSS never answers this.
+ */
+export function problemCustomCssPlanRequired(requestId: string, detail: string, instance?: string): Response {
+  return problemResponse(403, "Forbidden", detail, requestId, {
+    code: "custom_css_plan_required",
+    instance,
+  });
+}
+
+/**
+ * ENG-6584: charts and dashboards need the Dashboards add-on on Formbricks Cloud or a license that
+ * includes it. Checked after authorization, so it reveals nothing to a caller without access, and
+ * independent of any one resource.
+ */
+export function problemDashboardsPlanRequired(requestId: string, instance?: string): Response {
+  return problemResponse(
+    403,
+    "Forbidden",
+    "Dashboards are not enabled for this organization. They require the Dashboards add-on or an Enterprise license that includes it — an organization owner can enable them from the organization's billing or license settings.",
+    requestId,
+    { code: "dashboards_plan_required", instance }
+  );
+}
+
+/** The organization isn't entitled to Contacts (the enterprise Contacts, Attributes and Segments feature). */
+export function problemContactsNotEntitled(requestId: string, instance?: string): Response {
+  return problemForbidden(requestId, "The contacts feature is not enabled for this organization.", instance);
+}
+
+/** The organization isn't entitled to Workflows (a Cloud plan or a self-hosted license that includes them). */
+export function problemWorkflowsNotEntitled(requestId: string, instance?: string): Response {
+  return problemForbidden(requestId, "Workflows are not enabled for this organization", instance);
+}
+
+/**
+ * ENG-6602: the instance's license doesn't include Creatives. In wind-down (the workspace still has
+ * creatives) only reading them and taking them down stay allowed, and the detail says so; otherwise
+ * every creatives operation answers this. Only ever answered after the caller's own access to the
+ * workspace, so it reveals nothing about a workspace the caller can't see.
+ */
+export function problemCreativesNotEntitled(
+  requestId: string,
+  options: { windDown: boolean; instance?: string }
+): Response {
+  const detail = options.windDown
+    ? "Creatives is not included in this instance's license: existing creatives can only be listed, read, paused, closed or deleted"
+    : // Not "license": Formbricks Cloud has none, and Creatives isn't offered there.
+      "Creatives is not available on this instance";
+
+  return problemResponse(403, "Forbidden", detail, requestId, {
+    code: "creatives_not_entitled",
+    instance: options.instance,
+  });
+}
+
+/**
+ * ENG-3641: custom CSS that the processor rejected (syntax, size or complexity limits, processing
+ * failure). A 422 like any other semantic document failure; `details.errors` carries the processor's
+ * located errors (code, scope, appearance, line, column, reason), `invalid_params` the same as fields.
+ */
+export function problemCustomCssInvalid(
+  requestId: string,
+  options: { invalid_params: InvalidParam[]; errors: unknown[]; instance?: string }
+): Response {
+  return problemResponse(422, "Unprocessable Content", "Custom CSS failed validation", requestId, {
+    code: "unprocessable_content",
+    instance: options.instance,
+    invalid_params: options.invalid_params,
+    details: { errors: options.errors },
+  });
+}
+
+/**
+ * ENG-3282: survey visibility is not available here — the organization lacks the entitlement or the
+ * deployment's readiness marker is unset (contract §5). Independent of the survey, so it reveals
+ * nothing about it.
+ */
+export function problemVisibilityNotEnabled(requestId: string, instance?: string): Response {
+  return problemResponse(
+    403,
+    "Forbidden",
+    "Survey visibility is not enabled for this organization",
+    requestId,
+    {
+      code: "visibility_not_enabled",
+      instance,
+    }
+  );
+}
+
+/** ENG-3282: `restricted` refused while outbound connections depend on the survey; lists them. */
+export function problemVisibilityBlocked(
+  requestId: string,
+  blockers: ReadonlyArray<Readonly<{ id: string; name: string; type: string }>>,
+  instance?: string
+): Response {
+  return problemResponse(
+    409,
+    "Conflict",
+    "Remove the connections that use this survey before restricting it",
+    requestId,
+    { code: "visibility_blocked_by_connections", details: { blockers }, instance }
+  );
+}
+
+/**
+ * A survey delete refused while non-archived creatives open the survey; lists them so the caller
+ * can delete each one (pausing or closing a creative keeps its link).
+ */
+export function problemSurveyHasLinkedCreatives(
+  requestId: string,
+  creatives: ReadonlyArray<Readonly<{ id: string; name: string }>>,
+  instance?: string
+): Response {
+  return problemResponse(
+    409,
+    "Conflict",
+    "Delete the creatives that open this survey before deleting it",
+    requestId,
+    {
+      code: "survey_has_linked_creatives",
+      details: { creatives: creatives.map(({ id, name }) => ({ id, name })) },
+      instance,
+    }
+  );
+}
+
+/** ENG-3282: `restricted` refused because the survey has no owner (Decision log #3). */
+export function problemVisibilityChangeNotAllowed(requestId: string, instance?: string): Response {
+  return problemResponse(
+    422,
+    "Unprocessable Content",
+    "A survey without an author can't be restricted. Duplicate it to get a restricted copy you own.",
+    requestId,
+    { code: "visibility_change_not_allowed", instance }
+  );
+}
+
+/**
+ * ENG-3282: a grant was stored but the graph did not acknowledge it in-request. The survey stays
+ * restricted until the outbox delivers it; retrying is safe.
+ */
+export function problemProjectionPending(requestId: string, instance?: string): Response {
+  return problemResponse(
+    503,
+    "Service Unavailable",
+    "The change is stored and will take effect shortly; the survey stays restricted until it does",
+    requestId,
+    { code: "projection_pending", headers: { "Retry-After": "5" }, instance }
+  );
+}
+
+/**
+ * ENG-3282: the workspace already holds `SURVEY_WORKSPACE_LIMIT` surveys. `details` carries the limit
+ * and the current count so a client can say how many to archive or delete without a second call.
+ */
+export function problemWorkspaceSurveyLimit(
+  requestId: string,
+  limit: number,
+  count: number,
+  instance?: string
+): Response {
+  return problemResponse(
+    422,
+    "Unprocessable Content",
+    "This workspace has reached its survey limit",
+    requestId,
+    {
+      code: "workspace_survey_limit_reached",
+      details: { count, limit },
+      instance,
+    }
+  );
+}
+
+/**
+ * ENG-6590: a chart still on a dashboard cannot be deleted — deleting it would break every dashboard that
+ * shows it. `details.dashboards` names them, so the caller can take the chart off first. There is no force
+ * option.
+ */
+export function problemChartInUse(
+  requestId: string,
+  dashboards: { id: string; name: string }[],
+  instance?: string
+): Response {
+  return problemResponse(
+    409,
+    "Conflict",
+    dashboards.length === 1
+      ? "This chart is on 1 dashboard, so it was not deleted. Remove it from that dashboard first."
+      : `This chart is on ${dashboards.length} dashboards, so it was not deleted. Remove it from them first.`,
+    requestId,
+    { code: "chart_in_use", instance, details: { dashboards } }
+  );
+}
+
+export function problemConflict(
+  requestId: string,
+  detail: string,
+  instance?: string,
+  // ENG-3069: `details` carries the machine-readable half of an optimistic-concurrency failure
+  // (`expectedUpdatedAt` / `currentUpdatedAt`). Without it a client can only re-read and guess,
+  // and the human `detail` string is the wrong place for a value a retry has to compare.
+  options?: { details?: Record<string, unknown>; code?: ProblemCode }
+): Response {
+  return problemResponse(409, "Conflict", detail, requestId, {
+    code: options?.code ?? "conflict",
+    instance,
+    ...(options?.details && { details: options.details }),
+  });
+}
+
+/**
+ * 428: the write waits for the user's agreement. MCP-only (ENG-6930), like the refusal the response
+ * delete tools return, so it carries no `code`: no public v3 route answers it.
+ */
+export function problemConfirmationRequired(requestId: string, detail: string, instance?: string): Response {
+  return problemResponse(428, "Confirmation required", detail, requestId, { instance });
+}
+
+/**
+ * ENG-6850: a request repeated with an `Idempotency-Key` whose first request is still running (IETF
+ * Idempotency-Key draft §2.6). Internal routes only. `Retry-After` says when the first will have finished
+ * or given the key back.
+ */
+export function problemIdempotencyKeyInUse(
+  requestId: string,
+  instance: string | undefined,
+  retryAfterSeconds: number
+): Response {
+  return problemResponse(
+    409,
+    "Conflict",
+    "A request with this Idempotency-Key is still being processed",
+    requestId,
+    {
+      code: "idempotency_key_in_use",
+      instance,
+      headers: { "Retry-After": String(retryAfterSeconds) },
+    }
+  );
+}
+
+/**
+ * ENG-6850: an `Idempotency-Key` reused for a different request (IETF Idempotency-Key draft §2.6).
+ * Internal routes only.
+ */
+export function problemIdempotencyKeyReused(requestId: string, instance?: string): Response {
+  return problemResponse(
+    422,
+    "Unprocessable Content",
+    "This Idempotency-Key was used for a different request",
+    requestId,
+    { code: "idempotency_key_reused", instance }
+  );
+}
+
+/** 410 for a resource that existed and is gone for good, e.g. an export archive past its expiry. */
+export function problemGone(
+  requestId: string,
+  detail: string,
+  options?: { instance?: string; code?: ProblemCode }
+): Response {
+  return problemResponse(410, "Gone", detail, requestId, {
+    code: options?.code,
+    instance: options?.instance,
+  });
+}
+
+export function problemBadGateway(
+  requestId: string,
+  detail: string,
+  instance?: string,
+  code: V3ProblemCode = "bad_gateway"
+): Response {
+  return problemResponse(502, "Bad Gateway", detail, requestId, {
+    code,
+    instance,
+  });
+}
+
+/**
+ * 503 for a capability that is not enabled on this deployment (as opposed to a transient outage, which
+ * is a 502). `detail` should say what to configure — a bare "unavailable" is not actionable.
+ */
+export function problemServiceUnavailable(requestId: string, detail: string, instance?: string): Response {
+  return problemResponse(503, "Service Unavailable", detail, requestId, {
+    code: "service_unavailable",
+    instance,
+  });
+}
+
+/**
+ * 503 for a route that is at its concurrency limit on this server (`concurrency` in
+ * `withV3ApiWrapper`). Unlike `problemServiceUnavailable`, the capability is enabled and the caller
+ * did nothing wrong: the same request succeeds once a slot frees up, and `Retry-After` says when to try.
+ *
+ * `capacity_reached` is an internal code. A public route that adopts the limit has to publish it in
+ * `Problem.yml` first (`problem-codes.test.ts` keeps the two vocabularies apart).
+ */
+export function problemCapacityReached(
+  requestId: string,
+  retryAfterSeconds: number,
+  instance?: string
+): Response {
+  return problemResponse(
+    503,
+    "Service Unavailable",
+    `This server is busy with other requests like this one. Try again in ${retryAfterSeconds} seconds.`,
+    requestId,
+    { code: "capacity_reached", instance, headers: { "Retry-After": String(retryAfterSeconds) } }
+  );
+}
+
+/**
+ * 429 for a caller that already runs as many requests on a route as it may at once (`maxPerKey` in
+ * `withV3ApiWrapper`'s `concurrency`). Its own code, not the rate limit's `too_many_requests`: the fix is
+ * to wait for the caller's own request to finish, not to slow down, and a client says so.
+ *
+ * `concurrency_limit_reached` is an internal code, published the same way as `capacity_reached`.
+ */
+export function problemConcurrencyLimitReached(
+  requestId: string,
+  retryAfterSeconds: number,
+  instance?: string
+): Response {
+  return problemResponse(
+    429,
+    "Too Many Requests",
+    "You already have as many of these requests running as this route allows. Wait for one to finish.",
+    requestId,
+    { code: "concurrency_limit_reached", instance, headers: { "Retry-After": String(retryAfterSeconds) } }
+  );
+}
+
+/**
+ * 404 with resource details. Do not use for auth-sensitive or existence-sensitive resources:
+ * the body includes resource_type and resource_id, which can leak existence to unauthenticated or unauthorized callers.
+ * Prefer problemForbidden with a generic message for those cases.
+ */
+export function problemNotFound(
+  requestId: string,
+  resourceType: string,
+  resourceId: string | null,
+  instance?: string
+): Response {
+  return problemResponse(404, "Not Found", `${resourceType} not found`, requestId, {
+    code: "not_found",
+    details: { resource_type: resourceType, resource_id: resourceId },
+    instance,
+  });
+}
+
+export function problemInternalError(
+  requestId: string,
+  detail: string = "An unexpected error occurred.",
+  instance?: string,
+  code: ProblemCode = "internal_server_error"
+): Response {
+  return problemResponse(500, "Internal Server Error", detail, requestId, {
+    code,
+    instance,
+  });
+}
+
+export function problemTooManyRequests(
+  requestId: string,
+  detail: string,
+  retryAfter?: number,
+  instance?: string
+): Response {
+  const headers: Record<string, string> = {};
+  if (retryAfter !== undefined) {
+    headers["Retry-After"] = String(retryAfter);
+  }
+  return problemResponse(429, "Too Many Requests", detail, requestId, {
+    code: "too_many_requests",
+    instance,
+    headers,
+  });
+}
+
+export function successListResponse<T, TMeta extends Record<string, unknown>>(
+  data: T[],
+  meta: TMeta,
+  options?: { requestId?: string; cache?: string }
+): Response {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Cache-Control": options?.cache ?? CACHE_NO_STORE,
+  };
+  if (options?.requestId) {
+    headers["X-Request-Id"] = options.requestId;
+  }
+  return Response.json({ data, meta }, { status: 200, headers });
+}
+
+/**
+ * Top-level members a success body may carry beside `data` — additive, never a replacement for it. The
+ * custom CSS writes use it for `warnings` (ENG-3641), which describe the request rather than the
+ * resource, so they stay out of `data` and a PATCH that round-trips `data` never sends them back.
+ */
+type TSuccessExtensions = { warnings?: unknown[]; meta?: Record<string, unknown> };
+
+export function successResponse<T>(
+  data: T,
+  options?: { requestId?: string; cache?: string; status?: number; extensions?: TSuccessExtensions }
+): Response {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Cache-Control": options?.cache ?? CACHE_NO_STORE,
+  };
+
+  if (options?.requestId) {
+    headers["X-Request-Id"] = options.requestId;
+  }
+
+  return Response.json(
+    {
+      data,
+      ...options?.extensions,
+    },
+    {
+      status: options?.status ?? 200,
+      headers,
+    }
+  );
+}
+
+export function createdResponse<T>(
+  data: T,
+  options: { location: string; requestId?: string; cache?: string; extensions?: TSuccessExtensions }
+): Response {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Cache-Control": options.cache ?? CACHE_NO_STORE,
+    Location: options.location,
+  };
+
+  if (options.requestId) {
+    headers["X-Request-Id"] = options.requestId;
+  }
+
+  return Response.json(
+    {
+      data,
+      ...options.extensions,
+    },
+    {
+      status: 201,
+      headers,
+    }
+  );
+}
+
+export function noContentResponse(options?: { requestId?: string; cache?: string }): Response {
+  const headers: Record<string, string> = {
+    "Cache-Control": options?.cache ?? CACHE_NO_STORE,
+  };
+
+  if (options?.requestId) {
+    headers["X-Request-Id"] = options.requestId;
+  }
+
+  return new Response(null, {
+    status: 204,
+    headers,
+  });
+}
