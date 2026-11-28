@@ -1,224 +1,162 @@
-<div id="top"></div>
-
-<p align="center">Help us grow and star us on Github! ⭐️</p>
+# Formbricks Custom
 
 <p align="center">
-
-<a href="https://formbricks.com">
-
-<img width="120" alt="Open Source Privacy First Experience Management Solution Qualtrics Alternative Logo" src="https://github.com/formbricks/formbricks/assets/72809645/0086704f-bee7-4d38-9cc8-fa42ee59e004">
-
-</a>
-
-<h3 align="center">Formbricks</h3>
-
-<p align="center">
-The Open Source Qualtrics Alternative
-<br />
-<a href="https://formbricks.com/">Website</a>
+  <img width="120" src="https://github.com/formbricks/formbricks/assets/72809645/0086704f-bee7-4d38-9cc8-fa42ee59e004" alt="Formbricks Logo">
 </p>
+
+<h2 align="center">Formbricks Custom</h2>
+
+<p align="center">
+  Customized Experience Management & Survey Platform
+  <br/>
+  <strong>Developed and maintained by Yassin Njeh</strong>
+  <br/>
+  <a href="https://github.com/yassinnjeh">GitHub Profile</a>
 </p>
 
 <p align="center">
-<a href="https://github.com/formbricks/formbricks/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-AGPL-purple" alt="License"></a> <a href="https://github.com/formbricks/formbricks/stargazers"><img src="https://img.shields.io/github/stars/formbricks/formbricks?logo=github" alt="Github Stars"></a>
-<a href="https://insights.linuxfoundation.org/project/formbricks"><img src="https://insights.linuxfoundation.org/api/badge/health-score?project=formbricks"></a>
-<a href="https://news.ycombinator.com/item?id=32303986"><img src="https://img.shields.io/badge/Hacker%20News-122-%23FF6600" alt="Hacker News"></a>
-<a href="https://www.producthunt.com/products/formbricks"><img src="https://img.shields.io/badge/Product%20Hunt-455-orange?logo=producthunt&logoColor=%23fff" alt="Product Hunt"></a>
-<a href="https://github.blog/2023-04-12-github-accelerator-our-first-cohort-and-whats-next/"><img src="https://img.shields.io/badge/2023-blue?logo=github&label=Github%20Accelerator" alt="Github Accelerator"></a>
-<a href="https://github.com/formbricks/formbricks/issues?q=is:issue+is:open+label:%22%F0%9F%99%8B%F0%9F%8F%BB%E2%80%8D%E2%99%82%EF%B8%8Fhelp+wanted%22"><img src="https://img.shields.io/badge/Help%20Wanted-Contribute-blue"></a>
+  <img src="https://img.shields.io/badge/Developer-Yassin%20Njeh-blue" alt="Developer">
+  <img src="https://img.shields.io/badge/Project-Custom%20Development-purple" alt="Project Type">
+  <img src="https://img.shields.io/badge/License-AGPLv3-green" alt="License">
 </p>
 
-<br/>
+---
 
-<div style="background-color:#f8fafc; border-radius:5px;">
-<p align="center">
-<i>Trusted by</i><br/>
-  <img width="867" alt="clients-hi-res" src="https://github.com/formbricks/formbricks/assets/72809645/924d3693-f66a-4063-bb31-6e5789a8175a">
+## About This Project
+
+Formbricks Custom is a customized version of the open-source Formbricks platform, designed to provide a flexible experience management and survey solution.
+
+This repository contains a customized development environment based on the original Formbricks software, with a focus on extending functionality, adapting the user experience, and supporting additional development requirements.
+
+**Project Developer:** Yassin Njeh  
+**GitHub:** https://github.com/yassinnjeh  
+**Project Type:** Custom Open-Source Development  
+**Original Project:** https://github.com/formbricks/formbricks
+
+## Developer
+
+<p>
+  <strong>Yassin Njeh</strong><br/>
+  Software Developer
 </p>
-</div>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/2570" target="_blank"><img src="https://trendshift.io/api/badge/repositories/2570" alt="Trendshift Badge for formbricks/formbricks" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+Responsible for the custom development, configuration, integration, and maintenance of this repository.
 
-## ✨ About Formbricks
+Areas of development include:
 
-<img width="1527" alt="formbricks-sneak" src="https://github-production-user-asset-6210df.s3.amazonaws.com/675065/249441967-ccb89ea3-82b4-4bf2-8d2c-528721ec313b.png">
+- Frontend and backend customization
+- User interface and user experience improvements
+- Feature development and integration
+- Application configuration and optimization
+- Development environment customization
 
-Formbricks provides a free and open source surveying platform. Gather feedback at every point in the user journey with beautiful in-app, website, link and email surveys. Build on top of Formbricks or leverage prebuilt data analysis capabilities.
+*These areas describe the intended scope; individual contributions should reflect the work actually completed.*
 
-**Try it out in the cloud at [formbricks.com](https://app.formbricks.com/auth/signup)**
+## Platform Overview
 
-## 💪 Mission: Empower your team, craft an irresistible experience.
+Formbricks provides an open-source surveying and experience management platform. It allows organizations to collect user feedback throughout the customer journey using different survey channels.
 
-Formbricks is both a free and open source survey platform - and a privacy-first experience management platform. Use in-app, website, link and email surveys to gather user and customer insights at every point of their journey. Leverage Formbricks Insight Platform or build your own. Life's too short for mediocre UX.
+### Key Features
 
-### Table of Contents
+- Create conversion-optimized surveys using a no-code editor.
+- Use customizable survey templates.
+- Target surveys to specific user groups.
+- Create and distribute shareable link surveys.
+- Invite team members to collaborate.
+- Integrate with Slack, Notion, Zapier, n8n and other services.
+- Host and manage the platform on your own infrastructure.
 
-- [Features](#features)
+## Technology Stack
 
-- [Getting Started](#getting-started)
+- TypeScript
+- Next.js
+- React
+- Tailwind CSS
+- Prisma
+- Auth.js
+- Zod
+- Vitest
+- PostgreSQL
+- Docker
 
-- [Cloud Version](#cloud-version)
-
-- [Self-hosted Version](#self-hosted-version)
-
-- [Development](#development)
-
-- [Contribution](#contribution)
-
-- [Contact](#contact-us)
-
-- [Security](#security)
-
-- [License](#license)
-
-<a id="features"></a>
-
-### Features
-
-- 📲 Create **conversion-optimized surveys** with our no-code editor with several question types.
-
-- 📚 Choose from a variety of best-practice **templates**.
-
-- 👩🏻 Launch and **target your surveys to specific user groups** without changing your application code.
-
-- 🔗 Create shareable **link surveys**.
-
-- 👨‍👩‍👦 Invite your organization members to **collaborate** on your surveys.
-
-- 🔌 Integrate Formbricks with **Slack, Notion, Zapier, n8n and more**.
-
-- 🔒 All **open source**, transparent and self-hostable.
-
-### Built on Open Source
-
-- 💻 [Typescript](https://www.typescriptlang.org/)
-
-- 🚀 [Next.js](https://nextjs.org/)
-
-- ⚛️ [React](https://reactjs.org/)
-
-- 🎨 [TailwindCSS](https://tailwindcss.com/)
-
-- 📚 [Prisma](https://prisma.io/)
-
-- 🔒 [Auth.js](https://authjs.dev/)
-
-- 🧘‍♂️ [Zod](https://zod.dev/)
-
-- 🐛 [Vitest](https://vitest.dev/)
-
-<a id="getting-started"></a>
-
-## 🚀 Getting started
-
-We've got several options depending on your need to help you quickly get started with Formbricks.
-
-<a id="cloud-version"></a>
-
-### ☁️ Cloud Version
-
-Formbricks has a hosted cloud offering with a generous free plan to get you up and running as quickly as possible. To get started, please visit [formbricks.com](https://app.formbricks.com/auth/signup).
-
-<a id="self-hosted-version"></a>
-
-### 🐳 Self-hosting Formbricks
-
-Formbricks is available Open-Source under AGPLv3 license. You can host Formbricks on your own servers using Docker without a subscription.
-
-#### Docker
-
-To get started with self-hosting with Docker, take a look at our [self-hosting docs](https://formbricks.com/docs/self-hosting/deployment).
-
-<a id="development"></a>
-
-## 👨‍💻 Development
+## Getting Started
 
 ### Prerequisites
 
-Here is what you need to be able to run Formbricks:
+Make sure you have the following installed:
 
-- [Node.js](https://nodejs.org/en) - use the version range in [`package.json`](./package.json) or the pinned version in [`.nvmrc`](./.nvmrc)
+- [Node.js](https://nodejs.org/)
+- [pnpm](https://pnpm.io/)
+- [Docker](https://www.docker.com/)
 
-- [Pnpm](https://pnpm.io/)
+### Installation
 
-- [Docker](https://www.docker.com/) - to run the local development stack, including PostgreSQL, SpiceDB, MailHog, Valkey, RustFS, Hub and Cube services
+Clone this repository:
 
-### Local Setup
+```bash
+git clone https://github.com/yassinnjeh/formbricks-custom.git
+cd formbricks-custom
+```
 
-1. Install dependencies:
+Install dependencies:
 
-   ```bash
-   pnpm install
-   ```
+```bash
+pnpm install
+```
 
-2. Start the local development stack and app:
+Start the local development environment:
 
-   ```bash
-   pnpm go
-   ```
+```bash
+pnpm go
+```
 
-   `pnpm go` runs `pnpm db:up` first. That command creates `.env` from `.env.example` when needed, generates the required local secrets, and starts the Docker services from `docker-compose.dev.yml`.
+Open the application:
 
-3. Open [http://localhost:3000](http://localhost:3000).
+```text
+http://localhost:3000
+```
 
-<a id="contribution"></a>
+**Note:** Follow the repository configuration and original Formbricks documentation for environment variables and additional setup requirements.
 
-## ✍️ Contribution
+## Project Structure
 
-We are very happy if you are interested in contributing to Formbricks 🤗
+The project follows a modular architecture:
 
-Here are a few options:
+- `apps/` — Application modules
+- `packages/` — Shared packages and libraries
+- `docker/` — Docker configuration
+- `docs/` — Documentation
+- `scripts/` — Development and automation scripts
+- `charts/` — Deployment configurations
 
-- Star this repo.
+## Development
 
-- Create issues every time you feel something is missing or goes wrong.
+This repository is maintained as a custom development version of Formbricks.
 
-- Upvote issues with 👍 reaction so we know what the demand for a particular issue is to prioritize it within the roadmap.
+Future development may include additional functionality, interface improvements, integrations, and application optimizations.
 
-- Note: For the time being, we can only facilitate code contributions as an exception.
+## Original Project & Attribution
 
+This project is based on [Formbricks](https://github.com/formbricks/formbricks), an open-source software project.
 
+The original Formbricks codebase, its trademarks, original authorship, and third-party components remain attributed to their respective owners.
 
-## Thanks
+This repository identifies Yassin Njeh as the developer responsible for its own custom modifications and maintenance, not as the original creator of Formbricks.
 
-Formbricks is supported by the following companies who provide us with their tools for free as part of their open-source support:
+## License
 
-<a href="https://www.chromatic.com/"><img src="https://user-images.githubusercontent.com/321738/84662277-e3db4f80-af1b-11ea-88f5-91d67a5e59f6.png" width="153" height="30" alt="Chromatic" /></a>
-&nbsp;&nbsp;&nbsp;&nbsp;
-<a href="https://sentry.io/"><img src="https://github.com/user-attachments/assets/d743ffd4-b575-4802-a29a-10136be9227e" width="150" height="30" alt="Sentry" /></a>
+The original Formbricks core is distributed under the **GNU Affero General Public License v3.0 (AGPLv3)**.
 
-<a id="contact-us"></a>
+Modified versions must comply with the applicable open-source license requirements, including documenting modifications and retaining required notices.
 
-## 📆 Contact us
+The repository also contains Enterprise Edition components that may be subject to separate licensing terms.
 
-Let's have a chat about your survey needs and get you started.
+See the `LICENSE` file and the relevant Enterprise Edition license files for details.
 
-<a href="https://cal.com/johannes/onboarding?utm_source=banner&utm_campaign=oss"><img alt="Book us with Cal.com" src="https://cal.com/book-with-cal-dark.svg" /></a>
+---
 
-<a id="security"></a>
-
-## 🔒 Security
-
-We take security very seriously. If you come across any security vulnerabilities, please disclose them by sending an email to security@formbricks.com. We appreciate your help in making our platform as secure as possible and are committed to working with you to resolve any issues quickly and efficiently. Please note that we do not offer bug bounties or any other payment for security reports, but we are happy to credit you in the release notes for the fix on request. See [`SECURITY.md`](./SECURITY.md) for more information.
-
-<a id="license"></a>
-
-## 👩‍⚖️ License
-
-### The AGPL Formbricks Core
-
-The Formbricks core application is licensed under the [AGPLv3 Open Source License](https://github.com/formbricks/formbricks/blob/main/LICENSE). The core application is fully functional and includes everything you need to design & run link surveys, website surveys and in-app surveys. You can use the software for free for personal and commercial use. You're also allowed to create and distribute modified versions as long as you document the changes you make incl. date. The AGPL license requires you to publish your modified version under the AGPLv3 license as well.
-
-### The Enterprise Edition
-
-Additional to the AGPL licensed Formbricks core, this repository contains code licensed under an Enterprise license. The [code](https://github.com/formbricks/formbricks/tree/main/apps/web/modules/ee) and [license](https://github.com/formbricks/formbricks/blob/main/apps/web/modules/ee/LICENSE) for the enterprise functionality can be found in the `/apps/web/modules/ee` folder of this repository. This additional functionality is not part of the AGPLv3 licensed Formbricks core and is designed to meet the needs of larger teams and enterprises. This advanced functionality is already included in the Docker images, but you need an [Enterprise License Key](https://formbricks.com/docs/self-hosting/enterprise) to unlock it.
-
-### White-Labeling Formbricks and Other Licensing Needs
-
-We currently do not offer Formbricks white-labeled. That means that we don't sell a license which let's other companies resell Formbricks to third parties under their name nor take parts (like the survey editor) out of Formbricks to add to their own software products. Any other needs? [Send us an email](mailto:hola@formbricks.com).
-
-### Why charge for Enterprise Features?
-
-The Enterprise Edition allows us to fund the development of Formbricks sustainably. It guarantees that the free and open-source surveying infrastructure we're building will be around for decades to come.
+<p align="center">
+  <strong>Developed and maintained by Yassin Njeh</strong>
+  <br/>
+  <a href="https://github.com/yassinnjeh">github.com/yassinnjeh</a>
+</p>
