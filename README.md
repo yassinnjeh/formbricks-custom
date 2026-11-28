@@ -179,13 +179,7 @@ Here are a few options:
 
 - Note: For the time being, we can only facilitate code contributions as an exception.
 
-## All Thanks To Our Contributors
 
-<a href="https://github.com/formbricks/formbricks/graphs/contributors">
-
-<img src="https://contrib.rocks/image?repo=formbricks/formbricks" />
-
-</a>
 
 ## Thanks
 
